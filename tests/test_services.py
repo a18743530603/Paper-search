@@ -31,6 +31,7 @@ def test_parse_arxiv_feed_builds_pdf_url():
     assert paper.title == "Multimodal Agent: A Survey?"
     assert paper.authors == "Alice Smith, Bob Lee"
     assert paper.published == "2024-01-01"
+    assert paper.publisher == "arXiv"
     assert paper.page_url == "https://arxiv.org/abs/2401.00001v1"
     assert paper.pdf_url == "https://arxiv.org/pdf/2401.00001v1.pdf"
     assert paper.status == STATUS_DOWNLOADING
@@ -42,6 +43,7 @@ def test_parse_crossref_without_direct_pdf_is_link_only():
             {
                 "title": ["Crossref Paper"],
                 "DOI": "10.1000/example",
+                "publisher": "Elsevier BV",
                 "URL": "https://doi.org/10.1000/example",
                 "author": [{"given": "Carol", "family": "Wang"}],
                 "created": {"date-parts": [[2025, 5, 1]]},
@@ -52,6 +54,7 @@ def test_parse_crossref_without_direct_pdf_is_link_only():
 
     assert len(papers) == 1
     assert papers[0].doi == "10.1000/example"
+    assert papers[0].publisher == "Elsevier BV"
     assert papers[0].pdf_url is None
     assert papers[0].status == STATUS_LINK_ONLY
 

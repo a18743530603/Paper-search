@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS papers (
     summary TEXT NOT NULL,
     published TEXT NOT NULL,
     source TEXT NOT NULL,
+    publisher TEXT NOT NULL DEFAULT '',
     doi TEXT,
     page_url TEXT NOT NULL,
     pdf_url TEXT,
@@ -42,6 +43,12 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(papers)").fetchall()
+        }
+        if "publisher" not in columns:
+            conn.execute("ALTER TABLE papers ADD COLUMN publisher TEXT NOT NULL DEFAULT ''")
 
 
 def insert_papers(query: str, papers: Iterable[PaperCandidate]) -> list[int]:
@@ -51,10 +58,10 @@ def insert_papers(query: str, papers: Iterable[PaperCandidate]) -> list[int]:
             cursor = conn.execute(
                 """
                 INSERT INTO papers (
-                    query, title, authors, summary, published, source, doi,
+                    query, title, authors, summary, published, source, publisher, doi,
                     page_url, pdf_url, status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     query,
@@ -63,6 +70,7 @@ def insert_papers(query: str, papers: Iterable[PaperCandidate]) -> list[int]:
                     paper.summary,
                     paper.published,
                     paper.source,
+                    paper.publisher,
                     paper.doi,
                     paper.page_url,
                     paper.pdf_url,
@@ -120,6 +128,7 @@ def export_papers_csv() -> Path:
                 "authors",
                 "published",
                 "source",
+                "publisher",
                 "doi",
                 "page_url",
                 "pdf_url",
@@ -139,6 +148,7 @@ def export_papers_csv() -> Path:
                     row["authors"],
                     row["published"],
                     row["source"],
+                    row["publisher"],
                     row["doi"],
                     row["page_url"],
                     row["pdf_url"],

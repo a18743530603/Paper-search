@@ -6,6 +6,7 @@
   <h1>{{ paper["title"] }}</h1>
   <dl>
     <dt>作者</dt><dd>{{ paper["authors"] or "未知" }}</dd>
+    <dt>出版商</dt><dd>{{ paper["publisher"] or "未知" }}</dd>
     <dt>发表时间</dt><dd>{{ paper["published"] or "未知" }}</dd>
     <dt>DOI</dt><dd>{{ paper["doi"] or "无" }}</dd>
     <dt>网页地址</dt><dd><a href="{{ paper["page_url"] }}" target="_blank" rel="noreferrer">{{ paper["page_url"] }}</a></dd>

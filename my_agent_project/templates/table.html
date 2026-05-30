@@ -5,6 +5,7 @@
       <tr>
         <th>标题</th>
         <th>来源</th>
+        <th>出版商</th>
         <th>时间</th>
         <th>状态</th>
         <th>链接</th>
@@ -19,6 +20,7 @@
           {% if paper["error"] %}<span class="error">{{ paper["error"] }}</span>{% endif %}
         </td>
         <td><span class="badge">{{ paper["source"] }}</span></td>
+        <td>{{ paper["publisher"] or "-" }}</td>
         <td>{{ paper["published"] or "-" }}</td>
         <td><span class="status status-{{ paper["status"] }}">{{ paper["status"] }}</span></td>
         <td>

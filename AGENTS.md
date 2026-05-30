@@ -9,6 +9,7 @@ The user wanted a resume-ready project that can:
 - Accept user-provided keywords.
 - Search the web for related academic papers.
 - Record paper website addresses and metadata.
+- Show each paper's publisher when the source provides it.
 - Download papers locally when they are clearly free/open-access.
 - Save downloaded files into a local folder.
 - Be understandable to beginners and suitable for GitHub/resume presentation.
@@ -71,6 +72,7 @@ Important modules:
 - `search_service.py`
   - Searches arXiv and Crossref.
   - Parses arXiv XML and Crossref JSON.
+  - Sets publisher to `arXiv` for arXiv records and parses Crossref `publisher`.
   - Generates arXiv PDF URLs.
   - Applies Crossref `.pdf` direct-link rule.
   - Turns source failures into `failed` records instead of crashing the whole search.
@@ -225,3 +227,12 @@ uv run pytest
 ```
 
 No need to retest after editing only documentation unless code is changed.
+
+## Later Feature Addition
+
+The app was updated to store and display `publisher`:
+
+- arXiv records use `publisher = "arXiv"`.
+- Crossref records use the Crossref `publisher` field, for example `Elsevier BV` or Springer publisher names.
+- The SQLite schema now includes a `publisher` column and `init_db()` migrates older local databases by adding the column if missing.
+- The results/history table and detail page display publisher.

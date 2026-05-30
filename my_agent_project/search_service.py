@@ -45,6 +45,7 @@ def parse_arxiv_feed(xml_text: str) -> list[PaperCandidate]:
                 summary=summary,
                 published=published,
                 source="arxiv",
+                publisher="arXiv",
                 doi=None,
                 page_url=page_url,
                 pdf_url=arxiv_pdf_url(page_url),
@@ -121,6 +122,7 @@ def parse_crossref_items(items: list[dict[str, Any]]) -> list[PaperCandidate]:
         published = "-".join(str(part) for part in published_parts[0]) if published_parts else ""
         page_url = normalize_text(item.get("URL"))
         pdf_url = extract_crossref_pdf_url(item)
+        publisher = normalize_text(item.get("publisher")) or "Unknown publisher"
         papers.append(
             PaperCandidate(
                 title=title,
@@ -128,6 +130,7 @@ def parse_crossref_items(items: list[dict[str, Any]]) -> list[PaperCandidate]:
                 summary=first_text(item.get("abstract")),
                 published=published,
                 source="crossref",
+                publisher=publisher,
                 doi=normalize_text(item.get("DOI")) or None,
                 page_url=page_url,
                 pdf_url=pdf_url,
@@ -164,6 +167,7 @@ def search_all(query: str, max_results: int) -> list[PaperCandidate]:
                     summary=str(exc),
                     published="",
                     source="system",
+                    publisher="",
                     doi=None,
                     page_url="",
                     pdf_url=None,

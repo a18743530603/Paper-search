@@ -15,8 +15,8 @@ class PaperCandidate:
     summary: str
     published: str
     source: str
+    publisher: str
     doi: Optional[str]
     page_url: str
     pdf_url: Optional[str]
     status: str
-
