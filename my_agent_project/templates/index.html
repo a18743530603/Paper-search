@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}搜索文献 - Paper Hunter{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Literature Search Assistant</p>
+    <h1>搜索关键词，归档论文链接，并后台下载开放 PDF。</h1>
+    <p class="lede">优先下载 arXiv PDF；Crossref 结果在没有明确 PDF 直链时自动降级为链接记录。</p>
+  </div>
+  <form class="search-form" action="/search" method="post">
+    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+    <label for="query">关键词</label>
+    <input id="query" name="query" type="text" placeholder="multimodal agent" required autofocus>
+    <label for="max_results">结果数量</label>
+    <input id="max_results" name="max_results" type="number" min="1" max="50" value="{{ max_results }}">
+    <button type="submit">开始搜索</button>
+  </form>
+</section>
+{% endblock %}
+

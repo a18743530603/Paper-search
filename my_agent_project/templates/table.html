@@ -1,0 +1,36 @@
+{% if papers %}
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>标题</th>
+        <th>来源</th>
+        <th>时间</th>
+        <th>状态</th>
+        <th>链接</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for paper in papers %}
+      <tr>
+        <td>
+          <a class="paper-title" href="/papers/{{ paper["id"] }}">{{ paper["title"] }}</a>
+          <span class="authors">{{ paper["authors"] or "未知作者" }}</span>
+          {% if paper["error"] %}<span class="error">{{ paper["error"] }}</span>{% endif %}
+        </td>
+        <td><span class="badge">{{ paper["source"] }}</span></td>
+        <td>{{ paper["published"] or "-" }}</td>
+        <td><span class="status status-{{ paper["status"] }}">{{ paper["status"] }}</span></td>
+        <td>
+          {% if paper["page_url"] %}<a href="{{ paper["page_url"] }}" target="_blank" rel="noreferrer">网页</a>{% endif %}
+          {% if paper["pdf_url"] %}<a href="{{ paper["pdf_url"] }}" target="_blank" rel="noreferrer">PDF</a>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="empty">还没有记录。</p>
+{% endif %}
+

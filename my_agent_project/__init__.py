@@ -1,0 +1,2 @@
+"""Paper Hunter application package."""
+

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}历史记录 - Paper Hunter{% endblock %}
+{% block content %}
+<section class="section-head">
+  <div>
+    <p class="eyebrow">Archive</p>
+    <h1>历史记录与下载进度</h1>
+    <p class="lede">状态会随着后台任务更新。刷新页面即可看到最新结果。</p>
+  </div>
+  <a class="button secondary" href="/">继续搜索</a>
+</section>
+{% include "table.html" %}
+{% endblock %}
+

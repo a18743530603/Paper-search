@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}搜索结果 - Paper Hunter{% endblock %}
+{% block content %}
+<section class="section-head">
+  <div>
+    <p class="eyebrow">Search Results</p>
+    <h1>“{{ query }}” 的检索结果</h1>
+    {% if enhanced_query != query %}
+      <p class="lede">增强检索词：{{ enhanced_query }}</p>
+    {% else %}
+      <p class="lede">PDF 下载已转入后台，可在历史页刷新查看状态。</p>
+    {% endif %}
+  </div>
+  <a class="button secondary" href="/papers">查看历史进度</a>
+</section>
+{% include "table.html" %}
+{% endblock %}
+
