@@ -1,120 +1,84 @@
-# Paper Hunter Project Memory
+# Paper Hunter 项目记忆
 
-This file records the important context from the conversation that created this project. It is intended for future Codex sessions opened in this repository.
+本文件记录创建和维护本项目时形成的重要背景，供以后在本仓库中新开的 Codex 对话读取，避免丢失项目上下文。
 
-## User Goal
+## 用户目标
 
-The user wanted a resume-ready project that can:
+用户希望完成一个适合写入简历的文献检索项目，能够：
 
-- Accept user-provided keywords.
-- Search the web for related academic papers.
-- Record paper website addresses and metadata.
-- Show each paper's publisher when the source provides it.
-- Download papers locally when they are clearly free/open-access.
-- Save downloaded files into a local folder.
-- Be understandable to beginners and suitable for GitHub/resume presentation.
+- 接收用户输入的关键词或论文标题。
+- 从网络检索相关学术论文。
+- 保存论文网页地址和元数据。
+- 在数据源提供信息时展示出版商。
+- 对明确免费或开放获取的论文自动下载 PDF。
+- 将下载文件保存到本地目录。
+- 让新手能够看懂项目结构、运行方式和实现思路。
 
-The final project is named **Paper Hunter**.
+项目名称为 **Paper Hunter**。
 
-GitHub repository:
+GitHub 仓库：
 
 ```text
 https://github.com/a18743530603/Paper-search.git
 ```
 
-## Product Decisions Made
+## 已确定的产品方案
 
-- Build as a **FastAPI Web app**, not just a command-line script.
-- Search sources for v1:
-  - arXiv
-  - Crossref
-- Download policy:
-  - arXiv is the primary automatic PDF download source because its PDF URL format is stable.
-  - Crossref is conservative: only try downloading when metadata exposes an absolute URL ending in `.pdf`.
-  - Otherwise mark the paper as `link_only` and store DOI/page URL.
-- Use FastAPI `BackgroundTasks` for PDF downloads so `POST /search` can return results quickly.
-- Use SQLite for local metadata storage.
-- Keep Agent/LLM enhancement optional. The current `agent_service.py` is a safe extension hook and does not require an API key.
-- Do not use Sci-Hub, paid databases, or login-only sources.
+- 项目采用 **FastAPI Web 应用**，而不是只提供命令行脚本。
+- 第一版检索来源为 arXiv 和 Crossref。
+- arXiv 是自动下载 PDF 的主要来源，因为它的 PDF 地址格式较稳定。
+- Crossref 采用保守策略：只有元数据提供以 `.pdf` 结尾的绝对直链时才尝试下载，否则保存 DOI 或网页地址并标记为 `link_only`。
+- 使用 FastAPI `BackgroundTasks` 执行 PDF 下载，使 `POST /search` 能尽快返回检索结果。
+- 使用 SQLite 在本地保存论文元数据和下载状态。
+- Agent/大模型增强功能保持可选。当前 `agent_service.py` 只是扩展入口，不需要 API Key。
+- 不接入 Sci-Hub、付费数据库或必须登录的下载来源。
 
-## Current Architecture
+## 当前项目结构
 
-Main app package:
+主要代码位于 `my_agent_project/`。
+
+- `main.py`：FastAPI 入口，注册页面和导出接口，连接检索、数据库与后台下载服务。
+- `config.py`：配置运行路径，创建下载目录，并处理 Windows UTF-8 输出。
+- `schemas.py`：定义 `PaperCandidate` 和 `downloading`、`downloaded`、`link_only`、`failed` 等状态。
+- `search_service.py`：检索并解析 arXiv XML 和 Crossref JSON，生成论文元数据和下载策略。
+- `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常。
+- `db.py`：初始化和操作 SQLite，保存论文、更新状态并导出 CSV/JSON。
+- `agent_service.py`：预留的关键词扩展、摘要和推荐理由接口，必须保持可选和非阻塞。
+- `origin_service.py`：整理统计数据，并在本机安装 Origin/OriginPro 时尝试自动生成图表。
+- `templates/`：Jinja2 页面模板。
+- `static/styles.css`：网页样式。
+- `tests/`：解析、下载策略、文件名清洗和异常降级等离线测试。
+
+主要接口：
 
 ```text
-my_agent_project/
+GET  /
+POST /search
+GET  /papers
+GET  /papers/{paper_id}
+POST /papers/{paper_id}/retry
+GET  /export.csv
+GET  /export.json
+GET  /origin
 ```
 
-Important modules:
-
-- `main.py`
-  - FastAPI entrypoint.
-  - Defines routes:
-    - `GET /`
-    - `POST /search`
-    - `GET /papers`
-    - `GET /papers/{paper_id}`
-    - `POST /papers/{paper_id}/retry`
-    - `GET /export.csv`
-    - `GET /export.json`
-  - Connects search, database, and background download services.
-- `config.py`
-  - Runtime paths and environment setup.
-  - Creates `downloads/`, `downloads/papers/`, and `downloads/exports/`.
-  - Forces UTF-8 stdout/stderr for Windows compatibility.
-- `schemas.py`
-  - Defines `PaperCandidate`.
-  - Defines status constants:
-    - `downloading`
-    - `downloaded`
-    - `link_only`
-    - `failed`
-- `search_service.py`
-  - Searches arXiv and Crossref.
-  - Parses arXiv XML and Crossref JSON.
-  - Sets publisher to `arXiv` for arXiv records and parses Crossref `publisher`.
-  - Generates arXiv PDF URLs.
-  - Applies Crossref `.pdf` direct-link rule.
-  - Turns source failures into `failed` records instead of crashing the whole search.
-- `download_service.py`
-  - Downloads PDFs.
-  - Sanitizes filenames with invalid Windows/Linux characters replaced by `_`.
-  - Avoids filename collisions.
-  - Updates each paper status independently.
-  - Catches single-paper download failures.
-- `db.py`
-  - Initializes and queries SQLite.
-  - Inserts search results.
-  - Updates download status.
-  - Exports CSV and JSON.
-- `agent_service.py`
-  - Optional future Agent/LLM query enhancement hook.
-  - Must remain non-blocking and optional.
-- `templates/`
-  - Jinja2 templates for homepage, results, history, detail page, and shared table.
-- `static/styles.css`
-  - UI styling.
-- `tests/test_services.py`
-  - Offline tests for parsing, download policy, filename sanitization, and failure fallback.
-
-## Data Flow
+## 数据流程
 
 ```text
-Browser submits keyword
+浏览器提交关键词
   -> POST /search
-  -> main.py receives form
-  -> agent_service.enhance_query() optionally adjusts query
-  -> search_service.search_all() searches arXiv and Crossref
-  -> db.insert_papers() stores metadata
-  -> main.py schedules download_service.download_paper() via BackgroundTasks
-  -> results page returns immediately
-  -> background tasks update SQLite status
-  -> user checks GET /papers for progress
+  -> agent_service.enhance_query() 可选优化关键词
+  -> search_service.search_all() 检索 arXiv 和 Crossref
+  -> db.insert_papers() 保存元数据
+  -> main.py 通过 BackgroundTasks 安排 PDF 下载
+  -> 结果页立即返回
+  -> download_service.download_paper() 在后台下载并更新 SQLite
+  -> 用户通过 GET /papers 查看进度
 ```
 
-## Runtime Data
+## 运行时数据
 
-Runtime files are intentionally ignored by Git:
+以下内容由程序运行时生成，应由 `.gitignore` 排除，不要提交到 Git：
 
 ```text
 downloads/
@@ -126,113 +90,69 @@ downloads/exports/
 __pycache__/
 ```
 
-Do not commit downloaded PDFs, SQLite databases, virtual environments, or caches.
+## 常用命令
 
-## Commands
-
-Run the app:
+启动项目：
 
 ```powershell
 uv run uvicorn my_agent_project.main:app --host 127.0.0.1 --port 8001
 ```
 
-Open:
+浏览器访问：
 
 ```text
 http://127.0.0.1:8001/
 ```
 
-Run tests:
+运行测试：
 
 ```powershell
 uv run pytest
 ```
 
-Push future changes:
+提交并上传后续修改：
 
 ```powershell
 git add .
-git commit -m "Your commit message"
+git commit -m "说明本次修改"
 git push
 ```
 
-## Git History Created During This Conversation
+## Git 历史背景
 
-- Initialized Git repository.
-- Added `.gitignore`.
-- Created initial commit:
+- 已初始化 Git 仓库并配置 `.gitignore`。
+- 初始提交：`008d774 Initial commit`。
+- README 重写提交：`b22e7e8 Rewrite README for Paper Hunter`。
+- 项目记忆提交：`2104e47 Add project memory for future agents`。
+- 出版商展示功能提交：`4d1ffaa Show publisher for searched papers`。
+- 远程仓库名为 `origin`，主分支为 `main`。
+- 此前 GitHub 连接失败时配置过本机代理 `127.0.0.1:7890`，之后用户确认推送成功。
 
-```text
-008d774 Initial commit
-```
+## 已加入的出版商功能
 
-- Added GitHub remote:
+- arXiv 记录使用 `publisher = "arXiv"`。
+- Crossref 记录读取返回数据中的 `publisher` 字段，例如 `Elsevier BV` 或 Springer 旗下出版商名称。
+- SQLite 的 `papers` 表包含 `publisher` 字段，`init_db()` 会为旧数据库补充该字段。
+- 检索结果、历史列表和论文详情页都会展示出版商。
+- 数据源没有提供出版商时，页面可能显示“未知”；这并不一定表示论文没有出版商。
 
-```text
-origin https://github.com/a18743530603/Paper-search.git
-```
+## 后续讨论形成的方向
 
-- Renamed branch from `master` to `main`.
-- Pushed initial project to GitHub.
-- Rewrote README for beginners and pushed:
+- 当前系统是 arXiv 与 Crossref 的简单多来源召回，不是完整 RAG，也不是 GraphRAG。
+- 建议先加入 DOI 识别、OpenAlex、Unpaywall、去重、结果融合和重排序，再扩展传统 RAG。
+- 传统 RAG 可增加 PDF 解析、分块、向量化、向量数据库以及带引用回答；GraphRAG 可作为更后期的高级功能。
+- 若部署为公网网站，还需要服务器、域名与 HTTPS、生产数据库、对象存储、任务队列、用户与安全限流、日志监控及容器化。
 
-```text
-b22e7e8 Rewrite README for Paper Hunter
-```
+## 用户偏好和维护约定
 
-## README Status
+- 解释应面向新手，同时保留可用于面试和简历的技术细节。
+- 优先让项目稳定、合规、可演示，再逐步增加复杂能力。
+- 修改项目记忆时继续使用仓库根目录的 `AGENTS.md`。
+- 命令、路径、接口、字段名和代码标识符应保持原样，不要为了中文化而翻译它们。
 
-`README.md` has already been rewritten from the old smolagents documentation into a beginner-friendly project document. It explains:
+## 已知环境信息
 
-- What the project does.
-- How to run it.
-- How to use it.
-- Directory structure.
-- Module responsibilities.
-- How modules connect.
-- Background task workflow.
-- Crossref fallback strategy.
-- Runtime data paths.
-- Common commands.
-- Resume description.
-- Possible future extensions.
-
-## Important User Preferences
-
-- The user wants explanations that are beginner-friendly.
-- The user wants the project to look good on a resume.
-- The user values clear module explanations and practical project documentation.
-- The user asked for this memory file so future conversations do not lose context.
-- If modifying project memory again, keep it in the repository root as `AGENTS.md`.
-
-## Known Environment Notes
-
-- Workspace path:
-
-```text
-C:\Users\28319\Desktop\<Chinese folder name>\smolagent
-```
-
-- Windows path contains Chinese characters.
-- Earlier `.venv` invocation had encoding/path issues; using `uv run ...` is the recommended way to run commands.
-- Git safe.directory was configured during the session because the repository was initialized under a sandbox user and later operated by the Windows user.
-
-## Current Quality Checks
-
-The latest tested result before this memory file was added:
-
-```text
-uv run pytest
-6 passed
-```
-
-No need to retest after editing only documentation unless code is changed.
-
-## Later Feature Addition
-
-The app was updated to store and display `publisher`:
-
-- arXiv records use `publisher = "arXiv"`.
-- Crossref records use the Crossref `publisher` field, for example `Elsevier BV` or Springer publisher names.
-- The SQLite schema now includes a `publisher` column and `init_db()` migrates older local databases by adding the column if missing.
-- The results/history table and detail page display publisher.
+- 工作区位于 Windows 中文路径下。
+- 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
+- Git 曾因仓库所有者不同配置过 `safe.directory`。
+- 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
