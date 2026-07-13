@@ -1,3 +1,5 @@
+import csv
+from collections import Counter
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -597,6 +599,32 @@ def test_evidence_coverage_tolerates_pdf_line_breaks():
     candidate = "including the three splits (adver-\n sarial, random and popular)."
 
     assert evaluation_service.evidence_coverage(evidence, candidate) == 1.0
+
+
+def test_benchmark_dataset_has_balanced_twelve_papers_and_sixty_cases():
+    benchmark_path = Path(__file__).parents[1] / "benchmarks" / "chunking_baseline.csv"
+    with benchmark_path.open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+
+    paper_counts = Counter(row["paper_title"] for row in rows)
+    type_counts = Counter(row["question_type"] for row in rows)
+    unique_questions = {
+        (row["paper_title"], row["question"])
+        for row in rows
+    }
+
+    assert len(rows) == 60
+    assert len(paper_counts) == 12
+    assert set(paper_counts.values()) == {5}
+    assert type_counts == {
+        "事实型": 12,
+        "方法型": 12,
+        "参数型": 12,
+        "结果型": 12,
+        "原因型": 12,
+    }
+    assert len(unique_questions) == 60
+    assert all(int(row["evidence_page"]) > 0 for row in rows)
 
 
 def test_evaluation_metrics_include_hit_and_mrr():
