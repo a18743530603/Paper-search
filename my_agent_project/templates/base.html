@@ -12,6 +12,7 @@
       <nav>
         <a href="/">搜索</a>
         <a href="/papers">历史</a>
+        <a href="/origin">Origin 绘图</a>
         <a href="/export.csv">CSV</a>
         <a href="/export.json">JSON</a>
       </nav>
@@ -19,6 +20,6 @@
     <main class="page">
       {% block content %}{% endblock %}
     </main>
+    <script src="{{ url_for('static', path='/status_poll.js') }}" defer></script>
   </body>
 </html>
-

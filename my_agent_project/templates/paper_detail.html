@@ -2,7 +2,7 @@
 {% block title %}论文详情 - Paper Hunter{% endblock %}
 {% block content %}
 <article class="detail">
-  <p class="eyebrow">{{ paper["source"] }} / {{ paper["status"] }}</p>
+  <p class="eyebrow">{{ paper["source"] }} / <span data-download-status>{{ paper["status"] }}</span></p>
   <h1>{{ paper["title"] }}</h1>
   <dl>
     <dt>作者</dt><dd>{{ paper["authors"] or "未知" }}</dd>
@@ -12,13 +12,133 @@
     <dt>网页地址</dt><dd><a href="{{ paper["page_url"] }}" target="_blank" rel="noreferrer">{{ paper["page_url"] }}</a></dd>
     <dt>PDF 地址</dt><dd>{{ paper["pdf_url"] or "无明确 PDF 直链" }}</dd>
     <dt>本地文件</dt><dd>{{ paper["local_path"] or "尚未下载" }}</dd>
+    <dt>下载日期</dt><dd data-downloaded-at>{{ paper["downloaded_at"] or "尚未下载" }}</dd>
     <dt>失败原因</dt><dd>{{ paper["error"] or "无" }}</dd>
   </dl>
   <h2>摘要</h2>
   <p>{{ paper["summary"] or "暂无摘要。" }}</p>
-  <form action="/papers/{{ paper["id"] }}/retry" method="post">
-    <button type="submit">重新尝试下载</button>
-  </form>
+
+  <section class="document-section">
+    <h2>全文解析</h2>
+    {% if paper["local_path"] %}
+      <p>
+        解析状态：
+        <span class="status" data-parse-status>{{ document["parse_status"] if document else "not_started" }}</span>
+        {% if document and document["parse_status"] == "parsed" %}
+          ，共 {{ document["page_count"] }} 页、{{ document["chunk_count"] }} 个文本块。
+        {% endif %}
+      </p>
+      {% if document and document["error"] %}
+        <p class="alert">{{ document["error"] }}</p>
+      {% endif %}
+      <form action="/papers/{{ paper["id"] }}/parse" method="post">
+        <button type="submit">{{ "重新解析 PDF" if document and document["parse_status"] == "parsed" else "解析 PDF" }}</button>
+      </form>
+    {% else %}
+      <div class="access-notice">
+        <strong>暂时无法进行全文问答</strong>
+        <p>{{ access_notice }}</p>
+        <a class="button secondary" href="{{ paper['page_url'] }}" target="_blank" rel="noreferrer">前往论文网站</a>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if chunks %}
+    <section class="document-section">
+      <h2>已解析文本预览</h2>
+      {% for chunk in chunks %}
+        <article class="chunk-preview">
+          <p class="chunk-meta">第 {{ chunk["page_number"] }} 页 / 文本块 {{ chunk["chunk_index"] + 1 }}</p>
+          <p>{{ chunk["content"] }}</p>
+        </article>
+      {% endfor %}
+    </section>
+  {% endif %}
+
+  {% if document and document["parse_status"] == "parsed" %}
+    <section class="document-section">
+      <h2>RAG 向量索引</h2>
+      <p>
+        索引状态：
+        <span class="status" data-index-status>{{ document["index_status"] or "not_indexed" }}</span>
+        {% if document["indexed_at"] %}，建立时间：{{ document["indexed_at"] }}{% endif %}
+        {% if document["vectorizer"] %}，检索器：{{ document["vectorizer"] }}{% endif %}
+      </p>
+      {% if document["index_error"] %}
+        {% if document["index_status"] == "indexed" %}
+          <div class="access-notice"><p>{{ document["index_error"] }}</p></div>
+        {% else %}
+          <p class="alert">{{ document["index_error"] }}</p>
+        {% endif %}
+      {% endif %}
+      {% if document["index_status"] != "indexing" %}
+        <form action="/papers/{{ paper['id'] }}/index" method="post">
+          <button type="submit">{{ "重新建立索引" if document["index_status"] == "indexed" else "建立向量索引" }}</button>
+        </form>
+      {% else %}
+        <p class="task-message">正在建立本地 TF-IDF 向量索引，状态会自动更新。</p>
+      {% endif %}
+    </section>
+  {% endif %}
+
+  {% if document and document["index_status"] == "indexed" %}
+    <section class="document-section rag-section">
+      <h2>DeepSeek 论文问答</h2>
+      <p class="section-note">系统先检索相关原文片段，再交给 DeepSeek 回答，并保留页码证据。</p>
+      {% if deepseek_ready %}
+        <form class="question-form" action="/papers/{{ paper['id'] }}/ask" method="post">
+          <label for="question">向这篇论文提问</label>
+          <textarea id="question" name="question" rows="4" maxlength="1000" placeholder="例如：这篇论文使用了什么数据集？" required></textarea>
+          <button type="submit">提交问题</button>
+        </form>
+      {% else %}
+        <div class="access-notice">
+          <strong>DeepSeek 尚未配置</strong>
+          <p>请在项目根目录创建 `.env`，填写 `DEEPSEEK_API_KEY`，然后重启服务。搜索、下载、解析和本地检索不受影响。</p>
+        </div>
+      {% endif %}
+
+      {% if rag_queries %}
+        <div class="qa-history">
+          <h3>问答记录</h3>
+          {% for item in rag_queries %}
+            <article class="qa-item">
+              <p class="question-text">问题：{{ item["question"] }}</p>
+              <p>状态：<span class="status" {% if loop.first %}data-rag-status{% endif %}>{{ item["status"] }}</span></p>
+              {% if item["answer"] %}
+                <div class="answer-text">{{ item["answer"] }}</div>
+              {% endif %}
+              {% if item["error"] %}<p class="alert">{{ item["error"] }}</p>{% endif %}
+              {% if item["evidence"] %}
+                <details>
+                  <summary>查看检索证据（{{ item["evidence"]|length }} 条）</summary>
+                  {% for evidence in item["evidence"] %}
+                    <div class="evidence-item">
+                      <strong>
+                        第 {{ evidence["page_number"] }} 页，综合分数 {{ "%.3f"|format(evidence["score"]) }}
+                        {% if evidence.get("semantic_score") is not none %}
+                          （语义 {{ "%.3f"|format(evidence["semantic_score"]) }} / 关键词 {{ "%.3f"|format(evidence["keyword_score"]) }}）
+                        {% endif %}
+                      </strong>
+                      <p>{{ evidence["content"] }}</p>
+                    </div>
+                  {% endfor %}
+                </details>
+              {% endif %}
+              {% if item["model"] %}<p class="model-meta">模型：{{ item["model"] }}</p>{% endif %}
+            </article>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+  {% endif %}
+
+  {% if paper["pdf_url"] and not paper["local_path"] and paper["status"] != "downloading" %}
+    <form action="/papers/{{ paper["id"] }}/download" method="post">
+      <button type="submit">{{ "重新下载 PDF" if paper["status"] == "failed" else "下载 PDF" }}</button>
+    </form>
+  {% elif paper["status"] == "downloading" %}
+    <p class="task-message">PDF 正在后台下载，状态会自动更新。</p>
+  {% endif %}
 </article>
 {% endblock %}
-

@@ -4,7 +4,7 @@ from typing import Any
 
 import requests
 
-from .schemas import PaperCandidate, STATUS_DOWNLOADING, STATUS_FAILED, STATUS_LINK_ONLY
+from .schemas import PaperCandidate, STATUS_AVAILABLE, STATUS_FAILED, STATUS_LINK_ONLY
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
@@ -49,7 +49,7 @@ def parse_arxiv_feed(xml_text: str) -> list[PaperCandidate]:
                 doi=None,
                 page_url=page_url,
                 pdf_url=arxiv_pdf_url(page_url),
-                status=STATUS_DOWNLOADING,
+                status=STATUS_AVAILABLE,
             )
         )
     return papers
@@ -134,7 +134,7 @@ def parse_crossref_items(items: list[dict[str, Any]]) -> list[PaperCandidate]:
                 doi=normalize_text(item.get("DOI")) or None,
                 page_url=page_url,
                 pdf_url=pdf_url,
-                status=STATUS_DOWNLOADING if pdf_url else STATUS_LINK_ONLY,
+                status=STATUS_AVAILABLE if pdf_url else STATUS_LINK_ONLY,
             )
         )
     return papers

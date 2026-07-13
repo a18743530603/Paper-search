@@ -4,8 +4,8 @@
 <section class="hero">
   <div>
     <p class="eyebrow">Literature Search Assistant</p>
-    <h1>搜索关键词，归档论文链接，并后台下载开放 PDF。</h1>
-    <p class="lede">优先下载 arXiv PDF；Crossref 结果在没有明确 PDF 直链时自动降级为链接记录。</p>
+    <h1>搜索关键词，归档论文链接，并按需下载开放 PDF。</h1>
+    <p class="lede">优先识别 arXiv PDF；发现可下载文件后由你手动确认，Crossref 没有明确 PDF 直链时保存为链接记录。</p>
   </div>
   <form class="search-form" action="/search" method="post">
     {% if error %}<div class="alert">{{ error }}</div>{% endif %}
@@ -17,4 +17,3 @@
   </form>
 </section>
 {% endblock %}
-

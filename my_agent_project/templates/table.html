@@ -8,12 +8,13 @@
         <th>出版商</th>
         <th>时间</th>
         <th>状态</th>
+        <th>下载日期</th>
         <th>链接</th>
       </tr>
     </thead>
     <tbody>
       {% for paper in papers %}
-      <tr>
+      <tr data-paper-row data-paper-id="{{ paper['id'] }}">
         <td>
           <a class="paper-title" href="/papers/{{ paper["id"] }}">{{ paper["title"] }}</a>
           <span class="authors">{{ paper["authors"] or "未知作者" }}</span>
@@ -22,10 +23,16 @@
         <td><span class="badge">{{ paper["source"] }}</span></td>
         <td>{{ paper["publisher"] or "-" }}</td>
         <td>{{ paper["published"] or "-" }}</td>
-        <td><span class="status status-{{ paper["status"] }}">{{ paper["status"] }}</span></td>
+        <td><span class="status status-{{ paper["status"] }}" data-download-status>{{ paper["status"] }}</span></td>
+        <td data-downloaded-at>{{ paper["downloaded_at"] or "-" }}</td>
         <td>
           {% if paper["page_url"] %}<a href="{{ paper["page_url"] }}" target="_blank" rel="noreferrer">网页</a>{% endif %}
           {% if paper["pdf_url"] %}<a href="{{ paper["pdf_url"] }}" target="_blank" rel="noreferrer">PDF</a>{% endif %}
+          {% if paper["pdf_url"] and paper["status"] in ["available", "failed"] %}
+            <form class="inline-form" action="/papers/{{ paper['id'] }}/download" method="post">
+              <button class="link-button" type="submit">{{ "重新下载" if paper["status"] == "failed" else "下载" }}</button>
+            </form>
+          {% endif %}
         </td>
       </tr>
       {% endfor %}
@@ -35,4 +42,3 @@
 {% else %}
 <p class="empty">还没有记录。</p>
 {% endif %}
-

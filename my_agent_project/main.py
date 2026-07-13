@@ -10,18 +10,33 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .agent_service import enhance_query
+from .model_service import enhance_query, is_deepseek_configured
 from .config import BASE_DIR, MAX_RESULTS, configure_utf8_stdio, ensure_runtime_dirs
 from .db import (
+    clear_paper_history,
+    create_rag_query,
     export_papers_csv,
     export_papers_json,
+    get_document,
+    get_or_create_document,
     get_paper,
     init_db,
     insert_papers,
+    list_paper_chunks,
+    list_paper_statuses,
     list_papers,
+    list_rag_queries,
+    update_download_status,
 )
-from .download_service import download_paper
-from .schemas import STATUS_DOWNLOADING
+from .download_service import can_attempt_download, download_paper
+from .origin_service import create_origin_outputs
+from .pdf_service import parse_paper_pdf
+from .rag_service import (
+    answer_rag_query,
+    build_access_notice,
+    index_paper_chunks,
+)
+from .schemas import INDEX_INDEXED, PARSE_PARSED, STATUS_DOWNLOADING
 from .search_service import search_all
 
 
@@ -32,7 +47,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.1.0")
+app = FastAPI(title="Paper Hunter", version="0.2.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -48,7 +63,6 @@ def home(request: Request):
 @app.post("/search")
 def search(
     request: Request,
-    background_tasks: BackgroundTasks,
     query: str = Form(...),
     max_results: int = Form(MAX_RESULTS),
 ):
@@ -68,10 +82,6 @@ def search(
     enhanced_query = enhance_query(query)
     candidates = search_all(enhanced_query, max_results)
     paper_ids = insert_papers(query, candidates)
-
-    for paper_id, paper in zip(paper_ids, candidates):
-        if paper.status == STATUS_DOWNLOADING:
-            background_tasks.add_task(download_paper, paper_id)
 
     papers = [get_paper(paper_id) for paper_id in paper_ids]
     return templates.TemplateResponse(
@@ -94,16 +104,83 @@ def papers(request: Request):
     )
 
 
+@app.post("/papers/clear")
+def clear_history():
+    clear_paper_history()
+    return RedirectResponse(url="/papers", status_code=303)
+
+
+@app.get("/api/papers/statuses")
+def paper_statuses():
+    return {"papers": list_paper_statuses()}
+
+
 @app.get("/papers/{paper_id}")
 def paper_detail(request: Request, paper_id: int):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
+    document = get_document(paper_id)
+    chunks = list_paper_chunks(paper_id, limit=8)
+    rag_queries = list_rag_queries(paper_id)
     return templates.TemplateResponse(
         request,
         "paper_detail.html",
-        {"paper": paper},
+        {
+            "paper": paper,
+            "document": document,
+            "chunks": chunks,
+            "rag_queries": rag_queries,
+            "deepseek_ready": is_deepseek_configured(),
+            "access_notice": build_access_notice(dict(paper)),
+        },
     )
+
+
+@app.post("/papers/{paper_id}/parse")
+def parse_paper(paper_id: int, background_tasks: BackgroundTasks):
+    paper = get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if not paper["local_path"]:
+        raise HTTPException(status_code=409, detail="Paper PDF is not downloaded")
+    get_or_create_document(paper_id)
+    background_tasks.add_task(parse_paper_pdf, paper_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.post("/papers/{paper_id}/index")
+def index_paper(paper_id: int, background_tasks: BackgroundTasks):
+    paper = get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    document = get_document(paper_id)
+    if document is None or document["parse_status"] != PARSE_PARSED:
+        raise HTTPException(status_code=409, detail="Paper is not parsed")
+    background_tasks.add_task(index_paper_chunks, paper_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.post("/papers/{paper_id}/ask")
+def ask_paper(
+    paper_id: int,
+    background_tasks: BackgroundTasks,
+    question: str = Form(...),
+):
+    paper = get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    document = get_document(paper_id)
+    if document is None or document["index_status"] != INDEX_INDEXED:
+        raise HTTPException(status_code=409, detail="Paper is not indexed")
+    question = question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+    if len(question) > 1000:
+        raise HTTPException(status_code=400, detail="Question is too long")
+    query_id = create_rag_query(paper_id, question)
+    background_tasks.add_task(answer_rag_query, query_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/retry")
@@ -111,8 +188,59 @@ def retry_download(paper_id: int, background_tasks: BackgroundTasks):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
+    if not can_attempt_download(paper["source"], paper["pdf_url"]):
+        raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
+    update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
     background_tasks.add_task(download_paper, paper_id)
-    return RedirectResponse(url="/papers", status_code=303)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.post("/papers/{paper_id}/download")
+def start_download(paper_id: int, background_tasks: BackgroundTasks):
+    paper = get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if not can_attempt_download(paper["source"], paper["pdf_url"]):
+        raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
+    if paper["status"] == STATUS_DOWNLOADING:
+        return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+    update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
+    background_tasks.add_task(download_paper, paper_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.get("/origin")
+def origin_dashboard(request: Request):
+    output = create_origin_outputs()
+    image_urls = [
+        f"/origin/images/{image_path.name}"
+        for image_path in output.image_paths
+    ]
+    return templates.TemplateResponse(
+        request,
+        "origin.html",
+        {"output": output, "image_urls": image_urls},
+    )
+
+
+@app.get("/origin/summary.csv")
+def origin_summary_csv():
+    output = create_origin_outputs(launch_origin=False)
+    return FileResponse(
+        output.summary_csv,
+        filename="paper_hunter_origin_summary.csv",
+        media_type="text/csv",
+    )
+
+
+@app.get("/origin/images/{filename}")
+def origin_image(filename: str):
+    from .config import ORIGIN_EXPORTS_DIR
+
+    path = ORIGIN_EXPORTS_DIR / filename
+    if path.parent != ORIGIN_EXPORTS_DIR or path.suffix.lower() != ".png" or not path.exists():
+        raise HTTPException(status_code=404, detail="Origin image not found")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/export.csv")

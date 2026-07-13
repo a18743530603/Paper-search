@@ -8,11 +8,10 @@
     {% if enhanced_query != query %}
       <p class="lede">增强检索词：{{ enhanced_query }}</p>
     {% else %}
-      <p class="lede">PDF 下载已转入后台，可在历史页刷新查看状态。</p>
+      <p class="lede">发现可用 PDF 后可手动点击下载，状态每 2 秒自动更新。</p>
     {% endif %}
   </div>
   <a class="button secondary" href="/papers">查看历史进度</a>
 </section>
 {% include "table.html" %}
 {% endblock %}
-

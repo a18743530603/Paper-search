@@ -1,5 +1,11 @@
 # Paper Hunter 的 Origin 绘图功能
 
+> 适用版本：`v0.2.0`
+>
+> 更新日期：`2026-07-12`
+>
+> 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
+
 Paper Hunter 可以把论文统计结果整理成适合 Origin 导入的数据。如果同一台 Windows 电脑已经安装 Origin 或 OriginPro，项目还可以调用 Origin 自动创建图表。
 
 ## Codex 如何操作 Origin

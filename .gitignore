@@ -15,6 +15,7 @@ env/
 
 # Local runtime data
 downloads/
+outputs/
 *.db
 *.sqlite
 *.sqlite3
@@ -31,4 +32,3 @@ downloads/
 Thumbs.db
 .idea/
 .vscode/
-

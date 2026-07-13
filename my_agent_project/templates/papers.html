@@ -5,10 +5,15 @@
   <div>
     <p class="eyebrow">Archive</p>
     <h1>历史记录与下载进度</h1>
-    <p class="lede">状态会随着后台任务更新。刷新页面即可看到最新结果。</p>
+    <p class="lede">下载、解析、索引和问答状态每 2 秒自动更新，无需手动刷新页面。</p>
   </div>
-  <a class="button secondary" href="/">继续搜索</a>
+  <div class="page-actions">
+    <a class="button secondary" href="/">继续搜索</a>
+    <form action="/papers/clear" method="post" onsubmit="return confirm('确定清空全部历史记录吗？本地已经下载的 PDF 文件会保留。');">
+      <button class="button danger" type="submit">清空历史记录</button>
+    </form>
+  </div>
 </section>
+<p class="history-note">清空历史记录只删除数据库记录、解析状态和文本块，本地已经下载的 PDF 文件会保留。</p>
 {% include "table.html" %}
 {% endblock %}
-

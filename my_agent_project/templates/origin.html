@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Origin 绘图 - Paper Hunter{% endblock %}
+{% block content %}
+<section class="section-head">
+  <div>
+    <p class="eyebrow">Origin Charts</p>
+    <h1>用 Origin 统计论文结果</h1>
+    <p class="lede">系统会把 SQLite 中的论文记录整理为 Origin 可导入的 CSV，并在本机装有 Origin/OriginPro 与 originpro 包时自动生成图表。</p>
+  </div>
+  <a class="button secondary" href="/origin/summary.csv">下载 Origin CSV</a>
+</section>
+
+{% if output.error %}
+  <div class="alert">
+    {{ output.error }}
+  </div>
+{% endif %}
+
+<section class="detail">
+  <h1>生成结果</h1>
+  <dl>
+    <dt>状态</dt>
+    <dd>{{ output.message }}</dd>
+    <dt>CSV</dt>
+    <dd>{{ output.summary_csv }}</dd>
+    <dt>Origin 工程</dt>
+    <dd>{{ output.project_path if output.project_path else "尚未生成" }}</dd>
+  </dl>
+</section>
+
+{% if image_urls %}
+  <section class="chart-grid">
+    {% for image_url in image_urls %}
+      <figure class="chart-card">
+        <img src="{{ image_url }}" alt="Origin chart">
+      </figure>
+    {% endfor %}
+  </section>
+{% endif %}
+{% endblock %}
