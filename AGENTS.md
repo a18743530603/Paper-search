@@ -1,10 +1,12 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.6.1`
+> 当前版本：`v0.7.0`
 >
 > 更新日期：`2026-07-13`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
+>
+> 完整实验步骤与待办：见 [EXPERIMENTS.md](EXPERIMENTS.md)
 
 本文件记录创建和维护本项目时形成的重要背景，供以后在本仓库中新开的 Codex 对话读取，避免丢失项目上下文。
 
@@ -48,11 +50,11 @@ https://github.com/a18743530603/Paper-search.git
 - `schemas.py`：定义 `PaperCandidate` 和 `available`、`downloading`、`downloaded`、`link_only`、`failed` 等状态。
 - `search_service.py`：检索并解析 arXiv XML 和 Crossref JSON，生成论文元数据和下载策略。
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常。
-- `db.py`：初始化和操作 SQLite，保存论文、更新状态并导出 CSV/JSON。
+- `db.py`：初始化和操作 SQLite，保存论文、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
-- `pdf_service.py`：使用 `pypdf` 按页提取正文，支持固定边界与论文章节感知分块、章节层级继承、参考文献过滤和附录恢复，并在后台更新解析状态。
-- `rag_service.py`：Seed 稠密向量、TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
-- `evaluation_service.py`：导入人工标注基准、校验含策略的 `ExperimentConfig`、按实验参数重建 PDF 分块与索引、统计章节路径、匹配标准证据并聚合 Hit/Recall/MRR 指标。
+- `pdf_service.py`：使用 PDF 内容哈希复用页文本，支持固定边界与论文章节感知分块、章节层级继承、参考文献过滤和附录恢复，并在后台更新解析状态。
+- `rag_service.py`：按模型命名空间与文本哈希缓存 Seed 稠密向量，提供 TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
+- `evaluation_service.py`：导入人工标注基准、校验 `ExperimentConfig`、按配置差异复用或重建分块与索引、记录缓存命中与耗时、匹配标准证据并聚合 Hit/Recall/MRR 指标。
 - `origin_service.py`：整理统计数据，并在本机安装 Origin/OriginPro 时尝试自动生成图表。
 - `templates/`：Jinja2 页面模板。
 - `static/styles.css`：网页样式。
@@ -219,6 +221,23 @@ git push
 - 章节策略逐题排名改善 `17` 题、变差 `12` 题、持平 `31` 题；Top-5 新增 `3` 题、丢失 `7` 题。丢失题的证据仍完整存在于章节语料，因此属于排序变化。
 - 当前结论：章节分块提高首位精度，尤其改善方法型与参数型，但尚未稳定提高召回广度；默认策略仍保留 `length_boundary`，下一步测试查询扩展或重排序。
 
+## v0.7.0 实验增量缓存
+
+- 新增 `pdf_text_cache`：以 PDF SHA-256 `source_hash` 和物理页码为主键保存页文本；切换分块策略时不得再次调用 `pypdf` 提取相同文件。
+- 新增 `embedding_cache`：以 `cache_namespace + content_hash` 为主键保存 Seed 向量；命名空间包含服务地址、模型和文本/多模态接口模式，不得跨模型误用向量。
+- `paper_documents` 新增 `source_hash`、`chunk_strategy`、`chunk_size`、`chunk_overlap` 和 `embedding_namespace`，用于判断当前分块与索引是否可直接复用。
+- `pdf_service.pdf_source_hash()` 计算文件指纹；`extract_pdf_pages()` 与 `build_pdf_chunks()` 分离昂贵的文本提取和可重复分块；`parse_paper_pdf()` 返回缓存状态。
+- `rag_service.embedding_content_hash()` 生成文本缓存键；`cache_active_chunk_embeddings()` 将升级前已有的稠密向量回填；块向量与问题向量均通过 `_cached_seed_embeddings()` 去重和复用。
+- `rag_service.document_index_is_reusable()` 校验当前索引状态与 Seed 命名空间；只有 PDF/分块/模型发生相关变化时才重建对应层。
+- `run_configured_experiment()` 的 `metrics_json` 新增 `cache_stats`、`preparation_seconds`、`evaluation_seconds` 和 `total_duration_seconds`；评测页展示缓存命中/新增数量和总耗时。
+- 缓存失效规则：只改 Top-K 或融合权重时直接复用分块、索引和问题向量；改分块策略/大小/重叠时复用页文本和问题向量，仅补算新块；改 PDF 或 Seed 模型时失效对应缓存。
+- 当前缓存功能自动化测试为 `35 passed`；正式检索指标仍沿用 `v0.6.1` 的运行 `#5/#6`，缓存只改变计算路径，不改变算法得分。
+- 真实预热运行 `#7`：211 页首次写入、794 个旧块向量回填并命中、60 个问题向量首次生成，总耗时 `105.876` 秒。
+- 全缓存运行 `#8`：794 个分块、12 篇论文索引和 60 个问题向量全部命中，Seed 请求为 0，总耗时 `4.406` 秒，约快 `24.0` 倍；指标与 `#7` 完全一致。
+- `#7` 与旧 `#6` 的 Hit@1/MRR 有轻微差异，因为旧版未持久化问题向量，预热时重新请求了 Seed；从 `#7` 开始问题向量被冻结缓存，后续实验应以同一缓存做公平比较。
+- C0 缓存步骤完成后必须停下，未经用户确认不得继续实现 E2 章节前缀消融。
+- 后续实验优先级：章节前缀消融；冻结的中英双路查询 + BM25/RRF；Top-20 重排；随后再评估父子块和表格专用分块。Late Chunking 依赖 token 级长上下文向量，当前 Seed API 不支持；RAPTOR 与原子命题索引暂不适合当前单段证据基准。
+
 ## 用户偏好和维护约定
 
 - 解释应面向新手，同时保留可用于面试和简历的技术细节。
@@ -228,6 +247,7 @@ git push
 - 每次增加或修改项目功能时，必须在同一次更新中同步维护 Markdown 文档，准确记录新增模块、函数、接口、数据库字段或表、状态、测试和使用方法。
 - 每次功能更新都必须确定新的语义化版本号，并在相关 Markdown 文档顶部更新“当前版本/适用版本”和“更新日期”。
 - 每次功能更新都必须在 `CHANGELOG.md` 顶部新增一条记录，写明日期、版本、新增功能、修改内容、测试结果和仍未实现的范围。
+- 每次实验必须同步更新 `EXPERIMENTS.md`，记录假设、唯一变量、固定参数、代码改动、运行编号、缓存统计、指标、异常、结论和未完成项；一次只完成一个实验变量，得到用户确认后再进入下一项。
 - `pyproject.toml` 与 FastAPI 应用中的版本号必须和文档当前版本保持一致。
 - 早期没有可靠日期的历史记录应明确写“日期未记录”，不得猜测日期。
 
@@ -237,7 +257,7 @@ git push
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前 `v0.6.1` 已于 `2026-07-13` 完成验证：正式基准包含 12 篇论文、60 题，新增证据已逐页核验，固定边界与章节感知完整对照实验均已完成，自动化测试为 `33 passed`。
+- 当前 `v0.7.0` 已于 `2026-07-13` 完成验证：正式基准包含 12 篇论文、60 题，固定边界与章节感知完整对照实验均已完成，增量缓存自动化测试为 `35 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import re
@@ -6,16 +7,24 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .db import (
+    get_cached_embeddings,
     get_document,
     get_paper,
     get_rag_query,
     list_indexed_chunks,
     list_paper_chunks,
     replace_chunk_vectors,
+    upsert_cached_embeddings,
     update_index_status,
     update_rag_query,
 )
-from .model_service import ask_deepseek, embed_with_seed, is_seed_configured
+from .config import SEED_EMBEDDING_MODEL
+from .model_service import (
+    ask_deepseek,
+    embed_with_seed,
+    is_seed_configured,
+    seed_embedding_cache_namespace,
+)
 from .schemas import (
     INDEX_FAILED,
     INDEX_INDEXED,
@@ -75,7 +84,106 @@ def term_frequency(text: str) -> dict[str, float]:
     return {term: count / total for term, count in counts.items()}
 
 
-def index_paper_chunks(paper_id: int) -> None:
+def _increment_cache_stat(
+    cache_stats: dict[str, int] | None,
+    name: str,
+    amount: int = 1,
+) -> None:
+    if cache_stats is not None:
+        cache_stats[name] = cache_stats.get(name, 0) + amount
+
+
+def embedding_content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _cached_seed_embeddings(
+    texts: list[str],
+    *,
+    cache_kind: str,
+    cache_stats: dict[str, int] | None = None,
+) -> tuple[list[list[float]], str]:
+    namespace = seed_embedding_cache_namespace()
+    content_hashes = [embedding_content_hash(text) for text in texts]
+    unique_texts = dict(zip(content_hashes, texts))
+    cached = get_cached_embeddings(namespace, unique_texts)
+    missing = {
+        content_hash: text
+        for content_hash, text in unique_texts.items()
+        if content_hash not in cached
+    }
+    _increment_cache_stat(
+        cache_stats,
+        f"{cache_kind}_embedding_hits",
+        len(unique_texts) - len(missing),
+    )
+    _increment_cache_stat(
+        cache_stats,
+        f"{cache_kind}_embedding_misses",
+        len(missing),
+    )
+
+    model = SEED_EMBEDDING_MODEL
+    missing_items = list(missing.items())
+    for start in range(0, len(missing_items), SEED_BATCH_SIZE):
+        batch = missing_items[start : start + SEED_BATCH_SIZE]
+        batch_vectors, model = embed_with_seed([text for _, text in batch])
+        if len(batch_vectors) != len(batch):
+            raise RuntimeError("Seed Embedding 返回的缓存向量数量不正确")
+        new_vectors = {
+            content_hash: vector
+            for (content_hash, _), vector in zip(batch, batch_vectors)
+        }
+        upsert_cached_embeddings(namespace, new_vectors)
+        cached.update(new_vectors)
+
+    return [cached[content_hash] for content_hash in content_hashes], model
+
+
+def cache_active_chunk_embeddings(
+    paper_id: int,
+    cache_stats: dict[str, int] | None = None,
+) -> int:
+    if not is_seed_configured():
+        return 0
+    namespace = seed_embedding_cache_namespace()
+    document = get_document(paper_id)
+    if document is not None and document["embedding_namespace"] == namespace:
+        return 0
+    rows = list_indexed_chunks(paper_id)
+    candidates: dict[str, list[float]] = {}
+    for row in rows:
+        if not row["dense_vector_json"]:
+            continue
+        try:
+            vector = json.loads(row["dense_vector_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(vector, list) and vector:
+            candidates[embedding_content_hash(row["content"])] = vector
+    existing = get_cached_embeddings(namespace, candidates)
+    missing = {
+        content_hash: vector
+        for content_hash, vector in candidates.items()
+        if content_hash not in existing
+    }
+    upsert_cached_embeddings(namespace, missing)
+    _increment_cache_stat(cache_stats, "chunk_embedding_backfilled", len(missing))
+    return len(missing)
+
+
+def document_index_is_reusable(document: Mapping[str, Any] | None) -> bool:
+    if document is None or document["index_status"] != INDEX_INDEXED:
+        return False
+    if not is_seed_configured():
+        return document["vectorizer"] == VECTOR_MODEL
+    return document["embedding_namespace"] == seed_embedding_cache_namespace()
+
+
+def index_paper_chunks(
+    paper_id: int,
+    cache_stats: dict[str, int] | None = None,
+) -> None:
     update_index_status(paper_id, INDEX_INDEXING, error=None)
     try:
         chunks = list_paper_chunks(paper_id, limit=100_000)
@@ -90,21 +198,22 @@ def index_paper_chunks(paper_id: int) -> None:
         dense_vectors: dict[int, list[float]] = {}
         vectorizer = VECTOR_MODEL
         warning = None
+        embedding_namespace = None
         if is_seed_configured():
             try:
-                seed_model = ""
-                for start in range(0, len(chunks), SEED_BATCH_SIZE):
-                    batch = chunks[start : start + SEED_BATCH_SIZE]
-                    batch_vectors, seed_model = embed_with_seed(
-                        [chunk["content"] for chunk in batch]
-                    )
-                    dense_vectors.update(
-                        {
-                            int(chunk["id"]): vector
-                            for chunk, vector in zip(batch, batch_vectors)
-                        }
-                    )
+                batch_vectors, seed_model = _cached_seed_embeddings(
+                    [chunk["content"] for chunk in chunks],
+                    cache_kind="chunk",
+                    cache_stats=cache_stats,
+                )
+                dense_vectors.update(
+                    {
+                        int(chunk["id"]): vector
+                        for chunk, vector in zip(chunks, batch_vectors)
+                    }
+                )
                 vectorizer = f"hybrid:{seed_model}+{VECTOR_MODEL}"
+                embedding_namespace = seed_embedding_cache_namespace()
             except Exception as exc:
                 dense_vectors = {}
                 warning = f"Seed Embedding 暂时不可用，已降级为 TF-IDF：{exc}"[:500]
@@ -114,6 +223,7 @@ def index_paper_chunks(paper_id: int) -> None:
             vectorizer=vectorizer,
             dense_vectors=dense_vectors,
             warning=warning,
+            embedding_namespace=embedding_namespace,
         )
     except Exception as exc:
         update_index_status(paper_id, INDEX_FAILED, error=str(exc)[:500])
@@ -156,6 +266,7 @@ def retrieve_relevant_chunks(
     top_k: int = 6,
     semantic_weight: float = SEMANTIC_WEIGHT,
     keyword_weight: float = KEYWORD_WEIGHT,
+    cache_stats: dict[str, int] | None = None,
 ) -> list[dict]:
     if semantic_weight < 0 or keyword_weight < 0:
         raise ValueError("retrieval weights must not be negative")
@@ -184,7 +295,11 @@ def retrieve_relevant_chunks(
     question_dense: list[float] | None = None
     if is_seed_configured() and any(row["dense_vector_json"] for row in rows):
         try:
-            dense_vectors, _model = embed_with_seed([question])
+            dense_vectors, _model = _cached_seed_embeddings(
+                [question],
+                cache_kind="query",
+                cache_stats=cache_stats,
+            )
             question_dense = dense_vectors[0]
         except Exception:
             question_dense = None

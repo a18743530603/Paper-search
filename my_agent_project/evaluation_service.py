@@ -1,5 +1,6 @@
 import csv
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -26,6 +27,8 @@ from .pdf_service import (
 from .rag_service import (
     KEYWORD_WEIGHT,
     SEMANTIC_WEIGHT,
+    cache_active_chunk_embeddings,
+    document_index_is_reusable,
     index_paper_chunks,
     retrieve_relevant_chunks,
 )
@@ -276,7 +279,10 @@ def run_evaluation(
     semantic_weight: float = SEMANTIC_WEIGHT,
     keyword_weight: float = KEYWORD_WEIGHT,
     extra_metrics: dict | None = None,
+    cache_stats: dict[str, int] | None = None,
+    experiment_started_at: float | None = None,
 ) -> None:
+    evaluation_started_at = time.perf_counter()
     cases = list_evaluation_cases()
     results: list[dict] = []
     try:
@@ -293,6 +299,7 @@ def run_evaluation(
                     top_k=top_k,
                     semantic_weight=semantic_weight,
                     keyword_weight=keyword_weight,
+                    cache_stats=cache_stats,
                 )
                 for rank, chunk in enumerate(retrieved, start=1):
                     coverage = (
@@ -342,6 +349,16 @@ def run_evaluation(
             )
         metrics = _aggregate_metrics(results, top_k)
         metrics.update(extra_metrics or {})
+        metrics["cache_stats"] = dict(cache_stats or {})
+        metrics["evaluation_seconds"] = round(
+            time.perf_counter() - evaluation_started_at,
+            3,
+        )
+        if experiment_started_at is not None:
+            metrics["total_duration_seconds"] = round(
+                time.perf_counter() - experiment_started_at,
+                3,
+            )
         finish_evaluation_run(
             run_id,
             "completed",
@@ -352,17 +369,21 @@ def run_evaluation(
 
 
 def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
+    experiment_started_at = time.perf_counter()
     cases = list_evaluation_cases()
     paper_ids = sorted({int(case["paper_id"]) for case in cases})
     total_chunks = 0
     detected_sections: set[str] = set()
+    cache_stats: dict[str, int] = {}
     try:
         for paper_id in paper_ids:
+            cache_active_chunk_embeddings(paper_id, cache_stats)
             parse_paper_pdf(
                 paper_id,
                 strategy=config.chunk_strategy,
                 chunk_size=config.chunk_size,
                 overlap=config.chunk_overlap,
+                cache_stats=cache_stats,
             )
             document = get_document(paper_id)
             if document is None or document["parse_status"] != PARSE_PARSED:
@@ -374,8 +395,16 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
                 if match:
                     detected_sections.add(match.group("section"))
 
-            index_paper_chunks(paper_id)
-            document = get_document(paper_id)
+            if document_index_is_reusable(document):
+                cache_stats["index_document_hits"] = (
+                    cache_stats.get("index_document_hits", 0) + 1
+                )
+            else:
+                cache_stats["index_document_misses"] = (
+                    cache_stats.get("index_document_misses", 0) + 1
+                )
+                index_paper_chunks(paper_id, cache_stats)
+                document = get_document(paper_id)
             if document is None or document["index_status"] != INDEX_INDEXED:
                 error = document["index_error"] if document else "索引状态不存在"
                 raise RuntimeError(f"论文 {paper_id} 重新索引失败：{error}")
@@ -388,7 +417,13 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
             extra_metrics={
                 "total_chunk_count": total_chunks,
                 "detected_section_count": len(detected_sections),
+                "preparation_seconds": round(
+                    time.perf_counter() - experiment_started_at,
+                    3,
+                ),
             },
+            cache_stats=cache_stats,
+            experiment_started_at=experiment_started_at,
         )
     except Exception as exc:
         finish_evaluation_run(run_id, "failed", error=str(exc)[:500])

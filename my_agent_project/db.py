@@ -45,9 +45,14 @@ CREATE TABLE IF NOT EXISTS paper_documents (
     page_count INTEGER NOT NULL DEFAULT 0,
     chunk_count INTEGER NOT NULL DEFAULT 0,
     error TEXT,
+    source_hash TEXT,
+    chunk_strategy TEXT,
+    chunk_size INTEGER,
+    chunk_overlap INTEGER,
     index_status TEXT NOT NULL DEFAULT 'not_indexed',
     index_error TEXT,
     vectorizer TEXT,
+    embedding_namespace TEXT,
     indexed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -68,6 +73,23 @@ CREATE TABLE IF NOT EXISTS paper_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_paper_chunks_paper_id ON paper_chunks(paper_id);
+
+CREATE TABLE IF NOT EXISTS pdf_text_cache (
+    source_hash TEXT NOT NULL,
+    page_number INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_hash, page_number)
+);
+
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    cache_namespace TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (cache_namespace, content_hash)
+);
 
 CREATE TABLE IF NOT EXISTS rag_queries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,9 +187,14 @@ def init_db() -> None:
             for row in conn.execute("PRAGMA table_info(paper_documents)").fetchall()
         }
         for name, definition in (
+            ("source_hash", "TEXT"),
+            ("chunk_strategy", "TEXT"),
+            ("chunk_size", "INTEGER"),
+            ("chunk_overlap", "INTEGER"),
             ("index_status", "TEXT NOT NULL DEFAULT 'not_indexed'"),
             ("index_error", "TEXT"),
             ("vectorizer", "TEXT"),
+            ("embedding_namespace", "TEXT"),
             ("indexed_at", "TEXT"),
         ):
             if name not in document_columns:
@@ -378,6 +405,88 @@ def list_indexed_chunks(paper_id: int) -> list[sqlite3.Row]:
         )
 
 
+def get_cached_pdf_pages(source_hash: str) -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT content FROM pdf_text_cache
+            WHERE source_hash = ?
+            ORDER BY page_number
+            """,
+            (source_hash,),
+        ).fetchall()
+    return [str(row["content"]) for row in rows]
+
+
+def replace_cached_pdf_pages(source_hash: str, pages: Iterable[str]) -> int:
+    page_list = list(pages)
+    with connect() as conn:
+        conn.execute("DELETE FROM pdf_text_cache WHERE source_hash = ?", (source_hash,))
+        conn.executemany(
+            """
+            INSERT INTO pdf_text_cache (source_hash, page_number, content)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (source_hash, page_number, content)
+                for page_number, content in enumerate(page_list, start=1)
+            ],
+        )
+    return len(page_list)
+
+
+def get_cached_embeddings(
+    cache_namespace: str,
+    content_hashes: Iterable[str],
+) -> dict[str, list[float]]:
+    hashes = list(dict.fromkeys(content_hashes))
+    if not hashes:
+        return {}
+    placeholders = ", ".join("?" for _ in hashes)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT content_hash, vector_json FROM embedding_cache
+            WHERE cache_namespace = ? AND content_hash IN ({placeholders})
+            """,
+            (cache_namespace, *hashes),
+        ).fetchall()
+    cached: dict[str, list[float]] = {}
+    for row in rows:
+        try:
+            vector = json.loads(row["vector_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(vector, list) and vector:
+            cached[str(row["content_hash"])] = vector
+    return cached
+
+
+def upsert_cached_embeddings(
+    cache_namespace: str,
+    vectors: dict[str, list[float]],
+) -> int:
+    if not vectors:
+        return 0
+    with connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO embedding_cache (
+                cache_namespace, content_hash, vector_json
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_namespace, content_hash) DO UPDATE SET
+                vector_json = excluded.vector_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (cache_namespace, content_hash, json.dumps(vector))
+                for content_hash, vector in vectors.items()
+            ],
+        )
+    return len(vectors)
+
+
 def update_parse_status(
     paper_id: int,
     status: str,
@@ -409,6 +518,10 @@ def replace_paper_chunks(
     chunks: Iterable[PaperChunk],
     *,
     page_count: int,
+    source_hash: Optional[str] = None,
+    chunk_strategy: Optional[str] = None,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
 ) -> int:
     chunk_list = list(chunks)
     with connect() as conn:
@@ -427,21 +540,39 @@ def replace_paper_chunks(
             """
             INSERT INTO paper_documents (
                 paper_id, parse_status, page_count, chunk_count, error,
-                index_status, index_error, vectorizer, indexed_at
+                source_hash, chunk_strategy, chunk_size, chunk_overlap,
+                index_status, index_error, vectorizer, embedding_namespace,
+                indexed_at
             )
-            VALUES (?, 'parsed', ?, ?, NULL, 'not_indexed', NULL, NULL, NULL)
+            VALUES (
+                ?, 'parsed', ?, ?, NULL, ?, ?, ?, ?,
+                'not_indexed', NULL, NULL, NULL, NULL
+            )
             ON CONFLICT(paper_id) DO UPDATE SET
                 parse_status = excluded.parse_status,
                 page_count = excluded.page_count,
                 chunk_count = excluded.chunk_count,
                 error = NULL,
+                source_hash = excluded.source_hash,
+                chunk_strategy = excluded.chunk_strategy,
+                chunk_size = excluded.chunk_size,
+                chunk_overlap = excluded.chunk_overlap,
                 index_status = 'not_indexed',
                 index_error = NULL,
                 vectorizer = NULL,
+                embedding_namespace = NULL,
                 indexed_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (paper_id, page_count, len(chunk_list)),
+            (
+                paper_id,
+                page_count,
+                len(chunk_list),
+                source_hash,
+                chunk_strategy,
+                chunk_size,
+                chunk_overlap,
+            ),
         )
     return len(chunk_list)
 
@@ -484,6 +615,7 @@ def replace_chunk_vectors(
     vectorizer: str,
     dense_vectors: Optional[dict[int, list[float]]] = None,
     warning: Optional[str] = None,
+    embedding_namespace: Optional[str] = None,
 ) -> None:
     indexed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     with connect() as conn:
@@ -522,10 +654,11 @@ def replace_chunk_vectors(
             """
             UPDATE paper_documents
             SET index_status = 'indexed', index_error = ?,
-                vectorizer = ?, indexed_at = ?, updated_at = CURRENT_TIMESTAMP
+                vectorizer = ?, embedding_namespace = ?, indexed_at = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE paper_id = ?
             """,
-            (warning, vectorizer, indexed_at, paper_id),
+            (warning, vectorizer, embedding_namespace, indexed_at, paper_id),
         )
 
 

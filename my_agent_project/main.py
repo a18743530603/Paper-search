@@ -57,7 +57,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.6.1")
+app = FastAPI(title="Paper Hunter", version="0.7.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 

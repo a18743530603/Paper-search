@@ -2,6 +2,31 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.7.0` - 2026-07-13
+
+### 实验增量缓存
+
+- 新增 `pdf_text_cache` 表，按 PDF SHA-256 和物理页码缓存 `pypdf` 提取结果；不同分块策略共享相同页文本。
+- 新增 `embedding_cache` 表，按 Seed 服务/模型/接口模式命名空间与文本 SHA-256 缓存稠密向量；文本块与评测问题使用同一套缓存机制。
+- `paper_documents` 新增 `source_hash`、`chunk_strategy`、`chunk_size`、`chunk_overlap` 和 `embedding_namespace`，用于精确判断分块和索引是否可复用。
+- `pdf_service.extract_pdf_pages()` 与 `build_pdf_chunks()` 将 PDF 提取和分块解耦；`parse_paper_pdf()` 在配置未变化时直接复用当前块，换策略时复用页文本。
+- `rag_service.cache_active_chunk_embeddings()` 自动回填升级前已有的 Seed 向量；`index_paper_chunks()` 只请求缓存中不存在的块；`retrieve_relevant_chunks()` 复用问题向量。
+- `evaluation_service.run_configured_experiment()` 按参数差异跳过无关步骤：只改 Top-K/权重不再重建分块和索引，换策略只重新分块并补算新向量。
+- 评测指标新增 `cache_stats`、准备耗时、评测耗时和总耗时；页面显示 PDF 页、分块配置、块向量、问题向量和论文索引的命中情况。
+
+### 验证结果
+
+- 新增 PDF 页缓存、分块配置缓存、块向量缓存和问题向量缓存离线测试。
+- 完整自动化测试：`35 passed`。
+- 本版本只优化实验计算路径，不修改分块、召回和证据判定算法；`v0.6.1` 的运行 `#5/#6` 仍是当前正式效果基线。
+- 真实预热运行 `#7` 用时 `105.876` 秒；同配置全缓存运行 `#8` 用时 `4.406` 秒，约快 `24.0` 倍。
+- `#8` 命中 794 个分块、12 篇论文索引和 60 个问题向量，Seed 请求为 0；Hit@K、MRR 和覆盖率与 `#7` 完全一致。
+
+### 后续实验顺序
+
+- 先做章节前缀消融，再测试冻结的中英双路查询与 BM25/RRF，之后加入 Top-20 到 Top-5 重排。
+- 父子块返回和表格专用分块保留为后续实验；原子命题、Late Chunking 和 RAPTOR 暂缓。
+
 ## `v0.6.1` - 2026-07-13
 
 ### 数据集扩展

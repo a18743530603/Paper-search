@@ -7,6 +7,7 @@ from jinja2 import Environment, FileSystemLoader
 from my_agent_project import db
 from my_agent_project import evaluation_service
 from my_agent_project import model_service
+from my_agent_project import pdf_service
 from my_agent_project import rag_service
 
 from my_agent_project.download_service import can_attempt_download, sanitize_filename
@@ -374,6 +375,61 @@ def test_local_tfidf_index_retrieves_relevant_page(tmp_path, monkeypatch):
     assert "ImageNet" in results[0]["content"]
 
 
+def test_pdf_text_cache_reuses_pages_when_chunk_strategy_changes(tmp_path, monkeypatch):
+    database_path = tmp_path / "metadata.db"
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"fake-pdf-for-cache-test")
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    db.init_db()
+    paper_id = db.register_local_paper("Cached paper", pdf_path)
+    extracted: list[Path] = []
+
+    def fake_extract(path):
+        extracted.append(path)
+        return [
+            "1 Introduction\nThe first page contains background.",
+            "2 Methods\nThe second page contains the method.",
+        ]
+
+    monkeypatch.setattr(pdf_service, "extract_pdf_pages", fake_extract)
+    first_stats: dict[str, int] = {}
+    second_stats: dict[str, int] = {}
+    third_stats: dict[str, int] = {}
+
+    first = pdf_service.parse_paper_pdf(
+        paper_id,
+        strategy="length_boundary",
+        chunk_size=300,
+        overlap=30,
+        cache_stats=first_stats,
+    )
+    second = pdf_service.parse_paper_pdf(
+        paper_id,
+        strategy="length_boundary",
+        chunk_size=300,
+        overlap=30,
+        cache_stats=second_stats,
+    )
+    third = pdf_service.parse_paper_pdf(
+        paper_id,
+        strategy="academic_section",
+        chunk_size=300,
+        overlap=30,
+        cache_stats=third_stats,
+    )
+
+    assert len(extracted) == 1
+    assert first["chunks_reused"] is False
+    assert second["chunks_reused"] is True
+    assert third["chunks_reused"] is False
+    assert first_stats["pdf_page_misses"] == 2
+    assert second_stats["chunk_layout_hits"] == 2
+    assert third_stats["pdf_page_hits"] == 2
+    document = db.get_document(paper_id)
+    assert document["chunk_strategy"] == "academic_section"
+    assert document["source_hash"] == pdf_service.pdf_source_hash(pdf_path)
+
+
 def test_deepseek_request_uses_configured_api(monkeypatch):
     class FakeResponse:
         status_code = 200
@@ -521,6 +577,64 @@ def test_hybrid_retrieval_uses_seed_semantics_and_tfidf(tmp_path, monkeypatch):
     assert results[0]["page_number"] == 1
     assert results[0]["semantic_score"] == 1.0
     assert results[0]["score"] >= 0.75
+
+
+def test_seed_embedding_cache_avoids_repeated_chunk_and_query_calls(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    monkeypatch.setattr(rag_service, "is_seed_configured", lambda: True)
+    monkeypatch.setattr(
+        rag_service,
+        "seed_embedding_cache_namespace",
+        lambda: "seed|test|model|text",
+    )
+    db.init_db()
+    paper_id = db.insert_papers("agent", [parse_arxiv_feed(ARXIV_XML)[0]])[0]
+    db.replace_paper_chunks(
+        paper_id,
+        [
+            PaperChunk(1, 0, "Neural architecture and attention."),
+            PaperChunk(2, 1, "Dataset contains one thousand images."),
+        ],
+        page_count=2,
+    )
+    calls: list[list[str]] = []
+
+    def fake_seed(texts):
+        calls.append(list(texts))
+        return [[1.0, float(index)] for index, _ in enumerate(texts)], "test-model"
+
+    monkeypatch.setattr(rag_service, "embed_with_seed", fake_seed)
+    first_stats: dict[str, int] = {}
+    second_stats: dict[str, int] = {}
+
+    index_paper_chunks(paper_id, first_stats)
+    index_paper_chunks(paper_id, second_stats)
+    retrieve_relevant_chunks(
+        paper_id,
+        "How is the architecture designed?",
+        cache_stats=first_stats,
+    )
+    retrieve_relevant_chunks(
+        paper_id,
+        "How is the architecture designed?",
+        cache_stats=second_stats,
+    )
+
+    assert calls == [
+        [
+            "Neural architecture and attention.",
+            "Dataset contains one thousand images.",
+        ],
+        ["How is the architecture designed?"],
+    ]
+    assert first_stats["chunk_embedding_misses"] == 2
+    assert second_stats["chunk_embedding_hits"] == 2
+    assert first_stats["query_embedding_misses"] == 1
+    assert second_stats["query_embedding_hits"] == 1
 
 
 def test_rag_query_stores_answer_and_page_evidence(tmp_path, monkeypatch):
@@ -722,7 +836,7 @@ def test_experiment_config_rejects_overlap_not_smaller_than_chunk():
         raise AssertionError("invalid overlap should fail")
 
 
-def test_configured_experiment_rebuilds_each_paper(monkeypatch):
+def test_configured_experiment_uses_cache_aware_pipeline(monkeypatch):
     parsed: list[tuple[int, str, int, int]] = []
     indexed: list[int] = []
     evaluated: list[dict] = []
@@ -734,9 +848,19 @@ def test_configured_experiment_rebuilds_each_paper(monkeypatch):
     monkeypatch.setattr(
         evaluation_service,
         "parse_paper_pdf",
-        lambda paper_id, *, strategy, chunk_size, overlap: parsed.append(
+        lambda paper_id, *, strategy, chunk_size, overlap, cache_stats: parsed.append(
             (paper_id, strategy, chunk_size, overlap)
         ),
+    )
+    monkeypatch.setattr(
+        evaluation_service,
+        "cache_active_chunk_embeddings",
+        lambda _paper_id, _cache_stats: 0,
+    )
+    monkeypatch.setattr(
+        evaluation_service,
+        "document_index_is_reusable",
+        lambda _document: False,
     )
     monkeypatch.setattr(
         evaluation_service,
@@ -752,7 +876,7 @@ def test_configured_experiment_rebuilds_each_paper(monkeypatch):
     monkeypatch.setattr(
         evaluation_service,
         "index_paper_chunks",
-        lambda paper_id: indexed.append(paper_id),
+        lambda paper_id, _cache_stats: indexed.append(paper_id),
     )
     monkeypatch.setattr(
         evaluation_service,
@@ -794,6 +918,13 @@ def test_evaluation_page_exposes_chart_metrics():
         "hit_at_5": 1.0,
         "mrr_at_5": 0.75,
         "mean_best_coverage": 0.9,
+        "total_duration_seconds": 2.5,
+        "cache_stats": {
+            "pdf_page_hits": 20,
+            "chunk_embedding_hits": 10,
+            "query_embedding_hits": 5,
+            "index_document_hits": 2,
+        },
     }
     run = {
         "id": 3,
@@ -823,3 +954,5 @@ def test_evaluation_page_exposes_chart_metrics():
     assert 'name="chunk_overlap" value="150" min="0" max="2999" step="10"' in html
     assert 'name="semantic_weight"' in html
     assert '<option value="academic_section">' in html
+    assert "2.50 秒" in html
+    assert "20 命中 / 0 新增" in html

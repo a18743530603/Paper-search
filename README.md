@@ -1,10 +1,12 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.6.1`
+> 当前版本：`v0.7.0`
 >
 > 更新日期：`2026-07-13`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
+>
+> 实验过程：见 [EXPERIMENTS.md](EXPERIMENTS.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在后台下载到本地。
 
@@ -106,7 +108,7 @@ http://127.0.0.1:8001/evaluation
 3. `paper_title` 应与 PDF 文件名或系统论文记录标题尽量一致；`evidence_page` 使用 PDF 阅读器显示的物理页码，而不是论文正文印刷页码。
 4. 打开“分块评测”页面，点击“导入并准备基准”。系统会注册本地论文、解析 PDF、分块并建立向量索引。
 5. 等待页面显示全部案例已建立索引，在实验配置中选择固定边界或论文章节策略，并填写实验名称、块大小、重叠、Top-K 和 Seed 语义权重。
-6. 点击“重建索引并运行实验”。后台会按本次参数重新解析三篇 PDF、调用 Seed 生成新向量，再执行 15 道检索评测。
+6. 点击“运行实验”。系统会按 PDF 内容哈希和实验参数自动复用页文本、分块、论文索引及问题向量，只计算发生变化的部分。
 7. 查看总体指标、Top-K 曲线和逐题结果；展开召回片段可以检查具体内容。
 
 CSV 必须保留以下表头：
@@ -115,7 +117,11 @@ CSV 必须保留以下表头：
 paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 ```
 
-每次实验都会创建新的 `evaluation_runs` 记录，保存分块策略、块大小、重叠、Top-K、Embedding 模型和融合权重。当前运行曲线展示 Hit@1、Hit@3、Hit@5；历史趋势图按运行编号比较结果。`academic_section` 会识别论文标题层级、过滤参考文献、保留附录，并把章节路径写入文本块；固定边界策略继续作为对照基线。
+每次实验都会创建新的 `evaluation_runs` 记录，保存分块策略、块大小、重叠、Top-K、Embedding 模型、融合权重、缓存命中统计和总耗时。当前运行曲线展示 Hit@1、Hit@3、Hit@5；历史趋势图按运行编号比较结果。`academic_section` 会识别论文标题层级、过滤参考文献、保留附录，并把章节路径写入文本块；固定边界策略继续作为对照基线。
+
+实验缓存按变化范围失效：只修改 Top-K 或融合权重时直接复用当前分块、索引和问题向量；修改分块策略、块大小或重叠时复用 PDF 页文本和问题向量，仅重新生成文本块并补算缓存中不存在的块向量；替换 PDF 或 Embedding 模型时才重建对应缓存。
+
+`v0.7.0` 真实验证中，缓存预热运行 `#7` 用时 `105.876` 秒，全缓存同配置运行 `#8` 用时 `4.406` 秒，约快 `24.0` 倍；`#8` 命中 794 个分块、12 篇论文索引和 60 个问题向量，Seed 请求为 0，且各项检索指标与 `#7` 完全一致。完整步骤见 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
 ## 目录结构
 
@@ -202,7 +208,7 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 
 ### `db.py`
 
-负责 SQLite 的全部数据读写，包括初始化表、插入检索结果、查询历史与详情、更新下载状态以及导出 CSV/JSON。
+负责 SQLite 的全部数据读写，包括初始化表、插入检索结果、查询历史与详情、更新下载状态、缓存 PDF 页文本与 Seed 向量，以及导出 CSV/JSON。
 
 主要字段包括：
 
@@ -221,6 +227,7 @@ created_at, updated_at
 - `ask_deepseek()`：使用 `httpx` 调用 DeepSeek `/chat/completions`，处理鉴权、超时、HTTP 错误和响应解析。
 - `is_seed_configured()`：判断火山方舟 Seed Embedding 是否已配置。
 - `embed_with_seed()`：根据模型自动调用火山方舟 `/embeddings` 或 `/embeddings/multimodal`，校验并按输入顺序返回稠密向量。
+- `seed_embedding_cache_namespace()`：使用服务地址、模型和接口模式生成向量缓存命名空间，模型配置变化时自动隔离旧向量。
 - `ModelConfigurationError`：缺少 `.env` 配置时给出明确提示。
 - `ModelRequestError`：统一包装网络错误和 DeepSeek 返回错误。
 
@@ -232,8 +239,10 @@ created_at, updated_at
 - `split_page_text()`：按页将正文切分为带重叠区域的文本块。
 - `detect_section_heading()`：识别数字、罗马数字、IEEE 字母小节和附录标题，并排除常见正文/表格误判。
 - `split_academic_page_text()`：跨页维护章节树，在章节内部继续生成定长子块，并过滤参考文献噪声。
+- `pdf_source_hash()`：计算 PDF 的 SHA-256 内容指纹，文件变化后自动失效旧页文本。
+- `extract_pdf_pages()` 与 `build_pdf_chunks()`：把昂贵的 PDF 文本提取和可重复的分块策略拆开，使不同策略共享同一份页文本。
 - `extract_pdf_chunks()`：使用 `pypdf` 提取每页正文，按 `length_boundary` 或 `academic_section` 生成带页码和顺序编号的文本块。
-- `parse_paper_pdf()`：按指定策略后台解析单篇论文，更新解析状态，并把文本块写入 SQLite；单篇解析失败不会影响其他论文。
+- `parse_paper_pdf()`：按 PDF 指纹和分块配置复用页文本或当前分块，只在缓存未命中时读取文件和生成新块。
 
 ### `rag_service.py`
 
@@ -241,7 +250,9 @@ created_at, updated_at
 
 - `tokenize()` 与 `term_frequency()`：将中英文正文转换为本地稀疏词频向量。
 - `index_paper_chunks()`：在后台建立 Seed 稠密向量和 `local-tfidf-v1` 关键词向量；Seed 不可用时自动降级。
-- `retrieve_relevant_chunks()`：融合 Seed 语义相似度和 TF-IDF 关键词相似度，返回相关页码和原文。
+- `embedding_content_hash()`：以文本内容哈希作为 Seed 向量缓存键，相同文本不重复调用 API。
+- `cache_active_chunk_embeddings()`：升级或切换策略前将现有论文块向量回填到通用缓存。
+- `retrieve_relevant_chunks()`：融合 Seed 语义相似度和 TF-IDF 关键词相似度，复用问题向量并返回相关页码和原文。
 - `answer_rag_query()`：组合检索、Prompt、DeepSeek 调用和问答状态更新。
 - `paper_access_url()`：优先返回论文网页地址，没有网页地址时生成 DOI 链接。
 - `build_access_notice()`：在系统没有全文时提示读者可能需要购买、学校或机构订阅，并附上合法访问链接。
@@ -254,7 +265,7 @@ created_at, updated_at
 
 ### `evaluation_service.py`
 
-负责分块实验：按论文标题导入本地 PDF 与人工标注 CSV，校验策略和实验参数，按本次配置强制重新分块和建立 Seed/TF-IDF 索引，再使用“同页 + 规范化 token 覆盖率”识别正确证据并聚合指标。`ExperimentConfig` 保存策略与参数，`run_configured_experiment()` 串联重建、章节统计与评测。评测只调用检索器，不调用 DeepSeek 生成答案。
+负责分块实验：按论文标题导入本地 PDF 与人工标注 CSV，校验策略和实验参数，根据配置差异决定复用或重建分块与 Seed/TF-IDF 索引，再使用“同页 + 规范化 token 覆盖率”识别正确证据并聚合指标。`run_configured_experiment()` 同时记录页文本、分块、块向量、问题向量和论文索引的命中统计及耗时。评测只调用检索器，不调用 DeepSeek 生成答案。
 
 ### `templates/` 与 `static/`
 
@@ -285,11 +296,13 @@ created_at, updated_at
 
 ```text
 本地 PDF
-  -> pypdf 按页提取正文
+  -> SHA-256 检查 PDF 内容是否变化
+  -> pdf_text_cache 复用或通过 pypdf 提取每页正文
   -> normalize_pdf_text() 清理文本
   -> split_page_text() 生成重叠文本块
   -> paper_documents 保存解析状态
   -> paper_chunks 保存页码、顺序和文本内容
+  -> embedding_cache 复用或补算 Seed 向量
   -> 详情页展示解析结果预览
 ```
 
@@ -304,6 +317,8 @@ created_at, updated_at
 
 - `paper_documents`：每篇论文的解析状态、页数、文本块数量和错误原因。
 - `paper_chunks`：每个文本块所属论文、页码、顺序编号和正文内容。
+- `pdf_text_cache`：按 PDF 内容哈希和物理页码保存原始页文本，供不同分块策略共享。
+- `embedding_cache`：按 Seed 配置命名空间和文本内容哈希保存向量，供文本块和评测问题复用。
 
 这一版已经完成可运行的传统 RAG 闭环：PDF 解析、Seed1.6 语义向量、本地 TF-IDF 关键词向量、双路混合召回、DeepSeek 后台问答和页码证据展示。后续可增加重排序与效果评测。
 

@@ -102,6 +102,11 @@ def _seed_api_mode() -> str:
     return "text"
 
 
+def seed_embedding_cache_namespace() -> str:
+    """Identify vectors that are safe to reuse across experiments."""
+    return f"seed|{SEED_BASE_URL}|{SEED_EMBEDDING_MODEL}|{_seed_api_mode()}"
+
+
 def _request_seed_embedding(path: str, body: dict[str, Any]) -> dict[str, Any]:
     try:
         response = httpx.post(

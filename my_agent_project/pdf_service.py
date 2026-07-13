@@ -1,7 +1,15 @@
+import hashlib
 import re
 from pathlib import Path
 
-from .db import get_paper, replace_paper_chunks, update_parse_status
+from .db import (
+    get_cached_pdf_pages,
+    get_document,
+    get_paper,
+    replace_cached_pdf_pages,
+    replace_paper_chunks,
+    update_parse_status,
+)
 from .schemas import PARSE_FAILED, PARSE_PARSING, PaperChunk
 
 
@@ -65,6 +73,23 @@ EXCLUDED_SECTION_TITLES = {
     "references",
     "bibliography",
 }
+
+
+def _increment_cache_stat(
+    cache_stats: dict[str, int] | None,
+    name: str,
+    amount: int = 1,
+) -> None:
+    if cache_stats is not None:
+        cache_stats[name] = cache_stats.get(name, 0) + amount
+
+
+def pdf_source_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def normalize_pdf_text(text: str) -> str:
@@ -273,26 +298,30 @@ def split_academic_page_text(
     return chunks, sections
 
 
-def extract_pdf_chunks(
-    path: Path,
-    *,
-    strategy: str = CHUNK_STRATEGY_LENGTH,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
-    overlap: int = DEFAULT_CHUNK_OVERLAP,
-) -> tuple[int, list[PaperChunk]]:
-    if strategy not in SUPPORTED_CHUNK_STRATEGIES:
-        raise ValueError(f"unsupported chunk strategy: {strategy}")
+def extract_pdf_pages(path: Path) -> list[str]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
         raise RuntimeError("缺少 pypdf 依赖，请先执行 uv sync") from exc
 
     reader = PdfReader(str(path))
+    return [page.extract_text() or "" for page in reader.pages]
+
+
+def build_pdf_chunks(
+    pages: list[str],
+    *,
+    strategy: str = CHUNK_STRATEGY_LENGTH,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[PaperChunk]:
+    if strategy not in SUPPORTED_CHUNK_STRATEGIES:
+        raise ValueError(f"unsupported chunk strategy: {strategy}")
+
     chunks: list[PaperChunk] = []
     chunk_index = 0
     current_sections: list[str] = []
-    for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
+    for page_number, page_text in enumerate(pages, start=1):
         if strategy == CHUNK_STRATEGY_ACADEMIC:
             page_chunks, current_sections = split_academic_page_text(
                 page_text,
@@ -315,7 +344,24 @@ def extract_pdf_chunks(
                 )
             )
             chunk_index += 1
-    return len(reader.pages), chunks
+    return chunks
+
+
+def extract_pdf_chunks(
+    path: Path,
+    *,
+    strategy: str = CHUNK_STRATEGY_LENGTH,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> tuple[int, list[PaperChunk]]:
+    pages = extract_pdf_pages(path)
+    chunks = build_pdf_chunks(
+        pages,
+        strategy=strategy,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
+    return len(pages), chunks
 
 
 def parse_paper_pdf(
@@ -324,12 +370,12 @@ def parse_paper_pdf(
     strategy: str = CHUNK_STRATEGY_LENGTH,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_CHUNK_OVERLAP,
-) -> None:
+    cache_stats: dict[str, int] | None = None,
+) -> dict[str, int | str | bool]:
     paper = get_paper(paper_id)
     if paper is None:
-        return
+        return {"chunks_reused": False}
 
-    update_parse_status(paper_id, PARSE_PARSING)
     try:
         local_path = paper["local_path"]
         if not local_path:
@@ -338,14 +384,66 @@ def parse_paper_pdf(
         if not path.is_file():
             raise RuntimeError("本地 PDF 文件不存在")
 
-        page_count, chunks = extract_pdf_chunks(
-            path,
+        source_hash = pdf_source_hash(path)
+        document = get_document(paper_id)
+        if (
+            document is not None
+            and document["parse_status"] == "parsed"
+            and document["source_hash"] == source_hash
+            and document["chunk_strategy"] == strategy
+            and document["chunk_size"] == chunk_size
+            and document["chunk_overlap"] == overlap
+            and int(document["chunk_count"] or 0) > 0
+        ):
+            _increment_cache_stat(
+                cache_stats,
+                "chunk_layout_hits",
+                int(document["chunk_count"]),
+            )
+            return {
+                "chunks_reused": True,
+                "source_hash": source_hash,
+                "page_count": int(document["page_count"]),
+                "chunk_count": int(document["chunk_count"]),
+            }
+
+        update_parse_status(paper_id, PARSE_PARSING)
+        pages = get_cached_pdf_pages(source_hash)
+        if pages:
+            _increment_cache_stat(cache_stats, "pdf_document_hits")
+            _increment_cache_stat(cache_stats, "pdf_page_hits", len(pages))
+        else:
+            pages = extract_pdf_pages(path)
+            if not pages:
+                raise RuntimeError("PDF 没有可读取页面")
+            replace_cached_pdf_pages(source_hash, pages)
+            _increment_cache_stat(cache_stats, "pdf_document_misses")
+            _increment_cache_stat(cache_stats, "pdf_page_misses", len(pages))
+
+        chunks = build_pdf_chunks(
+            pages,
             strategy=strategy,
             chunk_size=chunk_size,
             overlap=overlap,
         )
         if not chunks:
             raise RuntimeError("PDF 未提取到可用文本，文件可能是扫描版")
-        replace_paper_chunks(paper_id, chunks, page_count=page_count)
+        replace_paper_chunks(
+            paper_id,
+            chunks,
+            page_count=len(pages),
+            source_hash=source_hash,
+            chunk_strategy=strategy,
+            chunk_size=chunk_size,
+            chunk_overlap=overlap,
+        )
+        _increment_cache_stat(cache_stats, "chunk_layout_misses", len(chunks))
+        return {
+            "chunks_reused": False,
+            "source_hash": source_hash,
+            "page_count": len(pages),
+            "chunk_count": len(chunks),
+        }
     except Exception as exc:
         update_parse_status(paper_id, PARSE_FAILED, error=str(exc)[:500])
+        return {"chunks_reused": False, "error": str(exc)[:500]}

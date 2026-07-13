@@ -54,7 +54,7 @@
       <small>TF-IDF 关键词权重：<output data-keyword-output>0.25</output></small>
     </label>
     <div class="experiment-submit">
-      <button type="submit" {% if not cases %}disabled{% endif %}>重建索引并运行实验</button>
+      <button type="submit" {% if not cases %}disabled{% endif %}>运行实验</button>
     </div>
   </form>
 </section>
@@ -79,6 +79,17 @@
     {% endif %}
     {% if selected_run["metrics"].get("detected_section_count") %}
     <dt>识别章节路径</dt><dd>{{ selected_run["metrics"]["detected_section_count"] }}</dd>
+    {% endif %}
+    {% if selected_run["metrics"].get("total_duration_seconds") is not none %}
+    <dt>总耗时</dt><dd>{{ "%.2f 秒" | format(selected_run["metrics"]["total_duration_seconds"]) }}</dd>
+    {% endif %}
+    {% set cache = selected_run["metrics"].get("cache_stats", {}) %}
+    {% if cache %}
+    <dt>PDF 页缓存</dt><dd>{{ cache.get("pdf_page_hits", 0) }} 命中 / {{ cache.get("pdf_page_misses", 0) }} 新增</dd>
+    <dt>分块配置缓存</dt><dd>{{ cache.get("chunk_layout_hits", 0) }} 命中 / {{ cache.get("chunk_layout_misses", 0) }} 新增</dd>
+    <dt>块向量缓存</dt><dd>{{ cache.get("chunk_embedding_hits", 0) }} 命中 / {{ cache.get("chunk_embedding_misses", 0) }} 新增</dd>
+    <dt>问题向量缓存</dt><dd>{{ cache.get("query_embedding_hits", 0) }} 命中 / {{ cache.get("query_embedding_misses", 0) }} 新增</dd>
+    <dt>论文索引缓存</dt><dd>{{ cache.get("index_document_hits", 0) }} 命中 / {{ cache.get("index_document_misses", 0) }} 重建</dd>
     {% endif %}
   </dl>
   {% if selected_run["error"] %}<p class="alert">{{ selected_run["error"] }}</p>{% endif %}
