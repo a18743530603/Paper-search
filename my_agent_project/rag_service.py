@@ -154,7 +154,17 @@ def retrieve_relevant_chunks(
     question: str,
     *,
     top_k: int = 6,
+    semantic_weight: float = SEMANTIC_WEIGHT,
+    keyword_weight: float = KEYWORD_WEIGHT,
 ) -> list[dict]:
+    if semantic_weight < 0 or keyword_weight < 0:
+        raise ValueError("retrieval weights must not be negative")
+    total_weight = semantic_weight + keyword_weight
+    if total_weight <= 0:
+        raise ValueError("at least one retrieval weight must be positive")
+    semantic_weight /= total_weight
+    keyword_weight /= total_weight
+
     rows = list_indexed_chunks(paper_id)
     if not rows:
         return []
@@ -194,8 +204,8 @@ def retrieve_relevant_chunks(
             score = keyword_score
         else:
             score = (
-                SEMANTIC_WEIGHT * max(semantic_score, 0.0)
-                + KEYWORD_WEIGHT * max(keyword_score, 0.0)
+                semantic_weight * max(semantic_score, 0.0)
+                + keyword_weight * max(keyword_score, 0.0)
             )
         if score <= 0:
             continue

@@ -34,10 +34,10 @@ from .db import (
 )
 from .download_service import can_attempt_download, download_paper
 from .evaluation_service import (
-    create_baseline_run,
+    create_experiment_run,
     import_benchmark_cases,
     prepare_benchmark,
-    run_evaluation,
+    run_configured_experiment,
 )
 from .origin_service import create_origin_outputs
 from .pdf_service import parse_paper_pdf
@@ -57,7 +57,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.4.1")
+app = FastAPI(title="Paper Hunter", version="0.5.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -247,12 +247,25 @@ def prepare_evaluation(background_tasks: BackgroundTasks):
 
 
 @app.post("/evaluation/run")
-def start_evaluation(background_tasks: BackgroundTasks):
+def start_evaluation(
+    background_tasks: BackgroundTasks,
+    experiment_name: str = Form("固定边界分块实验"),
+    chunk_size: int = Form(1200),
+    chunk_overlap: int = Form(150),
+    top_k: int = Form(5),
+    semantic_weight: float = Form(0.75),
+):
     try:
-        run_id = create_baseline_run()
-    except RuntimeError as exc:
+        run_id, config = create_experiment_run(
+            name=experiment_name,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            top_k=top_k,
+            semantic_weight=semantic_weight,
+        )
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    background_tasks.add_task(run_evaluation, run_id)
+    background_tasks.add_task(run_configured_experiment, run_id, config)
     return RedirectResponse(url=f"/evaluation/runs/{run_id}", status_code=303)
 
 

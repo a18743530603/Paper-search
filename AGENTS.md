@@ -1,6 +1,6 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.4.1`
+> 当前版本：`v0.5.0`
 >
 > 更新日期：`2026-07-13`
 >
@@ -52,7 +52,7 @@ https://github.com/a18743530603/Paper-search.git
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
 - `pdf_service.py`：使用 `pypdf` 按页提取正文、清理文本、生成重叠文本块，并在后台更新解析状态。
 - `rag_service.py`：Seed 稠密向量、TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
-- `evaluation_service.py`：导入人工标注基准、按标题关联本地 PDF、匹配标准证据、运行检索基线并聚合 Hit/Recall/MRR 指标。
+- `evaluation_service.py`：导入人工标注基准、校验 `ExperimentConfig`、按实验参数重建 PDF 分块与索引、匹配标准证据并聚合 Hit/Recall/MRR 指标。
 - `origin_service.py`：整理统计数据，并在本机安装 Origin/OriginPro 时尝试自动生成图表。
 - `templates/`：Jinja2 页面模板。
 - `static/styles.css`：网页样式。
@@ -207,8 +207,12 @@ git push
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前 `v0.4.1` 已于 `2026-07-13` 完成验证：评测页新增 Canvas Top-K 命中率曲线和历次运行趋势图，完整自动化测试为 `24 passed`。
-- `v0.4.1` 的评测参数仍为固定基线；历史趋势图已经能够读取多次运行，但页面尚未提供分块大小、重叠、策略和召回权重的实验配置表单。
+- 当前 `v0.5.0` 已于 `2026-07-13` 完成验证：评测页可配置块大小、重叠、Top-K 和 Seed/TF-IDF 权重，每次实验强制重新分块和索引，完整自动化测试为 `27 passed`。
+- `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
+- `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
+- `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。
+- `v0.5.0` 的策略选项仍只有 `length_boundary`；语义分块、自适应分块和父子分块尚未实现。
 - `2026-07-13` 真实 API 连通性测试通过：`doubao-embedding-vision-251215` 返回 2048 维向量，`deepseek-v4-pro` 正常生成答案；不得在文档或 Git 中保存真实 Key。
 - 固定分块基线包含 3 篇论文和 15 条人工标注问题，策略为 `length_boundary`、`chunk_size=1200`、`overlap=150`、`top_k=5`；实测 `Hit@5=93.33%`、`MRR@5=0.7667`、平均证据覆盖率 `91.49%`。
 - 唯一未命中案例是 AOD 参数题，完整正确块位于第 18 名；该问题是块级排序失败，不能误判为文本被切断。
+- `900/120` 参数实验共生成 `217` 块，实测 `Hit@1=53.33%`、`Hit@3=80%`、`Hit@5=93.33%`、`MRR@5=0.6856`、覆盖率 `92.80%`；相较 `1200/150` 基线，覆盖率略升但 Hit@1 和 MRR 下降。

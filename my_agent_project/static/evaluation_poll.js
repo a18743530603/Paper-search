@@ -4,6 +4,20 @@ if (activeRun) {
   window.setTimeout(() => window.location.reload(), 2000);
 }
 
+const semanticWeight = document.querySelector("[data-semantic-weight]");
+const semanticOutput = document.querySelector("[data-semantic-output]");
+const keywordOutput = document.querySelector("[data-keyword-output]");
+
+function updateWeightOutputs() {
+  if (!semanticWeight || !semanticOutput || !keywordOutput) return;
+  const semantic = Number(semanticWeight.value);
+  semanticOutput.value = semantic.toFixed(2);
+  keywordOutput.value = (1 - semantic).toFixed(2);
+}
+
+semanticWeight?.addEventListener("input", updateWeightOutputs);
+updateWeightOutputs();
+
 const chartColors = {
   grid: "#d9dfe6",
   text: "#667085",

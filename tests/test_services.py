@@ -572,6 +572,73 @@ def test_evaluation_records_are_persisted(tmp_path, monkeypatch):
     assert results[0]["retrieved"][0]["page_number"] == 3
 
 
+def test_experiment_config_validates_and_derives_keyword_weight():
+    config = evaluation_service.validate_experiment_config(900, 120, 10, 0.65)
+
+    assert config.chunk_size == 900
+    assert config.chunk_overlap == 120
+    assert config.top_k == 10
+    assert config.semantic_weight == 0.65
+    assert config.keyword_weight == 0.35
+
+
+def test_experiment_config_rejects_overlap_not_smaller_than_chunk():
+    try:
+        evaluation_service.validate_experiment_config(600, 600, 5, 0.75)
+    except ValueError as exc:
+        assert "chunk_overlap" in str(exc)
+    else:
+        raise AssertionError("invalid overlap should fail")
+
+
+def test_configured_experiment_rebuilds_each_paper(monkeypatch):
+    parsed: list[tuple[int, int, int]] = []
+    indexed: list[int] = []
+    evaluated: list[dict] = []
+    monkeypatch.setattr(
+        evaluation_service,
+        "list_evaluation_cases",
+        lambda: [{"paper_id": 2}, {"paper_id": 1}, {"paper_id": 2}],
+    )
+    monkeypatch.setattr(
+        evaluation_service,
+        "parse_paper_pdf",
+        lambda paper_id, *, chunk_size, overlap: parsed.append(
+            (paper_id, chunk_size, overlap)
+        ),
+    )
+    monkeypatch.setattr(
+        evaluation_service,
+        "get_document",
+        lambda _paper_id: {
+            "parse_status": "parsed",
+            "index_status": "indexed",
+            "chunk_count": 7,
+            "error": None,
+            "index_error": None,
+        },
+    )
+    monkeypatch.setattr(
+        evaluation_service,
+        "index_paper_chunks",
+        lambda paper_id: indexed.append(paper_id),
+    )
+    monkeypatch.setattr(
+        evaluation_service,
+        "run_evaluation",
+        lambda run_id, **kwargs: evaluated.append({"run_id": run_id, **kwargs}),
+    )
+    config = evaluation_service.ExperimentConfig(800, 100, 10, 0.7, 0.3)
+
+    evaluation_service.run_configured_experiment(9, config)
+
+    assert parsed == [(1, 800, 100), (2, 800, 100)]
+    assert indexed == [1, 2]
+    assert evaluated[0]["run_id"] == 9
+    assert evaluated[0]["top_k"] == 10
+    assert evaluated[0]["extra_metrics"]["total_chunk_count"] == 14
+
+
 def test_evaluation_page_exposes_chart_metrics():
     template_dir = Path(__file__).parents[1] / "my_agent_project" / "templates"
     environment = Environment(loader=FileSystemLoader(template_dir))
@@ -594,6 +661,7 @@ def test_evaluation_page_exposes_chart_metrics():
         "embedding_model": "test-embedding",
         "semantic_weight": 0.75,
         "keyword_weight": 0.25,
+        "top_k": 5,
         "error": None,
         "metrics": metrics,
         "case_count": 1,
@@ -606,3 +674,7 @@ def test_evaluation_page_exposes_chart_metrics():
     assert 'id="run-history-chart"' in html
     assert 'data-hit1="0.6"' in html
     assert 'data-evaluation-run="3"' in html
+    assert 'name="chunk_size"' in html
+    assert 'name="chunk_overlap"' in html
+    assert 'name="chunk_overlap" value="150" min="0" max="2999" step="10"' in html
+    assert 'name="semantic_weight"' in html

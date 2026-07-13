@@ -5,17 +5,57 @@
 <section class="section-head evaluation-head">
   <div>
     <p class="eyebrow">CHUNKING EVALUATION</p>
-    <h1>固定分块基线</h1>
+    <h1>分块实验室</h1>
     <p class="section-note">{{ cases | length }} 个案例 / {{ ready_cases | length }} 个已建立索引</p>
   </div>
   <div class="page-actions">
     <form action="/evaluation/prepare" method="post">
       <button type="submit">导入并准备基准</button>
     </form>
-    <form action="/evaluation/run" method="post">
-      <button type="submit" {% if not cases or ready_cases | length != cases | length %}disabled{% endif %}>运行基线评测</button>
-    </form>
   </div>
+</section>
+
+<section class="experiment-config">
+  <div class="experiment-config-title">
+    <p class="eyebrow">EXPERIMENT CONFIG</p>
+    <h2>固定边界分块</h2>
+  </div>
+  <form action="/evaluation/run" method="post" class="experiment-form">
+    <label class="experiment-field experiment-name-field">
+      <span>实验名称</span>
+      <input name="experiment_name" value="固定边界分块实验" maxlength="80" required>
+    </label>
+    <label class="experiment-field">
+      <span>分块策略</span>
+      <select disabled>
+        <option>length_boundary</option>
+      </select>
+    </label>
+    <label class="experiment-field">
+      <span>块大小（字符）</span>
+      <input type="number" name="chunk_size" value="1200" min="300" max="3000" step="100" required>
+    </label>
+    <label class="experiment-field">
+      <span>重叠（字符）</span>
+      <input type="number" name="chunk_overlap" value="150" min="0" max="2999" step="10" required>
+    </label>
+    <label class="experiment-field">
+      <span>召回数量 Top-K</span>
+      <select name="top_k">
+        <option value="5" selected>5</option>
+        <option value="10">10</option>
+        <option value="20">20</option>
+      </select>
+    </label>
+    <label class="experiment-field weight-field">
+      <span>Seed 语义权重 <output data-semantic-output>0.75</output></span>
+      <input type="range" name="semantic_weight" value="0.75" min="0" max="1" step="0.05" data-semantic-weight>
+      <small>TF-IDF 关键词权重：<output data-keyword-output>0.25</output></small>
+    </label>
+    <div class="experiment-submit">
+      <button type="submit" {% if not cases %}disabled{% endif %}>重建索引并运行实验</button>
+    </div>
+  </form>
 </section>
 
 {% if selected_run %}
@@ -32,6 +72,10 @@
     <dt>块大小 / 重叠</dt><dd>{{ selected_run["chunk_size"] }} / {{ selected_run["chunk_overlap"] }}</dd>
     <dt>Embedding</dt><dd>{{ selected_run["embedding_model"] }}</dd>
     <dt>语义 / 关键词权重</dt><dd>{{ selected_run["semantic_weight"] }} / {{ selected_run["keyword_weight"] }}</dd>
+    <dt>Top-K</dt><dd>{{ selected_run["top_k"] }}</dd>
+    {% if selected_run["metrics"].get("total_chunk_count") %}
+    <dt>总文本块</dt><dd>{{ selected_run["metrics"]["total_chunk_count"] }}</dd>
+    {% endif %}
   </dl>
   {% if selected_run["error"] %}<p class="alert">{{ selected_run["error"] }}</p>{% endif %}
   {% if selected_run["metrics"] %}
@@ -113,7 +157,7 @@
   {% if runs %}
   <div class="table-wrap">
     <table class="evaluation-table">
-      <thead><tr><th>运行</th><th>状态</th><th>案例</th><th>Hit@5</th><th>MRR@5</th><th>完成时间</th></tr></thead>
+      <thead><tr><th>运行</th><th>块 / 重叠</th><th>状态</th><th>案例</th><th>Hit@5</th><th>MRR@5</th><th>完成时间</th></tr></thead>
       <tbody>
       {% for run in runs %}
         <tr
@@ -125,6 +169,7 @@
           {% endif %}
         >
           <td><a href="/evaluation/runs/{{ run['id'] }}">#{{ run["id"] }} {{ run["name"] }}</a></td>
+          <td>{{ run["chunk_size"] }} / {{ run["chunk_overlap"] }}</td>
           <td>{{ run["status"] }}</td>
           <td>{{ run["case_count"] }}</td>
           <td>{{ "%.1f%%" | format(run["metrics"].get("hit_at_5", 0) * 100) if run["metrics"] else "-" }}</td>

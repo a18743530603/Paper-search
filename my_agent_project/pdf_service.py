@@ -52,7 +52,12 @@ def split_page_text(
     return chunks
 
 
-def extract_pdf_chunks(path: Path) -> tuple[int, list[PaperChunk]]:
+def extract_pdf_chunks(
+    path: Path,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> tuple[int, list[PaperChunk]]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -63,7 +68,11 @@ def extract_pdf_chunks(path: Path) -> tuple[int, list[PaperChunk]]:
     chunk_index = 0
     for page_number, page in enumerate(reader.pages, start=1):
         page_text = page.extract_text() or ""
-        for content in split_page_text(page_text):
+        for content in split_page_text(
+            page_text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        ):
             chunks.append(
                 PaperChunk(
                     page_number=page_number,
@@ -75,7 +84,12 @@ def extract_pdf_chunks(path: Path) -> tuple[int, list[PaperChunk]]:
     return len(reader.pages), chunks
 
 
-def parse_paper_pdf(paper_id: int) -> None:
+def parse_paper_pdf(
+    paper_id: int,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> None:
     paper = get_paper(paper_id)
     if paper is None:
         return
@@ -89,7 +103,11 @@ def parse_paper_pdf(paper_id: int) -> None:
         if not path.is_file():
             raise RuntimeError("本地 PDF 文件不存在")
 
-        page_count, chunks = extract_pdf_chunks(path)
+        page_count, chunks = extract_pdf_chunks(
+            path,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
         if not chunks:
             raise RuntimeError("PDF 未提取到可用文本，文件可能是扫描版")
         replace_paper_chunks(paper_id, chunks, page_count=page_count)

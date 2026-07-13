@@ -1,6 +1,7 @@
 import csv
 import re
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -29,6 +30,18 @@ BASELINE_STRATEGY = "length_boundary"
 DEFAULT_TOP_K = 5
 EVIDENCE_MATCH_THRESHOLD = 0.65
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+MIN_CHUNK_SIZE = 300
+MAX_CHUNK_SIZE = 3000
+MAX_TOP_K = 20
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    chunk_size: int
+    chunk_overlap: int
+    top_k: int
+    semantic_weight: float
+    keyword_weight: float
 
 
 def _normalize_title(value: str) -> str:
@@ -121,6 +134,63 @@ def evidence_coverage(evidence_text: str, candidate_text: str) -> float:
     return matched / sum(expected.values())
 
 
+def validate_experiment_config(
+    chunk_size: int,
+    chunk_overlap: int,
+    top_k: int,
+    semantic_weight: float,
+) -> ExperimentConfig:
+    if not MIN_CHUNK_SIZE <= chunk_size <= MAX_CHUNK_SIZE:
+        raise ValueError(
+            f"chunk_size 必须在 {MIN_CHUNK_SIZE} 到 {MAX_CHUNK_SIZE} 之间"
+        )
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap 必须大于等于 0 且小于 chunk_size")
+    if not 1 <= top_k <= MAX_TOP_K:
+        raise ValueError(f"top_k 必须在 1 到 {MAX_TOP_K} 之间")
+    if not 0 <= semantic_weight <= 1:
+        raise ValueError("semantic_weight 必须在 0 到 1 之间")
+    semantic_weight = round(semantic_weight, 2)
+    return ExperimentConfig(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        top_k=top_k,
+        semantic_weight=semantic_weight,
+        keyword_weight=round(1 - semantic_weight, 2),
+    )
+
+
+def create_experiment_run(
+    *,
+    name: str = "固定边界分块实验",
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    top_k: int = DEFAULT_TOP_K,
+    semantic_weight: float = SEMANTIC_WEIGHT,
+) -> tuple[int, ExperimentConfig]:
+    config = validate_experiment_config(
+        chunk_size,
+        chunk_overlap,
+        top_k,
+        semantic_weight,
+    )
+    cases = list_evaluation_cases()
+    if not cases:
+        raise RuntimeError("尚未导入评测案例")
+    run_id = create_evaluation_run(
+        name=name.strip()[:80] or "固定边界分块实验",
+        chunk_strategy=BASELINE_STRATEGY,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
+        embedding_model=SEED_EMBEDDING_MODEL or "local-tfidf-v1",
+        semantic_weight=config.semantic_weight,
+        keyword_weight=config.keyword_weight,
+        top_k=config.top_k,
+        case_count=len(cases),
+    )
+    return run_id, config
+
+
 def create_baseline_run(top_k: int = DEFAULT_TOP_K) -> int:
     cases = list_evaluation_cases()
     if not cases:
@@ -133,17 +203,11 @@ def create_baseline_run(top_k: int = DEFAULT_TOP_K) -> int:
     ]
     if not_ready:
         raise RuntimeError("评测论文尚未全部完成解析和索引")
-    return create_evaluation_run(
+    run_id, _config = create_experiment_run(
         name="固定边界分块基线",
-        chunk_strategy=BASELINE_STRATEGY,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        chunk_overlap=DEFAULT_CHUNK_OVERLAP,
-        embedding_model=SEED_EMBEDDING_MODEL or "local-tfidf-v1",
-        semantic_weight=SEMANTIC_WEIGHT,
-        keyword_weight=KEYWORD_WEIGHT,
         top_k=top_k,
-        case_count=len(cases),
     )
+    return run_id
 
 
 def _aggregate_metrics(results: list[dict], top_k: int) -> dict:
@@ -191,18 +255,29 @@ def _aggregate_metrics(results: list[dict], top_k: int) -> dict:
     return metrics
 
 
-def run_evaluation(run_id: int, top_k: int = DEFAULT_TOP_K) -> None:
+def run_evaluation(
+    run_id: int,
+    top_k: int = DEFAULT_TOP_K,
+    semantic_weight: float = SEMANTIC_WEIGHT,
+    keyword_weight: float = KEYWORD_WEIGHT,
+    extra_metrics: dict | None = None,
+) -> None:
     cases = list_evaluation_cases()
     results: list[dict] = []
     try:
         for case in cases:
             hit_rank = None
             best_coverage = 0.0
+            best_coverage_at_5 = 0.0
             error = None
             stored_retrieved: list[dict] = []
             try:
                 retrieved = retrieve_relevant_chunks(
-                    case["paper_id"], case["question"], top_k=top_k
+                    case["paper_id"],
+                    case["question"],
+                    top_k=top_k,
+                    semantic_weight=semantic_weight,
+                    keyword_weight=keyword_weight,
                 )
                 for rank, chunk in enumerate(retrieved, start=1):
                     coverage = (
@@ -211,6 +286,8 @@ def run_evaluation(run_id: int, top_k: int = DEFAULT_TOP_K) -> None:
                         else 0.0
                     )
                     best_coverage = max(best_coverage, coverage)
+                    if rank <= 5:
+                        best_coverage_at_5 = max(best_coverage_at_5, coverage)
                     matched = coverage >= EVIDENCE_MATCH_THRESHOLD
                     if matched and hit_rank is None:
                         hit_rank = rank
@@ -244,14 +321,50 @@ def run_evaluation(run_id: int, top_k: int = DEFAULT_TOP_K) -> None:
                     "question_type": case["question_type"],
                     "hit_rank": hit_rank,
                     "reciprocal_rank": reciprocal_rank,
-                    "best_coverage": best_coverage,
+                    "best_coverage": best_coverage_at_5,
                     "error": error,
                 }
             )
+        metrics = _aggregate_metrics(results, top_k)
+        metrics.update(extra_metrics or {})
         finish_evaluation_run(
             run_id,
             "completed",
-            metrics=_aggregate_metrics(results, top_k),
+            metrics=metrics,
+        )
+    except Exception as exc:
+        finish_evaluation_run(run_id, "failed", error=str(exc)[:500])
+
+
+def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
+    cases = list_evaluation_cases()
+    paper_ids = sorted({int(case["paper_id"]) for case in cases})
+    total_chunks = 0
+    try:
+        for paper_id in paper_ids:
+            parse_paper_pdf(
+                paper_id,
+                chunk_size=config.chunk_size,
+                overlap=config.chunk_overlap,
+            )
+            document = get_document(paper_id)
+            if document is None or document["parse_status"] != PARSE_PARSED:
+                error = document["error"] if document else "解析状态不存在"
+                raise RuntimeError(f"论文 {paper_id} 重新分块失败：{error}")
+            total_chunks += int(document["chunk_count"] or 0)
+
+            index_paper_chunks(paper_id)
+            document = get_document(paper_id)
+            if document is None or document["index_status"] != INDEX_INDEXED:
+                error = document["index_error"] if document else "索引状态不存在"
+                raise RuntimeError(f"论文 {paper_id} 重新索引失败：{error}")
+
+        run_evaluation(
+            run_id,
+            top_k=config.top_k,
+            semantic_weight=config.semantic_weight,
+            keyword_weight=config.keyword_weight,
+            extra_metrics={"total_chunk_count": total_chunks},
         )
     except Exception as exc:
         finish_evaluation_run(run_id, "failed", error=str(exc)[:500])
