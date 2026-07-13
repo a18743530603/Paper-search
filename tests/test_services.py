@@ -9,7 +9,11 @@ from my_agent_project import rag_service
 
 from my_agent_project.download_service import can_attempt_download, sanitize_filename
 from my_agent_project.origin_service import build_origin_chart_tables
-from my_agent_project.pdf_service import split_page_text
+from my_agent_project.pdf_service import (
+    detect_section_heading,
+    split_academic_page_text,
+    split_page_text,
+)
 from my_agent_project.rag_service import (
     VECTOR_MODEL,
     build_access_notice,
@@ -157,6 +161,100 @@ def test_split_page_text_keeps_overlap_and_limits_chunks():
 
     assert len(chunks) > 1
     assert all(0 < len(chunk) <= 200 for chunk in chunks)
+
+
+def test_detect_section_heading_supports_academic_numbering():
+    assert detect_section_heading("4 Experiments") == (1, "4 Experiments")
+    assert detect_section_heading("4.1 Experimental Settings") == (
+        2,
+        "4.1 Experimental Settings",
+    )
+    assert detect_section_heading("IV. Results and Discussion") == (
+        1,
+        "IV Results and Discussion",
+    )
+    assert detect_section_heading("Figure 2. Main results") is None
+    assert detect_section_heading("I use AdamW for all experiments") is None
+    assert detect_section_heading("C. Feature Importance Analysis via SHAP") == (
+        2,
+        "C Feature Importance Analysis via SHAP",
+    )
+    assert detect_section_heading("2 values violate the assumption") is None
+    assert detect_section_heading("8 NumHDonors 0.063 -0.275") is None
+
+
+def test_academic_chunks_keep_section_path_across_pages():
+    first_page, section_path = split_academic_page_text(
+        "4 Experiments\nOverview of the experiments.\n"
+        "4.1 Experimental Settings\nWe use AdamW with learning rate 1e-3.",
+        chunk_size=400,
+        overlap=40,
+    )
+    second_page, section_path = split_academic_page_text(
+        "Training runs for five epochs.",
+        current_sections=section_path,
+        chunk_size=400,
+        overlap=40,
+    )
+
+    assert first_page[0].startswith("[Section: 4 Experiments]")
+    assert first_page[1].startswith(
+        "[Section: 4 Experiments > 4.1 Experimental Settings]"
+    )
+    assert second_page[0].startswith(
+        "[Section: 4 Experiments > 4.1 Experimental Settings]"
+    )
+    assert section_path == ["4 Experiments", "4.1 Experimental Settings"]
+
+
+def test_academic_chunks_exclude_reference_section():
+    chunks, section_path = split_academic_page_text(
+        "References\n[1] A cited work.\n[2] Another cited work.",
+        chunk_size=400,
+        overlap=40,
+    )
+
+    assert chunks == []
+    assert section_path == ["References"]
+
+
+def test_academic_chunks_merge_wrapped_ieee_headings_and_lock_references():
+    chunks, section_path = split_academic_page_text(
+        "II. M\n"
+        "ATERIALS AND METHODS\n"
+        "A. D\n"
+        "ataset Construction and Quality Control\n"
+        "The dataset contains complete records.\n"
+        "References\n"
+        "H. Duan, J. Wang, and Y. Qiao. A cited paper.\n",
+        chunk_size=400,
+        overlap=40,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].startswith(
+        "[Section: II MATERIALS AND METHODS > "
+        "A Dataset Construction and Quality Control]"
+    )
+    assert "cited paper" not in chunks[0]
+    assert section_path == ["References"]
+
+
+def test_academic_chunks_resume_after_explicit_appendix_heading():
+    chunks, section_path = split_academic_page_text(
+        "References\n"
+        "H. Duan, J. Wang, and Y. Qiao. A cited paper.\n"
+        "A. Appendix\n"
+        "A.1. Training Details\n"
+        "AdamW is used for five epochs.",
+        chunk_size=400,
+        overlap=40,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].startswith("[Section: A Appendix > A.1 Training Details]")
+    assert "cited paper" not in chunks[0]
+    assert section_path == ["A Appendix", "A.1 Training Details"]
 
 
 def test_access_notice_mentions_legal_access_and_link():
@@ -573,8 +671,11 @@ def test_evaluation_records_are_persisted(tmp_path, monkeypatch):
 
 
 def test_experiment_config_validates_and_derives_keyword_weight():
-    config = evaluation_service.validate_experiment_config(900, 120, 10, 0.65)
+    config = evaluation_service.validate_experiment_config(
+        "academic_section", 900, 120, 10, 0.65
+    )
 
+    assert config.chunk_strategy == "academic_section"
     assert config.chunk_size == 900
     assert config.chunk_overlap == 120
     assert config.top_k == 10
@@ -584,7 +685,9 @@ def test_experiment_config_validates_and_derives_keyword_weight():
 
 def test_experiment_config_rejects_overlap_not_smaller_than_chunk():
     try:
-        evaluation_service.validate_experiment_config(600, 600, 5, 0.75)
+        evaluation_service.validate_experiment_config(
+            "length_boundary", 600, 600, 5, 0.75
+        )
     except ValueError as exc:
         assert "chunk_overlap" in str(exc)
     else:
@@ -592,7 +695,7 @@ def test_experiment_config_rejects_overlap_not_smaller_than_chunk():
 
 
 def test_configured_experiment_rebuilds_each_paper(monkeypatch):
-    parsed: list[tuple[int, int, int]] = []
+    parsed: list[tuple[int, str, int, int]] = []
     indexed: list[int] = []
     evaluated: list[dict] = []
     monkeypatch.setattr(
@@ -603,8 +706,8 @@ def test_configured_experiment_rebuilds_each_paper(monkeypatch):
     monkeypatch.setattr(
         evaluation_service,
         "parse_paper_pdf",
-        lambda paper_id, *, chunk_size, overlap: parsed.append(
-            (paper_id, chunk_size, overlap)
+        lambda paper_id, *, strategy, chunk_size, overlap: parsed.append(
+            (paper_id, strategy, chunk_size, overlap)
         ),
     )
     monkeypatch.setattr(
@@ -625,18 +728,31 @@ def test_configured_experiment_rebuilds_each_paper(monkeypatch):
     )
     monkeypatch.setattr(
         evaluation_service,
+        "list_paper_chunks",
+        lambda paper_id, limit: [
+            {"content": f"[Section: Paper {paper_id} > Methods]\nText"}
+        ],
+    )
+    monkeypatch.setattr(
+        evaluation_service,
         "run_evaluation",
         lambda run_id, **kwargs: evaluated.append({"run_id": run_id, **kwargs}),
     )
-    config = evaluation_service.ExperimentConfig(800, 100, 10, 0.7, 0.3)
+    config = evaluation_service.ExperimentConfig(
+        "academic_section", 800, 100, 10, 0.7, 0.3
+    )
 
     evaluation_service.run_configured_experiment(9, config)
 
-    assert parsed == [(1, 800, 100), (2, 800, 100)]
+    assert parsed == [
+        (1, "academic_section", 800, 100),
+        (2, "academic_section", 800, 100),
+    ]
     assert indexed == [1, 2]
     assert evaluated[0]["run_id"] == 9
     assert evaluated[0]["top_k"] == 10
     assert evaluated[0]["extra_metrics"]["total_chunk_count"] == 14
+    assert evaluated[0]["extra_metrics"]["detected_section_count"] == 2
 
 
 def test_evaluation_page_exposes_chart_metrics():
@@ -678,3 +794,4 @@ def test_evaluation_page_exposes_chart_metrics():
     assert 'name="chunk_overlap"' in html
     assert 'name="chunk_overlap" value="150" min="0" max="2999" step="10"' in html
     assert 'name="semantic_weight"' in html
+    assert '<option value="academic_section">' in html

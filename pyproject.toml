@@ -1,6 +1,6 @@
 [project]
 name = "paper-hunter"
-version = "0.5.0"
+version = "0.6.0"
 description = "FastAPI literature search and open-access PDF archiver"
 requires-python = ">=3.11"
 dependencies = [

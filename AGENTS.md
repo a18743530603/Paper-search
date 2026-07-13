@@ -1,6 +1,6 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.5.0`
+> 当前版本：`v0.6.0`
 >
 > 更新日期：`2026-07-13`
 >
@@ -50,9 +50,9 @@ https://github.com/a18743530603/Paper-search.git
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常。
 - `db.py`：初始化和操作 SQLite，保存论文、更新状态并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
-- `pdf_service.py`：使用 `pypdf` 按页提取正文、清理文本、生成重叠文本块，并在后台更新解析状态。
+- `pdf_service.py`：使用 `pypdf` 按页提取正文，支持固定边界与论文章节感知分块、章节层级继承、参考文献过滤和附录恢复，并在后台更新解析状态。
 - `rag_service.py`：Seed 稠密向量、TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
-- `evaluation_service.py`：导入人工标注基准、校验 `ExperimentConfig`、按实验参数重建 PDF 分块与索引、匹配标准证据并聚合 Hit/Recall/MRR 指标。
+- `evaluation_service.py`：导入人工标注基准、校验含策略的 `ExperimentConfig`、按实验参数重建 PDF 分块与索引、统计章节路径、匹配标准证据并聚合 Hit/Recall/MRR 指标。
 - `origin_service.py`：整理统计数据，并在本机安装 Origin/OriginPro 时尝试自动生成图表。
 - `templates/`：Jinja2 页面模板。
 - `static/styles.css`：网页样式。
@@ -189,6 +189,21 @@ git push
 - Seed 配置使用 `SEED_API_KEY`、`SEED_BASE_URL`、`SEED_EMBEDDING_MODEL`、`SEED_EMBEDDING_API_MODE` 和 `SEED_TIMEOUT`。`embedding-vision` 模型自动使用多模态接口；`ep-...` 接入点需要显式指定模式。缺失或调用失败时必须自动降级到 TF-IDF。
 - 原 `agent_service.py` 已合并进 `model_service.py`。数据库、PDF、模型和 RAG 职责不同，不应为了减少文件数量继续强行合并。
 
+## v0.6.0 论文章节感知分块
+
+- 新增 `CHUNK_STRATEGY_ACADEMIC = "academic_section"`，保留 `length_boundary` 作为默认策略和历史基线。
+- `pdf_service.detect_section_heading()` 识别阿拉伯数字、多级数字、罗马数字、IEEE 字母小节与 `A.1` 附录编号，并拒绝表格数字、正文句子和编号操作步骤等常见误判。
+- `_merge_wrapped_heading_lines()` 合并 PDF 提取造成的拆行标题，例如 `II. M` 与 `ATERIALS AND METHODS`。
+- `split_academic_page_text()` 跨页继承父子章节路径；每个正文块以 `[Section: 父章节 > 子章节]` 开头，但仍在物理页内按 `chunk_size/overlap` 生成子块，保证证据页码可评测。
+- 进入 `References`、`Bibliography`、`Acknowledgment(s)` 后停止索引；遇到明确 `A. Appendix` 后恢复，避免参考文献作者名误判为小节，同时保留附录参数证据。
+- `extract_pdf_chunks()`、`parse_paper_pdf()` 新增 `strategy` 参数；普通详情页解析不传参时仍使用 `length_boundary`，避免隐式改变现有行为。
+- `ExperimentConfig.chunk_strategy`、`create_experiment_run()`、`run_configured_experiment()` 和 `/evaluation/run` 已贯通策略选择；评测指标额外保存 `detected_section_count`。
+- 评测页可选择 `length_boundary` 或 `academic_section`，切换时自动更新实验名称，运行详情显示唯一章节路径数。
+- 真实初版章节实验 `#3` 生成 `132` 块、识别 `40` 条路径，发现参考文献锁错误过滤 AOD 附录；该失败记录保留用于诊断回放。
+- 修正版章节实验 `#4` 生成 `148` 块、识别 `44` 条路径，`Hit@1=60.00%`、`Hit@3=80.00%`、`Hit@5=80.00%`、`MRR@5=0.6889`、覆盖率 `83.30%`。
+- 固定边界 `1200/150` 基线仍更好：`Hit@1=66.67%`、`Hit@5=93.33%`、`MRR@5=0.7667`、覆盖率 `91.49%`。本次结论是结构化分块本身不等于更好的排序，下一步应加入跨语言查询扩展或重排序器。
+- 新增章节编号、跨行标题、跨页层级、参考文献锁和附录恢复测试；完整测试为 `32 passed`。
+
 ## 用户偏好和维护约定
 
 - 解释应面向新手，同时保留可用于面试和简历的技术细节。
@@ -207,11 +222,11 @@ git push
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前 `v0.5.0` 已于 `2026-07-13` 完成验证：评测页可配置块大小、重叠、Top-K 和 Seed/TF-IDF 权重，每次实验强制重新分块和索引，完整自动化测试为 `27 passed`。
+- 当前 `v0.6.0` 已于 `2026-07-13` 完成验证：评测页可配置分块策略、块大小、重叠、Top-K 和 Seed/TF-IDF 权重，每次实验强制重新分块和索引，完整自动化测试为 `32 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。
-- `v0.5.0` 的策略选项仍只有 `length_boundary`；语义分块、自适应分块和父子分块尚未实现。
+- `v0.6.0` 已提供 `length_boundary` 与 `academic_section`；查询翻译、章节标题独立向量、父子召回和重排序尚未实现。
 - `2026-07-13` 真实 API 连通性测试通过：`doubao-embedding-vision-251215` 返回 2048 维向量，`deepseek-v4-pro` 正常生成答案；不得在文档或 Git 中保存真实 Key。
 - 固定分块基线包含 3 篇论文和 15 条人工标注问题，策略为 `length_boundary`、`chunk_size=1200`、`overlap=150`、`top_k=5`；实测 `Hit@5=93.33%`、`MRR@5=0.7667`、平均证据覆盖率 `91.49%`。
 - 唯一未命中案例是 AOD 参数题，完整正确块位于第 18 名；该问题是块级排序失败，不能误判为文本被切断。

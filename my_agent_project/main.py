@@ -57,7 +57,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.5.0")
+app = FastAPI(title="Paper Hunter", version="0.6.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -250,6 +250,7 @@ def prepare_evaluation(background_tasks: BackgroundTasks):
 def start_evaluation(
     background_tasks: BackgroundTasks,
     experiment_name: str = Form("固定边界分块实验"),
+    chunk_strategy: str = Form("length_boundary"),
     chunk_size: int = Form(1200),
     chunk_overlap: int = Form(150),
     top_k: int = Form(5),
@@ -258,6 +259,7 @@ def start_evaluation(
     try:
         run_id, config = create_experiment_run(
             name=experiment_name,
+            chunk_strategy=chunk_strategy,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             top_k=top_k,

@@ -7,6 +7,8 @@ if (activeRun) {
 const semanticWeight = document.querySelector("[data-semantic-weight]");
 const semanticOutput = document.querySelector("[data-semantic-output]");
 const keywordOutput = document.querySelector("[data-keyword-output]");
+const chunkStrategy = document.querySelector("[data-chunk-strategy]");
+const experimentName = document.querySelector('input[name="experiment_name"]');
 
 function updateWeightOutputs() {
   if (!semanticWeight || !semanticOutput || !keywordOutput) return;
@@ -17,6 +19,14 @@ function updateWeightOutputs() {
 
 semanticWeight?.addEventListener("input", updateWeightOutputs);
 updateWeightOutputs();
+
+chunkStrategy?.addEventListener("change", () => {
+  if (!experimentName) return;
+  experimentName.value =
+    chunkStrategy.value === "academic_section"
+      ? "论文章节感知分块"
+      : "固定边界分块实验";
+});
 
 const chartColors = {
   grid: "#d9dfe6",

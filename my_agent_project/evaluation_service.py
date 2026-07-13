@@ -11,11 +11,18 @@ from .db import (
     finish_evaluation_run,
     get_document,
     list_evaluation_cases,
+    list_paper_chunks,
     register_local_paper,
     save_evaluation_result,
     upsert_evaluation_case,
 )
-from .pdf_service import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, parse_paper_pdf
+from .pdf_service import (
+    CHUNK_STRATEGY_LENGTH,
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    SUPPORTED_CHUNK_STRATEGIES,
+    parse_paper_pdf,
+)
 from .rag_service import (
     KEYWORD_WEIGHT,
     SEMANTIC_WEIGHT,
@@ -26,10 +33,11 @@ from .schemas import INDEX_INDEXED, PARSE_PARSED
 
 
 BENCHMARK_PATH = BASE_DIR / "benchmarks" / "chunking_baseline.csv"
-BASELINE_STRATEGY = "length_boundary"
+BASELINE_STRATEGY = CHUNK_STRATEGY_LENGTH
 DEFAULT_TOP_K = 5
 EVIDENCE_MATCH_THRESHOLD = 0.65
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+SECTION_PREFIX_PATTERN = re.compile(r"^\[Section: (?P<section>.+?)]")
 MIN_CHUNK_SIZE = 300
 MAX_CHUNK_SIZE = 3000
 MAX_TOP_K = 20
@@ -37,6 +45,7 @@ MAX_TOP_K = 20
 
 @dataclass(frozen=True)
 class ExperimentConfig:
+    chunk_strategy: str
     chunk_size: int
     chunk_overlap: int
     top_k: int
@@ -135,11 +144,14 @@ def evidence_coverage(evidence_text: str, candidate_text: str) -> float:
 
 
 def validate_experiment_config(
+    chunk_strategy: str,
     chunk_size: int,
     chunk_overlap: int,
     top_k: int,
     semantic_weight: float,
 ) -> ExperimentConfig:
+    if chunk_strategy not in SUPPORTED_CHUNK_STRATEGIES:
+        raise ValueError(f"不支持的分块策略：{chunk_strategy}")
     if not MIN_CHUNK_SIZE <= chunk_size <= MAX_CHUNK_SIZE:
         raise ValueError(
             f"chunk_size 必须在 {MIN_CHUNK_SIZE} 到 {MAX_CHUNK_SIZE} 之间"
@@ -152,6 +164,7 @@ def validate_experiment_config(
         raise ValueError("semantic_weight 必须在 0 到 1 之间")
     semantic_weight = round(semantic_weight, 2)
     return ExperimentConfig(
+        chunk_strategy=chunk_strategy,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         top_k=top_k,
@@ -163,12 +176,14 @@ def validate_experiment_config(
 def create_experiment_run(
     *,
     name: str = "固定边界分块实验",
+    chunk_strategy: str = BASELINE_STRATEGY,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     top_k: int = DEFAULT_TOP_K,
     semantic_weight: float = SEMANTIC_WEIGHT,
 ) -> tuple[int, ExperimentConfig]:
     config = validate_experiment_config(
+        chunk_strategy,
         chunk_size,
         chunk_overlap,
         top_k,
@@ -179,7 +194,7 @@ def create_experiment_run(
         raise RuntimeError("尚未导入评测案例")
     run_id = create_evaluation_run(
         name=name.strip()[:80] or "固定边界分块实验",
-        chunk_strategy=BASELINE_STRATEGY,
+        chunk_strategy=config.chunk_strategy,
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
         embedding_model=SEED_EMBEDDING_MODEL or "local-tfidf-v1",
@@ -340,10 +355,12 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
     cases = list_evaluation_cases()
     paper_ids = sorted({int(case["paper_id"]) for case in cases})
     total_chunks = 0
+    detected_sections: set[str] = set()
     try:
         for paper_id in paper_ids:
             parse_paper_pdf(
                 paper_id,
+                strategy=config.chunk_strategy,
                 chunk_size=config.chunk_size,
                 overlap=config.chunk_overlap,
             )
@@ -352,6 +369,10 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
                 error = document["error"] if document else "解析状态不存在"
                 raise RuntimeError(f"论文 {paper_id} 重新分块失败：{error}")
             total_chunks += int(document["chunk_count"] or 0)
+            for chunk in list_paper_chunks(paper_id, limit=100_000):
+                match = SECTION_PREFIX_PATTERN.match(chunk["content"])
+                if match:
+                    detected_sections.add(match.group("section"))
 
             index_paper_chunks(paper_id)
             document = get_document(paper_id)
@@ -364,7 +385,10 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
             top_k=config.top_k,
             semantic_weight=config.semantic_weight,
             keyword_weight=config.keyword_weight,
-            extra_metrics={"total_chunk_count": total_chunks},
+            extra_metrics={
+                "total_chunk_count": total_chunks,
+                "detected_section_count": len(detected_sections),
+            },
         )
     except Exception as exc:
         finish_evaluation_run(run_id, "failed", error=str(exc)[:500])

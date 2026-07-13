@@ -18,7 +18,7 @@
 <section class="experiment-config">
   <div class="experiment-config-title">
     <p class="eyebrow">EXPERIMENT CONFIG</p>
-    <h2>固定边界分块</h2>
+    <h2>论文分块策略</h2>
   </div>
   <form action="/evaluation/run" method="post" class="experiment-form">
     <label class="experiment-field experiment-name-field">
@@ -27,8 +27,9 @@
     </label>
     <label class="experiment-field">
       <span>分块策略</span>
-      <select disabled>
-        <option>length_boundary</option>
+      <select name="chunk_strategy" data-chunk-strategy>
+        <option value="length_boundary" selected>固定边界 length_boundary</option>
+        <option value="academic_section">论文章节 academic_section</option>
       </select>
     </label>
     <label class="experiment-field">
@@ -75,6 +76,9 @@
     <dt>Top-K</dt><dd>{{ selected_run["top_k"] }}</dd>
     {% if selected_run["metrics"].get("total_chunk_count") %}
     <dt>总文本块</dt><dd>{{ selected_run["metrics"]["total_chunk_count"] }}</dd>
+    {% endif %}
+    {% if selected_run["metrics"].get("detected_section_count") %}
+    <dt>识别章节路径</dt><dd>{{ selected_run["metrics"]["detected_section_count"] }}</dd>
     {% endif %}
   </dl>
   {% if selected_run["error"] %}<p class="alert">{{ selected_run["error"] }}</p>{% endif %}
