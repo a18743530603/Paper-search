@@ -18,10 +18,14 @@ from .db import (
     export_papers_csv,
     export_papers_json,
     get_document,
+    get_evaluation_run,
     get_or_create_document,
     get_paper,
     init_db,
     insert_papers,
+    list_evaluation_cases,
+    list_evaluation_results,
+    list_evaluation_runs,
     list_paper_chunks,
     list_paper_statuses,
     list_papers,
@@ -29,6 +33,12 @@ from .db import (
     update_download_status,
 )
 from .download_service import can_attempt_download, download_paper
+from .evaluation_service import (
+    create_baseline_run,
+    import_benchmark_cases,
+    prepare_benchmark,
+    run_evaluation,
+)
 from .origin_service import create_origin_outputs
 from .pdf_service import parse_paper_pdf
 from .rag_service import (
@@ -47,7 +57,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.2.0")
+app = FastAPI(title="Paper Hunter", version="0.4.1")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -207,6 +217,64 @@ def start_download(paper_id: int, background_tasks: BackgroundTasks):
     update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
     background_tasks.add_task(download_paper, paper_id)
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
+
+
+@app.get("/evaluation")
+def evaluation_dashboard(request: Request):
+    runs = list_evaluation_runs()
+    latest_run = runs[0] if runs else None
+    return templates.TemplateResponse(
+        request,
+        "evaluation.html",
+        {
+            "cases": list_evaluation_cases(),
+            "runs": runs,
+            "selected_run": latest_run,
+            "results": (
+                list_evaluation_results(latest_run["id"])
+                if latest_run and latest_run["status"] == "completed"
+                else []
+            ),
+        },
+    )
+
+
+@app.post("/evaluation/prepare")
+def prepare_evaluation(background_tasks: BackgroundTasks):
+    import_benchmark_cases()
+    background_tasks.add_task(prepare_benchmark)
+    return RedirectResponse(url="/evaluation", status_code=303)
+
+
+@app.post("/evaluation/run")
+def start_evaluation(background_tasks: BackgroundTasks):
+    try:
+        run_id = create_baseline_run()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background_tasks.add_task(run_evaluation, run_id)
+    return RedirectResponse(url=f"/evaluation/runs/{run_id}", status_code=303)
+
+
+@app.get("/evaluation/runs/{run_id}")
+def evaluation_run_detail(request: Request, run_id: int):
+    selected_run = get_evaluation_run(run_id)
+    if selected_run is None:
+        raise HTTPException(status_code=404, detail="Evaluation run not found")
+    return templates.TemplateResponse(
+        request,
+        "evaluation.html",
+        {
+            "cases": list_evaluation_cases(),
+            "runs": list_evaluation_runs(),
+            "selected_run": selected_run,
+            "results": (
+                list_evaluation_results(run_id)
+                if selected_run["status"] == "completed"
+                else []
+            ),
+        },
+    )
 
 
 @app.get("/origin")

@@ -85,6 +85,59 @@ CREATE TABLE IF NOT EXISTS rag_queries (
 
 CREATE INDEX IF NOT EXISTS idx_rag_queries_paper_id
 ON rag_queries(paper_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS evaluation_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL,
+    question_type TEXT NOT NULL,
+    question TEXT NOT NULL,
+    reference_answer TEXT NOT NULL,
+    evidence_page INTEGER NOT NULL,
+    evidence_text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
+    UNIQUE (paper_id, question)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_cases_paper_id
+ON evaluation_cases(paper_id, id);
+
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    chunk_strategy TEXT NOT NULL,
+    chunk_size INTEGER NOT NULL,
+    chunk_overlap INTEGER NOT NULL,
+    embedding_model TEXT NOT NULL,
+    semantic_weight REAL NOT NULL,
+    keyword_weight REAL NOT NULL,
+    top_k INTEGER NOT NULL,
+    case_count INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    case_id INTEGER NOT NULL,
+    hit_rank INTEGER,
+    reciprocal_rank REAL NOT NULL DEFAULT 0,
+    best_coverage REAL NOT NULL DEFAULT 0,
+    retrieved_json TEXT NOT NULL,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES evaluation_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (case_id) REFERENCES evaluation_cases(id) ON DELETE CASCADE,
+    UNIQUE (run_id, case_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_results_run_id
+ON evaluation_results(run_id, case_id);
 """
 
 
@@ -190,8 +243,47 @@ def list_papers(limit: int = 100) -> list[sqlite3.Row]:
 def clear_paper_history() -> int:
     with connect() as conn:
         count = int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
+        conn.execute("DELETE FROM evaluation_runs")
         conn.execute("DELETE FROM papers")
     return count
+
+
+def register_local_paper(title: str, local_path: Path) -> int:
+    resolved_path = local_path.resolve()
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"本地 PDF 不存在：{resolved_path}")
+    downloaded_at = datetime.fromtimestamp(
+        resolved_path.stat().st_mtime
+    ).astimezone().isoformat(timespec="seconds")
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM papers WHERE title = ? ORDER BY id LIMIT 1",
+            (title,),
+        ).fetchone()
+        if existing is not None:
+            paper_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE papers
+                SET local_path = ?, status = 'downloaded', downloaded_at = ?,
+                    error = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (str(resolved_path), downloaded_at, paper_id),
+            )
+            return paper_id
+        cursor = conn.execute(
+            """
+            INSERT INTO papers (
+                query, title, authors, summary, published, source, publisher,
+                doi, page_url, pdf_url, local_path, status, downloaded_at
+            )
+            VALUES ('local benchmark', ?, '', '', '', 'local', '', NULL, '',
+                    NULL, ?, 'downloaded', ?)
+            """,
+            (title, str(resolved_path), downloaded_at),
+        )
+        return int(cursor.lastrowid)
 
 
 def get_paper(paper_id: int) -> Optional[sqlite3.Row]:
@@ -505,6 +597,220 @@ def update_rag_query(
                 query_id,
             ),
         )
+
+
+def upsert_evaluation_case(
+    paper_id: int,
+    question_type: str,
+    question: str,
+    reference_answer: str,
+    evidence_page: int,
+    evidence_text: str,
+) -> int:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO evaluation_cases (
+                paper_id, question_type, question, reference_answer,
+                evidence_page, evidence_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(paper_id, question) DO UPDATE SET
+                question_type = excluded.question_type,
+                reference_answer = excluded.reference_answer,
+                evidence_page = excluded.evidence_page,
+                evidence_text = excluded.evidence_text,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                paper_id,
+                question_type,
+                question,
+                reference_answer,
+                evidence_page,
+                evidence_text,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT id FROM evaluation_cases
+            WHERE paper_id = ? AND question = ?
+            """,
+            (paper_id, question),
+        ).fetchone()
+        return int(row["id"])
+
+
+def list_evaluation_cases() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.*, p.title AS paper_title, p.local_path,
+                   d.parse_status, d.index_status, d.vectorizer
+            FROM evaluation_cases AS c
+            JOIN papers AS p ON p.id = c.paper_id
+            LEFT JOIN paper_documents AS d ON d.paper_id = p.id
+            ORDER BY p.id, c.id
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_evaluation_run(
+    *,
+    name: str,
+    chunk_strategy: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    embedding_model: str,
+    semantic_weight: float,
+    keyword_weight: float,
+    top_k: int,
+    case_count: int,
+) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO evaluation_runs (
+                name, status, chunk_strategy, chunk_size, chunk_overlap,
+                embedding_model, semantic_weight, keyword_weight, top_k,
+                case_count
+            )
+            VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                chunk_strategy,
+                chunk_size,
+                chunk_overlap,
+                embedding_model,
+                semantic_weight,
+                keyword_weight,
+                top_k,
+                case_count,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def save_evaluation_result(
+    run_id: int,
+    case_id: int,
+    *,
+    hit_rank: Optional[int],
+    reciprocal_rank: float,
+    best_coverage: float,
+    retrieved: list[dict],
+    error: Optional[str] = None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO evaluation_results (
+                run_id, case_id, hit_rank, reciprocal_rank, best_coverage,
+                retrieved_json, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, case_id) DO UPDATE SET
+                hit_rank = excluded.hit_rank,
+                reciprocal_rank = excluded.reciprocal_rank,
+                best_coverage = excluded.best_coverage,
+                retrieved_json = excluded.retrieved_json,
+                error = excluded.error
+            """,
+            (
+                run_id,
+                case_id,
+                hit_rank,
+                reciprocal_rank,
+                best_coverage,
+                json.dumps(retrieved, ensure_ascii=False),
+                error,
+            ),
+        )
+
+
+def finish_evaluation_run(
+    run_id: int,
+    status: str,
+    *,
+    metrics: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> None:
+    completed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE evaluation_runs
+            SET status = ?, metrics_json = ?, error = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                json.dumps(metrics or {}, ensure_ascii=False),
+                error,
+                completed_at,
+                run_id,
+            ),
+        )
+
+
+def list_evaluation_runs(limit: int = 20) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM evaluation_runs ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    runs: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["metrics"] = json.loads(item["metrics_json"] or "{}")
+        except json.JSONDecodeError:
+            item["metrics"] = {}
+        runs.append(item)
+    return runs
+
+
+def get_evaluation_run(run_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM evaluation_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    try:
+        item["metrics"] = json.loads(item["metrics_json"] or "{}")
+    except json.JSONDecodeError:
+        item["metrics"] = {}
+    return item
+
+
+def list_evaluation_results(run_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, c.question_type, c.question, c.reference_answer,
+                   c.evidence_page, c.evidence_text, p.title AS paper_title
+            FROM evaluation_results AS r
+            JOIN evaluation_cases AS c ON c.id = r.case_id
+            JOIN papers AS p ON p.id = c.paper_id
+            WHERE r.run_id = ?
+            ORDER BY c.paper_id, c.id
+            """,
+            (run_id,),
+        ).fetchall()
+    results: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["retrieved"] = json.loads(item["retrieved_json"] or "[]")
+        except json.JSONDecodeError:
+            item["retrieved"] = []
+        results.append(item)
+    return results
 
 
 def update_download_status(

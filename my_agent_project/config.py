@@ -32,6 +32,7 @@ SEED_BASE_URL = os.getenv(
     "https://ark.cn-beijing.volces.com/api/v3",
 ).rstrip("/")
 SEED_EMBEDDING_MODEL = os.getenv("SEED_EMBEDDING_MODEL", "").strip()
+SEED_EMBEDDING_API_MODE = os.getenv("SEED_EMBEDDING_API_MODE", "auto").strip().lower()
 SEED_TIMEOUT = float(os.getenv("SEED_TIMEOUT", "120"))
 
 

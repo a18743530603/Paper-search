@@ -2,6 +2,97 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.4.1` - 2026-07-13
+
+### 新增功能
+
+- 评测页新增“当前运行 Top-K 命中率”曲线，直观展示 Hit@1、Hit@3、Hit@5 随候选数量增加的变化。
+- 评测页新增“历次运行趋势”曲线，按运行编号比较 Hit@1、Hit@3 和 Hit@5，便于后续对照不同分块及召回参数。
+- `evaluation_poll.js` 新增 `drawLineChart()` 和 `renderEvaluationCharts()`，使用原生 Canvas 绘图，不依赖外部 CDN，也不会额外调用 Embedding 或 DeepSeek API。
+- README 新增完整评测操作流程、基准 CSV 字段要求、物理页码说明和对照实验注意事项。
+
+### 修改内容
+
+- 评测运行表格增加指标数据属性，作为历史趋势图的数据来源。
+- 图表会跟随窗口宽度重新绘制，并在窄屏下自动切换为单列布局。
+- 项目版本由 `v0.4.0` 更新为 `v0.4.1`；本次与基线评测属于同日的小版本完善。
+
+### 验证结果
+
+- 新增评测模板指标数据与两个 Canvas 容器的渲染测试。
+- 完整自动化测试：`24 passed`。
+- 已在桌面端和 `390 x 844` 窄屏下完成浏览器验收，确认两张曲线正常绘制且布局无重叠。
+
+## `v0.4.0` - 2026-07-13
+
+### 新增功能
+
+- 新增 `benchmarks/chunking_baseline.csv`，保存 3 篇论文、15 条人工标注问题、参考答案、PDF 物理页码和连续原文证据。
+- 新增 `evaluation_service.py`，提供 `find_local_pdf()`、`import_benchmark_cases()`、`prepare_benchmark()`、`evidence_coverage()`、`create_baseline_run()` 和 `run_evaluation()`。
+- 新增 `evaluation_cases`、`evaluation_runs`、`evaluation_results` 三张 SQLite 表，分别保存标准案例、运行参数/指标和逐题召回结果。
+- 新增 `db.register_local_paper()`，支持将 `downloads/papers/` 中已有 PDF 注册为可解析论文记录。
+- 新增 `GET /evaluation`、`POST /evaluation/prepare`、`POST /evaluation/run` 和 `GET /evaluation/runs/{run_id}`。
+- 新增评测页面，展示运行参数、总体指标、历史运行、标准案例和逐题 Top-K 召回片段。
+- 新增 `evaluation_poll.js`，评测运行期间每 2 秒自动刷新。
+
+### 指标与匹配规则
+
+- 使用“PDF 物理页码一致 + 规范化 token 覆盖率不低于 0.65”判断召回块是否命中标准证据。
+- 计算 `Hit@1/3/5`、`Recall@1/3/5`、`MRR@5` 和平均最佳证据覆盖率。
+- 第一版每题只有一条标准证据，因此 `Recall@K` 与 `Hit@K` 数值相同；后续多证据问题会让两者产生区别。
+- 匹配逻辑容忍 PDF 提取造成的换行、断词和符号差异，不使用整句字符串全等。
+
+### 真实基线结果
+
+- 固定分块策略：`length_boundary`，`chunk_size=1200`，`overlap=150`，`top_k=5`。
+- 混合召回：Seed1.6 语义权重 `0.75`，TF-IDF 关键词权重 `0.25`。
+- 15 条问题实测：`Hit@1=66.67%`、`Hit@3=80.00%`、`Hit@5=93.33%`、`MRR@5=0.7667`、平均最佳证据覆盖率 `91.49%`，无 API 错误。
+- 唯一未命中案例为 AOD 参数题；正确证据块内容完整、覆盖率 100%，但排名第 18，属于块级排序失败，不是文本被切断。
+
+### 验证结果
+
+- 新增证据断词容错、指标聚合和评测数据库持久化测试。
+- 完整自动化测试：`23 passed`。
+
+### 尚未实现
+
+- 结构化分块、语义分块和父子层级分块。
+- 多条标准证据及跨段问题评测。
+- Cross-Encoder 重排序、查询翻译和分块策略对比图。
+
+## `v0.3.0` - 2026-07-13
+
+### 新增功能
+
+- 接入 Seed1.6 `Doubao-embedding-vision-251215`，用于论文文本块和用户问题的稠密向量生成。
+- `model_service._seed_api_mode()` 根据模型名称和 `SEED_EMBEDDING_API_MODE` 自动选择文本或多模态接口。
+- `model_service._request_seed_embedding()` 统一处理火山方舟鉴权、超时、HTTP 错误和 JSON 响应。
+- `model_service._extract_multimodal_vector()` 兼容多模态接口的嵌套向量响应，并校验向量有效性。
+- `.env.example` 新增 `SEED_EMBEDDING_API_MODE`，推荐模型改为 `doubao-embedding-vision-251215`。
+
+### 修改内容
+
+- `embed_with_seed()` 对 `embedding-vision` 模型调用 `/api/v3/embeddings/multimodal`，每个论文文本块使用一个纯文本输入对象。
+- 继续兼容旧文本模型的 `/api/v3/embeddings` 批量请求；使用 `ep-...` 接入点时可显式设置 `text` 或 `multimodal`。
+- 火山方舟请求失败时仍自动降级到本地 TF-IDF，不中断论文索引。
+- `pyproject.toml` 与 FastAPI 应用版本同步升级为 `0.3.0`。
+
+### 安全说明
+
+- 真实 DeepSeek 与火山方舟 API Key 只能写入被 Git 忽略的 `.env`，不得写入代码、`.env.example`、测试或 Markdown 文档。
+- 在聊天、截图或公开页面中暴露过的密钥必须撤销并重新生成。
+
+### 验证结果
+
+- 新增多模态 Embedding 请求结构、逐文本向量顺序和嵌套响应解析测试。
+- 完整自动化测试：`20 passed`，覆盖旧文本接口、新版多模态接口、混合召回、DeepSeek 请求封装和 Web 页面流程。
+- `2026-07-13` 完成真实 API 连通性验收：`doubao-embedding-vision-251215` 成功返回 1 个 2048 维向量，`deepseek-v4-pro` 成功返回预期短答。
+
+### 尚未实现
+
+- 暂未使用新模型的图片与视频向量能力，当前只向量化 PDF 提取后的文本。
+- 尚未使用真实论文完成“下载、解析、索引、检索、生成答案”的浏览器全流程验收。
+
 ## `v0.2.0` - 2026-07-12
 
 ### 新增功能
@@ -53,8 +144,7 @@
 
 ### 验证结果
 
-- 自动化测试：`17 passed`，覆盖 DeepSeek 请求封装、TF-IDF 召回、问答入库和问答页面表单。
-- Seed API 封装与混合召回测试已经新增，测试文件现有 19 个用例；本轮因执行额度限制未能重新运行完整 `pytest`，需在下次运行时复核。
+- 自动化测试：`19 passed`（`2026-07-13` 复核），覆盖 DeepSeek 请求封装、Seed API 请求封装、Seed + TF-IDF 混合召回、问答入库和问答页面表单。
 - FastAPI 首页、历史页和论文详情页响应检查：均返回 HTTP `200`。
 - `/papers/{paper_id}/parse`、`/index` 和 `/ask` 等路由已完成注册检查。
 

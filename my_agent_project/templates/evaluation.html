@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block title %}分块评测 - Paper Hunter{% endblock %}
+{% block content %}
+{% set ready_cases = cases | selectattr("index_status", "equalto", "indexed") | list %}
+<section class="section-head evaluation-head">
+  <div>
+    <p class="eyebrow">CHUNKING EVALUATION</p>
+    <h1>固定分块基线</h1>
+    <p class="section-note">{{ cases | length }} 个案例 / {{ ready_cases | length }} 个已建立索引</p>
+  </div>
+  <div class="page-actions">
+    <form action="/evaluation/prepare" method="post">
+      <button type="submit">导入并准备基准</button>
+    </form>
+    <form action="/evaluation/run" method="post">
+      <button type="submit" {% if not cases or ready_cases | length != cases | length %}disabled{% endif %}>运行基线评测</button>
+    </form>
+  </div>
+</section>
+
+{% if selected_run %}
+<section class="evaluation-summary" {% if selected_run["status"] == "running" %}data-evaluation-running{% endif %}>
+  <div class="evaluation-run-title">
+    <div>
+      <p class="eyebrow">RUN #{{ selected_run["id"] }}</p>
+      <h2>{{ selected_run["name"] }}</h2>
+    </div>
+    <span class="status status-{{ selected_run['status'] }}">{{ selected_run["status"] }}</span>
+  </div>
+  <dl class="run-config">
+    <dt>分块策略</dt><dd>{{ selected_run["chunk_strategy"] }}</dd>
+    <dt>块大小 / 重叠</dt><dd>{{ selected_run["chunk_size"] }} / {{ selected_run["chunk_overlap"] }}</dd>
+    <dt>Embedding</dt><dd>{{ selected_run["embedding_model"] }}</dd>
+    <dt>语义 / 关键词权重</dt><dd>{{ selected_run["semantic_weight"] }} / {{ selected_run["keyword_weight"] }}</dd>
+  </dl>
+  {% if selected_run["error"] %}<p class="alert">{{ selected_run["error"] }}</p>{% endif %}
+  {% if selected_run["metrics"] %}
+  <div
+    class="metric-grid"
+    data-current-metrics
+    data-hit1="{{ selected_run['metrics']['hit_at_1'] }}"
+    data-hit3="{{ selected_run['metrics']['hit_at_3'] }}"
+    data-hit5="{{ selected_run['metrics']['hit_at_5'] }}"
+  >
+    <div class="metric-item"><span>Hit@1</span><strong>{{ "%.1f%%" | format(selected_run["metrics"]["hit_at_1"] * 100) }}</strong></div>
+    <div class="metric-item"><span>Hit@3</span><strong>{{ "%.1f%%" | format(selected_run["metrics"]["hit_at_3"] * 100) }}</strong></div>
+    <div class="metric-item"><span>Hit@5</span><strong>{{ "%.1f%%" | format(selected_run["metrics"]["hit_at_5"] * 100) }}</strong></div>
+    <div class="metric-item"><span>MRR@5</span><strong>{{ "%.4f" | format(selected_run["metrics"]["mrr_at_5"]) }}</strong></div>
+    <div class="metric-item"><span>证据覆盖率</span><strong>{{ "%.1f%%" | format(selected_run["metrics"]["mean_best_coverage"] * 100) }}</strong></div>
+  </div>
+  <div class="evaluation-chart-grid">
+    <figure class="evaluation-chart-panel">
+      <figcaption>
+        <strong>当前运行 Top-K 命中率</strong>
+        <span>曲线越早接近 100%，正确证据的排名越靠前。</span>
+      </figcaption>
+      <div class="evaluation-chart-canvas">
+        <canvas id="top-k-chart" role="img" aria-label="当前运行 Top-K 命中率曲线"></canvas>
+      </div>
+    </figure>
+    <figure class="evaluation-chart-panel">
+      <figcaption>
+        <strong>历次运行趋势</strong>
+        <span>每次评测形成一个运行点，用于比较分块和召回参数。</span>
+      </figcaption>
+      <div class="evaluation-chart-canvas">
+        <canvas id="run-history-chart" role="img" aria-label="历次评测命中率趋势曲线"></canvas>
+      </div>
+    </figure>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if results %}
+<section class="evaluation-section">
+  <h2>逐题结果</h2>
+  <div class="table-wrap">
+    <table class="evaluation-table">
+      <thead><tr><th>论文 / 类型</th><th>问题</th><th>标准页</th><th>命中排名</th><th>最佳覆盖率</th></tr></thead>
+      <tbody>
+      {% for result in results %}
+        <tr>
+          <td><span class="source">{{ result["question_type"] }}</span><small>{{ result["paper_title"] }}</small></td>
+          <td>{{ result["question"] }}</td>
+          <td>{{ result["evidence_page"] }}</td>
+          <td>{{ result["hit_rank"] or "未命中" }}</td>
+          <td>{{ "%.1f%%" | format(result["best_coverage"] * 100) }}</td>
+        </tr>
+        <tr class="retrieval-detail-row">
+          <td colspan="5">
+            <details>
+              <summary>查看 Top {{ result["retrieved"] | length }} 召回片段</summary>
+              {% if result["error"] %}<p class="alert">{{ result["error"] }}</p>{% endif %}
+              {% for item in result["retrieved"] %}
+                <div class="retrieved-item {% if item['matched'] %}retrieved-match{% endif %}">
+                  <p><strong>#{{ item["rank"] }} / 第 {{ item["page_number"] }} 页</strong>，综合分 {{ item["score"] }}，证据覆盖 {{ "%.1f%%" | format(item["evidence_coverage"] * 100) }}</p>
+                  <p>{{ item["content"] }}</p>
+                </div>
+              {% endfor %}
+            </details>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="evaluation-section">
+  <h2>评测运行</h2>
+  {% if runs %}
+  <div class="table-wrap">
+    <table class="evaluation-table">
+      <thead><tr><th>运行</th><th>状态</th><th>案例</th><th>Hit@5</th><th>MRR@5</th><th>完成时间</th></tr></thead>
+      <tbody>
+      {% for run in runs %}
+        <tr
+          {% if run["metrics"] %}
+          data-evaluation-run="{{ run['id'] }}"
+          data-hit1="{{ run['metrics'].get('hit_at_1', 0) }}"
+          data-hit3="{{ run['metrics'].get('hit_at_3', 0) }}"
+          data-hit5="{{ run['metrics'].get('hit_at_5', 0) }}"
+          {% endif %}
+        >
+          <td><a href="/evaluation/runs/{{ run['id'] }}">#{{ run["id"] }} {{ run["name"] }}</a></td>
+          <td>{{ run["status"] }}</td>
+          <td>{{ run["case_count"] }}</td>
+          <td>{{ "%.1f%%" | format(run["metrics"].get("hit_at_5", 0) * 100) if run["metrics"] else "-" }}</td>
+          <td>{{ "%.4f" | format(run["metrics"].get("mrr_at_5", 0)) if run["metrics"] else "-" }}</td>
+          <td>{{ run["completed_at"] or "-" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">暂无评测运行。</p>{% endif %}
+</section>
+
+<section class="evaluation-section">
+  <h2>标准案例</h2>
+  {% if cases %}
+  <div class="table-wrap">
+    <table class="evaluation-table">
+      <thead><tr><th>论文</th><th>类型</th><th>问题</th><th>证据页</th><th>索引</th></tr></thead>
+      <tbody>
+      {% for case in cases %}
+        <tr>
+          <td>{{ case["paper_title"] }}</td>
+          <td>{{ case["question_type"] }}</td>
+          <td>{{ case["question"] }}</td>
+          <td>{{ case["evidence_page"] }}</td>
+          <td>{{ case["index_status"] or "not_indexed" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">尚未导入标准案例。</p>{% endif %}
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='/evaluation_poll.js') }}" defer></script>
+{% endblock %}

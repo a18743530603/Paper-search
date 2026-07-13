@@ -10,6 +10,7 @@ from .config import (
     DEEPSEEK_TIMEOUT,
     SEED_API_KEY,
     SEED_BASE_URL,
+    SEED_EMBEDDING_API_MODE,
     SEED_EMBEDDING_MODEL,
     SEED_TIMEOUT,
 )
@@ -93,26 +94,23 @@ def ask_deepseek(system_prompt: str, user_prompt: str) -> tuple[str, str]:
     return _extract_answer(payload), DEEPSEEK_MODEL
 
 
-def embed_with_seed(texts: list[str]) -> tuple[list[list[float]], str]:
-    if not is_seed_configured():
-        raise ModelConfigurationError(
-            "尚未配置 Seed Embedding。请设置 SEED_API_KEY 和 SEED_EMBEDDING_MODEL。"
-        )
-    if not texts or any(not text.strip() for text in texts):
-        raise EmbeddingRequestError("Seed Embedding 输入不能为空")
+def _seed_api_mode() -> str:
+    if SEED_EMBEDDING_API_MODE in {"text", "multimodal"}:
+        return SEED_EMBEDDING_API_MODE
+    if "embedding-vision" in SEED_EMBEDDING_MODEL.lower():
+        return "multimodal"
+    return "text"
 
+
+def _request_seed_embedding(path: str, body: dict[str, Any]) -> dict[str, Any]:
     try:
         response = httpx.post(
-            f"{SEED_BASE_URL}/embeddings",
+            f"{SEED_BASE_URL}{path}",
             headers={
                 "Authorization": f"Bearer {SEED_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": SEED_EMBEDDING_MODEL,
-                "input": texts,
-                "encoding_format": "float",
-            },
+            json=body,
             timeout=SEED_TIMEOUT,
         )
         response.raise_for_status()
@@ -124,13 +122,78 @@ def embed_with_seed(texts: list[str]) -> tuple[list[list[float]], str]:
         ) from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise EmbeddingRequestError(f"无法连接 Seed Embedding：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise EmbeddingRequestError("Seed Embedding 返回了无法识别的响应格式")
+    return payload
 
+
+def _validate_vector(vector: Any) -> list[float]:
+    if (
+        not isinstance(vector, list)
+        or not vector
+        or any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            for value in vector
+        )
+    ):
+        raise EmbeddingRequestError("Seed Embedding 返回了无效向量")
+    return [float(value) for value in vector]
+
+
+def _extract_multimodal_vector(payload: dict[str, Any]) -> list[float]:
+    try:
+        data = payload["data"]
+        item = data[0] if isinstance(data, list) else data
+        vector = item["embedding"]
+        if (
+            isinstance(vector, list)
+            and len(vector) == 1
+            and isinstance(vector[0], list)
+        ):
+            vector = vector[0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise EmbeddingRequestError("Seed Embedding 返回了无法识别的响应格式") from exc
+    return _validate_vector(vector)
+
+
+def embed_with_seed(texts: list[str]) -> tuple[list[list[float]], str]:
+    if not is_seed_configured():
+        raise ModelConfigurationError(
+            "尚未配置 Seed Embedding。请设置 SEED_API_KEY 和 SEED_EMBEDDING_MODEL。"
+        )
+    if not texts or any(not text.strip() for text in texts):
+        raise EmbeddingRequestError("Seed Embedding 输入不能为空")
+
+    if _seed_api_mode() == "multimodal":
+        vectors = []
+        model = SEED_EMBEDDING_MODEL
+        for text in texts:
+            payload = _request_seed_embedding(
+                "/embeddings/multimodal",
+                {
+                    "model": SEED_EMBEDDING_MODEL,
+                    "input": [{"type": "text", "text": text}],
+                    "encoding_format": "float",
+                },
+            )
+            vectors.append(_extract_multimodal_vector(payload))
+            model = str(payload.get("model") or model)
+        return vectors, model
+
+    payload = _request_seed_embedding(
+        "/embeddings",
+        {
+            "model": SEED_EMBEDDING_MODEL,
+            "input": texts,
+            "encoding_format": "float",
+        },
+    )
     try:
         ordered = sorted(payload["data"], key=lambda item: item["index"])
-        vectors = [item["embedding"] for item in ordered]
+        vectors = [_validate_vector(item["embedding"]) for item in ordered]
     except (KeyError, TypeError) as exc:
         raise EmbeddingRequestError("Seed Embedding 返回了无法识别的响应格式") from exc
-    if len(vectors) != len(texts) or any(not isinstance(vector, list) for vector in vectors):
+    if len(vectors) != len(texts):
         raise EmbeddingRequestError("Seed Embedding 返回的向量数量不正确")
     model = str(payload.get("model") or SEED_EMBEDDING_MODEL)
     return vectors, model

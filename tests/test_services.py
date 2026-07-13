@@ -3,6 +3,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader
 
 from my_agent_project import db
+from my_agent_project import evaluation_service
 from my_agent_project import model_service
 from my_agent_project import rag_service
 
@@ -337,6 +338,58 @@ def test_seed_embedding_request_uses_volcano_ark(monkeypatch):
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer seed-key"
 
 
+def test_seed_embedding_vision_uses_multimodal_api(monkeypatch):
+    responses = iter(
+        [
+            {
+                "model": "doubao-embedding-vision-251215",
+                "data": [{"object": "embedding", "embedding": [[1.0, 0.0]]}],
+            },
+            {
+                "model": "doubao-embedding-vision-251215",
+                "data": [{"object": "embedding", "embedding": [[0.0, 1.0]]}],
+            },
+        ]
+    )
+    captured = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_post(url, **kwargs):
+        captured.append((url, kwargs))
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr(model_service, "SEED_API_KEY", "seed-key")
+    monkeypatch.setattr(
+        model_service,
+        "SEED_EMBEDDING_MODEL",
+        "doubao-embedding-vision-251215",
+    )
+    monkeypatch.setattr(model_service, "SEED_EMBEDDING_API_MODE", "auto")
+    monkeypatch.setattr(model_service.httpx, "post", fake_post)
+
+    vectors, model = model_service.embed_with_seed(["first", "second"])
+
+    assert vectors == [[1.0, 0.0], [0.0, 1.0]]
+    assert model == "doubao-embedding-vision-251215"
+    assert len(captured) == 2
+    assert all(url.endswith("/api/v3/embeddings/multimodal") for url, _ in captured)
+    assert captured[0][1]["json"]["input"] == [
+        {"type": "text", "text": "first"}
+    ]
+    assert captured[1][1]["json"]["input"] == [
+        {"type": "text", "text": "second"}
+    ]
+
+
 def test_hybrid_retrieval_uses_seed_semantics_and_tfidf(tmp_path, monkeypatch):
     database_path = tmp_path / "metadata.db"
     monkeypatch.setattr(db, "DATABASE_PATH", database_path)
@@ -439,3 +492,117 @@ def test_indexed_paper_renders_deepseek_question_form():
     assert 'action="/papers/1/index"' in html
     assert 'action="/papers/1/ask"' in html
     assert "DeepSeek 论文问答" in html
+
+
+def test_evidence_coverage_tolerates_pdf_line_breaks():
+    evidence = "including the three splits adversarial random and popular"
+    candidate = "including the three splits (adver-\n sarial, random and popular)."
+
+    assert evaluation_service.evidence_coverage(evidence, candidate) == 1.0
+
+
+def test_evaluation_metrics_include_hit_and_mrr():
+    metrics = evaluation_service._aggregate_metrics(
+        [
+            {
+                "question_type": "事实型",
+                "hit_rank": 1,
+                "reciprocal_rank": 1.0,
+                "best_coverage": 1.0,
+                "error": None,
+            },
+            {
+                "question_type": "事实型",
+                "hit_rank": 4,
+                "reciprocal_rank": 0.25,
+                "best_coverage": 0.8,
+                "error": None,
+            },
+        ],
+        top_k=5,
+    )
+
+    assert metrics["hit_at_1"] == 0.5
+    assert metrics["hit_at_3"] == 0.5
+    assert metrics["hit_at_5"] == 1.0
+    assert metrics["mrr_at_5"] == 0.625
+    assert metrics["mean_best_coverage"] == 0.9
+
+
+def test_evaluation_records_are_persisted(tmp_path, monkeypatch):
+    database_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    db.init_db()
+    paper_id = db.insert_papers("agent", [parse_arxiv_feed(ARXIV_XML)[0]])[0]
+    case_id = db.upsert_evaluation_case(
+        paper_id,
+        "事实型",
+        "Which dataset is used?",
+        "CIFAR-10",
+        3,
+        "The experiment uses the CIFAR-10 dataset.",
+    )
+    run_id = db.create_evaluation_run(
+        name="baseline",
+        chunk_strategy="length_boundary",
+        chunk_size=1200,
+        chunk_overlap=150,
+        embedding_model="test-embedding",
+        semantic_weight=0.75,
+        keyword_weight=0.25,
+        top_k=5,
+        case_count=1,
+    )
+    db.save_evaluation_result(
+        run_id,
+        case_id,
+        hit_rank=2,
+        reciprocal_rank=0.5,
+        best_coverage=1.0,
+        retrieved=[{"rank": 2, "page_number": 3}],
+    )
+    db.finish_evaluation_run(run_id, "completed", metrics={"hit_at_5": 1.0})
+
+    run = db.get_evaluation_run(run_id)
+    results = db.list_evaluation_results(run_id)
+
+    assert run is not None
+    assert run["metrics"]["hit_at_5"] == 1.0
+    assert results[0]["hit_rank"] == 2
+    assert results[0]["retrieved"][0]["page_number"] == 3
+
+
+def test_evaluation_page_exposes_chart_metrics():
+    template_dir = Path(__file__).parents[1] / "my_agent_project" / "templates"
+    environment = Environment(loader=FileSystemLoader(template_dir))
+    environment.globals["url_for"] = lambda _name, path: path
+    template = environment.get_template("evaluation.html")
+    metrics = {
+        "hit_at_1": 0.6,
+        "hit_at_3": 0.8,
+        "hit_at_5": 1.0,
+        "mrr_at_5": 0.75,
+        "mean_best_coverage": 0.9,
+    }
+    run = {
+        "id": 3,
+        "name": "baseline",
+        "status": "completed",
+        "chunk_strategy": "length_boundary",
+        "chunk_size": 1200,
+        "chunk_overlap": 150,
+        "embedding_model": "test-embedding",
+        "semantic_weight": 0.75,
+        "keyword_weight": 0.25,
+        "error": None,
+        "metrics": metrics,
+        "case_count": 1,
+        "completed_at": "2026-07-13T12:00:00+08:00",
+    }
+
+    html = template.render(cases=[], runs=[run], selected_run=run, results=[])
+
+    assert 'id="top-k-chart"' in html
+    assert 'id="run-history-chart"' in html
+    assert 'data-hit1="0.6"' in html
+    assert 'data-evaluation-run="3"' in html
