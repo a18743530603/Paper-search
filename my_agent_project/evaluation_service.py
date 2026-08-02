@@ -19,41 +19,76 @@ from .db import (
 )
 from .pdf_service import (
     CHUNK_STRATEGY_LENGTH,
+    CHUNK_STRATEGY_PARENT_CHILD,
+    CHUNK_STRATEGY_SEMANTIC,
+    CHUNK_STRATEGY_SEMANTIC_LOCAL,
+    CHUNK_STRATEGY_TABLE_CONTEXT,
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
     SUPPORTED_CHUNK_STRATEGIES,
+    SEMANTIC_BREAKPOINT_PERCENTILE,
+    SEMANTIC_UNIT_SIZE,
+    TABLE_BODY_PREFIX,
+    TABLE_CONTEXT_PREFIX,
+    parent_child_sizes,
     parse_paper_pdf,
 )
 from .rag_service import (
     KEYWORD_WEIGHT,
+    KEYWORD_RETRIEVER_TFIDF,
+    RERANK_CANDIDATE_K,
+    RERANKER_DEEPSEEK_LISTWISE,
+    RERANKER_NONE,
     SEMANTIC_WEIGHT,
+    SUPPORTED_KEYWORD_RETRIEVERS,
+    SUPPORTED_RERANKERS,
     cache_active_chunk_embeddings,
     document_index_is_reusable,
+    embed_semantic_units,
     index_paper_chunks,
+    retrieve_bilingual_rrf_chunks,
     retrieve_relevant_chunks,
+    rerank_candidates_with_deepseek,
 )
 from .schemas import INDEX_INDEXED, PARSE_PARSED
 
 
 BENCHMARK_PATH = BASE_DIR / "benchmarks" / "chunking_baseline.csv"
+ENGLISH_QUERY_PATH = BASE_DIR / "benchmarks" / "retrieval_queries_en.csv"
 BASELINE_STRATEGY = CHUNK_STRATEGY_LENGTH
 DEFAULT_TOP_K = 5
 EVIDENCE_MATCH_THRESHOLD = 0.65
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 SECTION_PREFIX_PATTERN = re.compile(r"^\[Section: (?P<section>.+?)]")
+TABLE_CONTEXT_PATTERN = re.compile(
+    rf"^{re.escape(TABLE_CONTEXT_PREFIX)}\n(?P<context>.+?)\n"
+    rf"{re.escape(TABLE_BODY_PREFIX)}\n",
+    re.DOTALL,
+)
 MIN_CHUNK_SIZE = 300
 MAX_CHUNK_SIZE = 3000
 MAX_TOP_K = 20
+QUERY_MODE_ORIGINAL = "original"
+QUERY_MODE_ENGLISH = "english"
+QUERY_MODE_BILINGUAL_RRF = "bilingual_rrf"
+SUPPORTED_QUERY_MODES = {
+    QUERY_MODE_ORIGINAL,
+    QUERY_MODE_ENGLISH,
+    QUERY_MODE_BILINGUAL_RRF,
+}
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     chunk_strategy: str
+    query_mode: str
+    keyword_retriever: str
     chunk_size: int
     chunk_overlap: int
     top_k: int
     semantic_weight: float
     keyword_weight: float
+    reranker: str = RERANKER_NONE
 
 
 def _normalize_title(value: str) -> str:
@@ -104,6 +139,24 @@ def import_benchmark_cases(path: Path = BENCHMARK_PATH) -> dict:
     return {"paper_count": len(paper_ids), "case_count": imported, "paper_ids": paper_ids}
 
 
+def load_english_queries(path: Path = ENGLISH_QUERY_PATH) -> dict[str, str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"英文检索问题不存在：{path}")
+    queries: dict[str, str] = {}
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        for row_number, row in enumerate(csv.DictReader(file), start=2):
+            question = str(row.get("question") or "").strip()
+            retrieval_query = str(row.get("retrieval_query_en") or "").strip()
+            if not question or not retrieval_query:
+                raise ValueError(f"英文检索问题第 {row_number} 行存在空值")
+            if question in queries:
+                raise ValueError(f"英文检索问题重复：{question}")
+            queries[question] = retrieval_query
+    if not queries:
+        raise ValueError("英文检索问题为空")
+    return queries
+
+
 def prepare_benchmark() -> dict:
     imported = import_benchmark_cases()
     prepared: list[dict] = []
@@ -152,6 +205,9 @@ def validate_experiment_config(
     chunk_overlap: int,
     top_k: int,
     semantic_weight: float,
+    query_mode: str = QUERY_MODE_ORIGINAL,
+    keyword_retriever: str = KEYWORD_RETRIEVER_TFIDF,
+    reranker: str = RERANKER_NONE,
 ) -> ExperimentConfig:
     if chunk_strategy not in SUPPORTED_CHUNK_STRATEGIES:
         raise ValueError(f"不支持的分块策略：{chunk_strategy}")
@@ -165,14 +221,23 @@ def validate_experiment_config(
         raise ValueError(f"top_k 必须在 1 到 {MAX_TOP_K} 之间")
     if not 0 <= semantic_weight <= 1:
         raise ValueError("semantic_weight 必须在 0 到 1 之间")
+    if query_mode not in SUPPORTED_QUERY_MODES:
+        raise ValueError(f"不支持的检索问题语言：{query_mode}")
+    if keyword_retriever not in SUPPORTED_KEYWORD_RETRIEVERS:
+        raise ValueError(f"不支持的关键词检索器：{keyword_retriever}")
+    if reranker not in SUPPORTED_RERANKERS:
+        raise ValueError(f"不支持的重排器：{reranker}")
     semantic_weight = round(semantic_weight, 2)
     return ExperimentConfig(
         chunk_strategy=chunk_strategy,
+        query_mode=query_mode,
+        keyword_retriever=keyword_retriever,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         top_k=top_k,
         semantic_weight=semantic_weight,
         keyword_weight=round(1 - semantic_weight, 2),
+        reranker=reranker,
     )
 
 
@@ -184,6 +249,9 @@ def create_experiment_run(
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     top_k: int = DEFAULT_TOP_K,
     semantic_weight: float = SEMANTIC_WEIGHT,
+    query_mode: str = QUERY_MODE_ORIGINAL,
+    keyword_retriever: str = KEYWORD_RETRIEVER_TFIDF,
+    reranker: str = RERANKER_NONE,
 ) -> tuple[int, ExperimentConfig]:
     config = validate_experiment_config(
         chunk_strategy,
@@ -191,6 +259,9 @@ def create_experiment_run(
         chunk_overlap,
         top_k,
         semantic_weight,
+        query_mode=query_mode,
+        keyword_retriever=keyword_retriever,
+        reranker=reranker,
     )
     cases = list_evaluation_cases()
     if not cases:
@@ -198,6 +269,8 @@ def create_experiment_run(
     run_id = create_evaluation_run(
         name=name.strip()[:80] or "固定边界分块实验",
         chunk_strategy=config.chunk_strategy,
+        query_mode=config.query_mode,
+        keyword_retriever=config.keyword_retriever,
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
         embedding_model=SEED_EMBEDDING_MODEL or "local-tfidf-v1",
@@ -205,6 +278,7 @@ def create_experiment_run(
         keyword_weight=config.keyword_weight,
         top_k=config.top_k,
         case_count=len(cases),
+        reranker=config.reranker,
     )
     return run_id, config
 
@@ -278,6 +352,9 @@ def run_evaluation(
     top_k: int = DEFAULT_TOP_K,
     semantic_weight: float = SEMANTIC_WEIGHT,
     keyword_weight: float = KEYWORD_WEIGHT,
+    query_mode: str = QUERY_MODE_ORIGINAL,
+    keyword_retriever: str = KEYWORD_RETRIEVER_TFIDF,
+    reranker: str = RERANKER_NONE,
     extra_metrics: dict | None = None,
     cache_stats: dict[str, int] | None = None,
     experiment_started_at: float | None = None,
@@ -286,6 +363,21 @@ def run_evaluation(
     cases = list_evaluation_cases()
     results: list[dict] = []
     try:
+        english_queries = (
+            load_english_queries()
+            if query_mode in {QUERY_MODE_ENGLISH, QUERY_MODE_BILINGUAL_RRF}
+            else {}
+        )
+        missing_queries = [
+            case["question"]
+            for case in cases
+            if query_mode in {QUERY_MODE_ENGLISH, QUERY_MODE_BILINGUAL_RRF}
+            and case["question"] not in english_queries
+        ]
+        if missing_queries:
+            raise RuntimeError(
+                f"缺少 {len(missing_queries)} 条固定英文检索问题"
+            )
         for case in cases:
             hit_rank = None
             best_coverage = 0.0
@@ -293,14 +385,51 @@ def run_evaluation(
             error = None
             stored_retrieved: list[dict] = []
             try:
-                retrieved = retrieve_relevant_chunks(
-                    case["paper_id"],
-                    case["question"],
-                    top_k=top_k,
-                    semantic_weight=semantic_weight,
-                    keyword_weight=keyword_weight,
-                    cache_stats=cache_stats,
+                retrieval_top_k = (
+                    max(top_k, RERANK_CANDIDATE_K)
+                    if reranker == RERANKER_DEEPSEEK_LISTWISE
+                    else top_k
                 )
+                retrieval_kwargs = {
+                    "top_k": retrieval_top_k,
+                    "semantic_weight": semantic_weight,
+                    "keyword_weight": keyword_weight,
+                    "keyword_retriever": keyword_retriever,
+                    "cache_stats": cache_stats,
+                }
+                if query_mode == QUERY_MODE_BILINGUAL_RRF:
+                    retrieved = retrieve_bilingual_rrf_chunks(
+                        case["paper_id"],
+                        case["question"],
+                        english_queries[case["question"]],
+                        **retrieval_kwargs,
+                    )
+                else:
+                    retrieval_query = (
+                        english_queries[case["question"]]
+                        if query_mode == QUERY_MODE_ENGLISH
+                        else case["question"]
+                    )
+                    retrieved = retrieve_relevant_chunks(
+                        case["paper_id"],
+                        retrieval_query,
+                        **retrieval_kwargs,
+                    )
+                if reranker == RERANKER_DEEPSEEK_LISTWISE:
+                    rerank_query = (
+                        english_queries[case["question"]]
+                        if query_mode in {
+                            QUERY_MODE_ENGLISH,
+                            QUERY_MODE_BILINGUAL_RRF,
+                        }
+                        else case["question"]
+                    )
+                    retrieved = rerank_candidates_with_deepseek(
+                        rerank_query,
+                        retrieved,
+                        top_k=top_k,
+                        cache_stats=cache_stats,
+                    )
                 for rank, chunk in enumerate(retrieved, start=1):
                     coverage = (
                         evidence_coverage(case["evidence_text"], chunk["content"])
@@ -318,12 +447,19 @@ def run_evaluation(
                             "rank": rank,
                             "page_number": chunk["page_number"],
                             "chunk_index": chunk["chunk_index"],
+                            "child_chunk_index": chunk.get("child_chunk_index"),
                             "score": chunk["score"],
                             "semantic_score": chunk["semantic_score"],
                             "keyword_score": chunk["keyword_score"],
+                            "fusion_ranks": chunk.get("fusion_ranks", {}),
+                            "retrieval_rank": chunk.get("retrieval_rank"),
+                            "rerank_rank": chunk.get("rerank_rank"),
                             "evidence_coverage": round(coverage, 4),
                             "matched": matched,
-                            "content": chunk["content"][:800],
+                            "content": chunk["content"],
+                            "retrieval_content": chunk.get(
+                                "retrieval_content", ""
+                            ),
                         }
                     )
             except Exception as exc:
@@ -373,27 +509,81 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
     cases = list_evaluation_cases()
     paper_ids = sorted({int(case["paper_id"]) for case in cases})
     total_chunks = 0
+    total_parent_chunks = 0
     detected_sections: set[str] = set()
+    detected_tables: set[str] = set()
+    table_context_chunk_count = 0
+    semantic_unit_count = 0
+    semantic_break_count = 0
+    semantic_thresholds: list[float] = []
     cache_stats: dict[str, int] = {}
+    strategy_metrics: dict[str, object] = {}
+    if config.chunk_strategy == CHUNK_STRATEGY_PARENT_CHILD:
+        child_size, child_overlap = parent_child_sizes(
+            config.chunk_size,
+            config.chunk_overlap,
+        )
+        strategy_metrics = {
+            "child_chunk_size": child_size,
+            "child_chunk_overlap": child_overlap,
+        }
+    elif config.chunk_strategy in {
+        CHUNK_STRATEGY_SEMANTIC_LOCAL,
+        CHUNK_STRATEGY_SEMANTIC,
+    }:
+        strategy_metrics = {
+            "semantic_unit_size": SEMANTIC_UNIT_SIZE,
+            "semantic_breakpoint_percentile": SEMANTIC_BREAKPOINT_PERCENTILE,
+            "semantic_threshold_scope": (
+                "paper"
+                if config.chunk_strategy == CHUNK_STRATEGY_SEMANTIC
+                else "segment"
+            ),
+        }
     try:
         for paper_id in paper_ids:
             cache_active_chunk_embeddings(paper_id, cache_stats)
-            parse_paper_pdf(
-                paper_id,
-                strategy=config.chunk_strategy,
-                chunk_size=config.chunk_size,
-                overlap=config.chunk_overlap,
-                cache_stats=cache_stats,
-            )
+            parse_kwargs = {
+                "strategy": config.chunk_strategy,
+                "chunk_size": config.chunk_size,
+                "overlap": config.chunk_overlap,
+                "cache_stats": cache_stats,
+            }
+            if config.chunk_strategy in {
+                CHUNK_STRATEGY_SEMANTIC_LOCAL,
+                CHUNK_STRATEGY_SEMANTIC,
+            }:
+                parse_kwargs["semantic_embedder"] = (
+                    lambda texts: embed_semantic_units(texts, cache_stats)
+                )
+            parse_result = parse_paper_pdf(paper_id, **parse_kwargs)
+            layout_stats = (parse_result or {}).get("layout_stats", {})
+            if isinstance(layout_stats, dict):
+                semantic_unit_count += int(
+                    layout_stats.get("semantic_unit_count", 0)
+                )
+                semantic_break_count += int(
+                    layout_stats.get("semantic_break_count", 0)
+                )
+                threshold = layout_stats.get("semantic_threshold")
+                if isinstance(threshold, (int, float)):
+                    semantic_thresholds.append(float(threshold))
             document = get_document(paper_id)
             if document is None or document["parse_status"] != PARSE_PARSED:
                 error = document["error"] if document else "解析状态不存在"
                 raise RuntimeError(f"论文 {paper_id} 重新分块失败：{error}")
             total_chunks += int(document["chunk_count"] or 0)
+            total_parent_chunks += int(
+                (parse_result or {}).get("parent_chunk_count", 0)
+            )
             for chunk in list_paper_chunks(paper_id, limit=100_000):
                 match = SECTION_PREFIX_PATTERN.match(chunk["content"])
                 if match:
                     detected_sections.add(match.group("section"))
+                table_match = TABLE_CONTEXT_PATTERN.match(chunk["content"])
+                if table_match:
+                    detected_tables.add(table_match.group("context"))
+                    table_context_chunk_count += 1
 
             if document_index_is_reusable(document):
                 cache_stats["index_document_hits"] = (
@@ -408,15 +598,39 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
             if document is None or document["index_status"] != INDEX_INDEXED:
                 error = document["index_error"] if document else "索引状态不存在"
                 raise RuntimeError(f"论文 {paper_id} 重新索引失败：{error}")
+            if not document_index_is_reusable(document):
+                error = document["index_error"] or "索引与当前Embedding配置不一致"
+                raise RuntimeError(
+                    f"论文 {paper_id} 未完成统一的实验索引：{error}"
+                )
 
         run_evaluation(
             run_id,
             top_k=config.top_k,
             semantic_weight=config.semantic_weight,
             keyword_weight=config.keyword_weight,
+            query_mode=config.query_mode,
+            keyword_retriever=config.keyword_retriever,
+            reranker=config.reranker,
             extra_metrics={
                 "total_chunk_count": total_chunks,
+                "parent_chunk_count": total_parent_chunks,
                 "detected_section_count": len(detected_sections),
+                "detected_table_count": len(detected_tables),
+                "table_context_chunk_count": table_context_chunk_count,
+                "semantic_unit_count": semantic_unit_count,
+                "semantic_break_count": semantic_break_count,
+                "mean_semantic_threshold": (
+                    round(sum(semantic_thresholds) / len(semantic_thresholds), 6)
+                    if semantic_thresholds
+                    else None
+                ),
+                "rerank_candidate_k": (
+                    RERANK_CANDIDATE_K
+                    if config.reranker == RERANKER_DEEPSEEK_LISTWISE
+                    else 0
+                ),
+                **strategy_metrics,
                 "preparation_seconds": round(
                     time.perf_counter() - experiment_started_at,
                     3,

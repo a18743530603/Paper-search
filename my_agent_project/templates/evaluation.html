@@ -28,8 +28,35 @@
     <label class="experiment-field">
       <span>分块策略</span>
       <select name="chunk_strategy" data-chunk-strategy>
+        <option value="paper_semantic_breakpoint_global">Seed semantic breakpoint paper_semantic_breakpoint_global</option>
         <option value="length_boundary" selected>固定边界 length_boundary</option>
-        <option value="academic_section">论文章节 academic_section</option>
+        <option value="academic_section">论文章节 + 前缀 academic_section</option>
+        <option value="academic_section_no_prefix">论文章节无前缀 academic_section_no_prefix</option>
+        <option value="paper_section_sentence">论文章节 + 完整句子 paper_section_sentence</option>
+        <option value="paper_parent_child">小块检索 + 父块返回 paper_parent_child</option>
+        <option value="paper_table_context">表题表头上下文 paper_table_context</option>
+      </select>
+    </label>
+    <label class="experiment-field">
+      <span>检索问题语言</span>
+      <select name="query_mode" data-query-mode>
+        <option value="original" selected>原始中文 original</option>
+        <option value="english">固定英文 english</option>
+        <option value="bilingual_rrf">中英文双路 RRF bilingual_rrf</option>
+      </select>
+    </label>
+    <label class="experiment-field">
+      <span>关键词检索器</span>
+      <select name="keyword_retriever" data-keyword-retriever>
+        <option value="tfidf" selected>TF-IDF 基线</option>
+        <option value="bm25">BM25 实验</option>
+      </select>
+    </label>
+    <label class="experiment-field">
+      <span>重排器</span>
+      <select name="reranker" data-reranker>
+        <option value="none" selected>不重排 none</option>
+        <option value="deepseek_listwise">DeepSeek Top-20 列表重排</option>
       </select>
     </label>
     <label class="experiment-field">
@@ -51,7 +78,7 @@
     <label class="experiment-field weight-field">
       <span>Seed 语义权重 <output data-semantic-output>0.75</output></span>
       <input type="range" name="semantic_weight" value="0.75" min="0" max="1" step="0.05" data-semantic-weight>
-      <small>TF-IDF 关键词权重：<output data-keyword-output>0.25</output></small>
+      <small><span data-keyword-name>TF-IDF</span> 关键词权重：<output data-keyword-output>0.25</output></small>
     </label>
     <div class="experiment-submit">
       <button type="submit" {% if not cases %}disabled{% endif %}>运行实验</button>
@@ -70,25 +97,48 @@
   </div>
   <dl class="run-config">
     <dt>分块策略</dt><dd>{{ selected_run["chunk_strategy"] }}</dd>
+    <dt>检索问题语言</dt><dd>{{ selected_run["query_mode"] }}</dd>
+    <dt>关键词检索器</dt><dd>{{ selected_run["keyword_retriever"] }}</dd>
+    <dt>重排器</dt><dd>{{ selected_run["reranker"] }}</dd>
     <dt>块大小 / 重叠</dt><dd>{{ selected_run["chunk_size"] }} / {{ selected_run["chunk_overlap"] }}</dd>
     <dt>Embedding</dt><dd>{{ selected_run["embedding_model"] }}</dd>
     <dt>语义 / 关键词权重</dt><dd>{{ selected_run["semantic_weight"] }} / {{ selected_run["keyword_weight"] }}</dd>
     <dt>Top-K</dt><dd>{{ selected_run["top_k"] }}</dd>
     {% if selected_run["metrics"].get("total_chunk_count") %}
-    <dt>总文本块</dt><dd>{{ selected_run["metrics"]["total_chunk_count"] }}</dd>
+    <dt>索引文本块</dt><dd>{{ selected_run["metrics"]["total_chunk_count"] }}</dd>
+    {% endif %}
+    {% if selected_run["metrics"].get("parent_chunk_count") %}
+    <dt>返回父块</dt><dd>{{ selected_run["metrics"]["parent_chunk_count"] }}</dd>
+    <dt>子块大小 / 重叠</dt><dd>{{ selected_run["metrics"]["child_chunk_size"] }} / {{ selected_run["metrics"]["child_chunk_overlap"] }}</dd>
     {% endif %}
     {% if selected_run["metrics"].get("detected_section_count") %}
     <dt>识别章节路径</dt><dd>{{ selected_run["metrics"]["detected_section_count"] }}</dd>
+    {% endif %}
+    {% if selected_run["metrics"].get("detected_table_count") %}
+    <dt>识别表格 / 上下文块</dt><dd>{{ selected_run["metrics"]["detected_table_count"] }} / {{ selected_run["metrics"]["table_context_chunk_count"] }}</dd>
+    {% endif %}
+    {% if selected_run["metrics"].get("semantic_unit_count") %}
+    <dt>Semantic units / breaks</dt><dd>{{ selected_run["metrics"]["semantic_unit_count"] }} / {{ selected_run["metrics"]["semantic_break_count"] }}</dd>
+    <dt>Unit / percentile / scope</dt><dd>{{ selected_run["metrics"]["semantic_unit_size"] }} / P{{ selected_run["metrics"]["semantic_breakpoint_percentile"] }} / {{ selected_run["metrics"]["semantic_threshold_scope"] }}</dd>
+    {% if selected_run["metrics"].get("mean_semantic_threshold") is not none %}
+    <dt>Mean semantic threshold</dt><dd>{{ "%.4f" | format(selected_run["metrics"]["mean_semantic_threshold"]) }}</dd>
+    {% endif %}
     {% endif %}
     {% if selected_run["metrics"].get("total_duration_seconds") is not none %}
     <dt>总耗时</dt><dd>{{ "%.2f 秒" | format(selected_run["metrics"]["total_duration_seconds"]) }}</dd>
     {% endif %}
     {% set cache = selected_run["metrics"].get("cache_stats", {}) %}
     {% if cache %}
+    {% if cache.get("semantic_unit_embedding_hits", 0) or cache.get("semantic_unit_embedding_misses", 0) %}
+    <dt>Semantic unit vectors</dt><dd>{{ cache.get("semantic_unit_embedding_hits", 0) }} hits / {{ cache.get("semantic_unit_embedding_misses", 0) }} new</dd>
+    {% endif %}
     <dt>PDF 页缓存</dt><dd>{{ cache.get("pdf_page_hits", 0) }} 命中 / {{ cache.get("pdf_page_misses", 0) }} 新增</dd>
     <dt>分块配置缓存</dt><dd>{{ cache.get("chunk_layout_hits", 0) }} 命中 / {{ cache.get("chunk_layout_misses", 0) }} 新增</dd>
     <dt>块向量缓存</dt><dd>{{ cache.get("chunk_embedding_hits", 0) }} 命中 / {{ cache.get("chunk_embedding_misses", 0) }} 新增</dd>
     <dt>问题向量缓存</dt><dd>{{ cache.get("query_embedding_hits", 0) }} 命中 / {{ cache.get("query_embedding_misses", 0) }} 新增</dd>
+    {% if selected_run["reranker"] != "none" %}
+    <dt>重排结果缓存</dt><dd>{{ cache.get("rerank_cache_hits", 0) }} 命中 / {{ cache.get("rerank_cache_misses", 0) }} 新增</dd>
+    {% endif %}
     <dt>论文索引缓存</dt><dd>{{ cache.get("index_document_hits", 0) }} 命中 / {{ cache.get("index_document_misses", 0) }} 重建</dd>
     {% endif %}
   </dl>
@@ -154,6 +204,16 @@
               {% for item in result["retrieved"] %}
                 <div class="retrieved-item {% if item['matched'] %}retrieved-match{% endif %}">
                   <p><strong>#{{ item["rank"] }} / 第 {{ item["page_number"] }} 页</strong>，综合分 {{ item["score"] }}，证据覆盖 {{ "%.1f%%" | format(item["evidence_coverage"] * 100) }}</p>
+                  {% if item.get("fusion_ranks") %}
+                  <p><strong>融合来源：</strong>中文第 {{ item["fusion_ranks"].get("original", "-") }} 名 / 英文第 {{ item["fusion_ranks"].get("english", "-") }} 名</p>
+                  {% endif %}
+                  {% if item.get("rerank_rank") %}
+                  <p><strong>重排变化：</strong>初召回第 {{ item["retrieval_rank"] }} 名 → 重排第 {{ item["rerank_rank"] }} 名</p>
+                  {% endif %}
+                  {% if item.get("retrieval_content") and item["retrieval_content"] != item["content"] %}
+                  <p><strong>命中子块：</strong>{{ item["retrieval_content"] }}</p>
+                  <p><strong>返回父块：</strong></p>
+                  {% endif %}
                   <p>{{ item["content"] }}</p>
                 </div>
               {% endfor %}

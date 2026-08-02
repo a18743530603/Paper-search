@@ -89,7 +89,13 @@
         <form class="question-form" action="/papers/{{ paper['id'] }}/ask" method="post">
           <label for="question">向这篇论文提问</label>
           <textarea id="question" name="question" rows="4" maxlength="1000" placeholder="例如：这篇论文使用了什么数据集？" required></textarea>
-          <button type="submit">提交问题</button>
+          <div class="question-actions">
+            <label class="toggle-control" title="从初召回20条证据中重新选择最相关的5条">
+              <input type="checkbox" name="use_reranker" value="true">
+              <span>DeepSeek 重排</span>
+            </label>
+            <button type="submit">提交问题</button>
+          </div>
         </form>
       {% else %}
         <div class="access-notice">
@@ -105,6 +111,10 @@
             <article class="qa-item">
               <p class="question-text">问题：{{ item["question"] }}</p>
               <p>状态：<span class="status" {% if loop.first %}data-rag-status{% endif %}>{{ item["status"] }}</span></p>
+              <p class="model-meta">
+                检索：{{ "DeepSeek 重排" if item["reranker"] == "deepseek_listwise" else "原始排序" }}
+              </p>
+              {% if item["rerank_error"] %}<p class="alert">重排失败，已使用原始排序：{{ item["rerank_error"] }}</p>{% endif %}
               {% if item["answer"] %}
                 <div class="answer-text">{{ item["answer"] }}</div>
               {% endif %}
@@ -118,6 +128,9 @@
                         第 {{ evidence["page_number"] }} 页，综合分数 {{ "%.3f"|format(evidence["score"]) }}
                         {% if evidence.get("semantic_score") is not none %}
                           （语义 {{ "%.3f"|format(evidence["semantic_score"]) }} / 关键词 {{ "%.3f"|format(evidence["keyword_score"]) }}）
+                        {% endif %}
+                        {% if evidence.get("rerank_rank") %}
+                          · 初召回第 {{ evidence["retrieval_rank"] }} 名 → 重排第 {{ evidence["rerank_rank"] }} 名
                         {% endif %}
                       </strong>
                       <p>{{ evidence["content"] }}</p>

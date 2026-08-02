@@ -1,0 +1,9 @@
+heldout_id,paper_title,domain,source_url,pdf_url,access_note,local_filename,download_status,annotation_status
+H01,OpenVLA: An Open-Source Vision-Language-Action Model,机器人与多模态,https://arxiv.org/abs/2406.09246,https://arxiv.org/pdf/2406.09246,arXiv公开访问,H01_OpenVLA.pdf,downloaded,validated
+H02,A Foundation Model for the Earth System,地球系统与气象,https://arxiv.org/abs/2405.13063,https://arxiv.org/pdf/2405.13063,arXiv公开访问,H02_Aurora_Earth_System.pdf,downloaded,validated
+H03,TimeMixer: Decomposable Multiscale Mixing for Time Series Forecasting,时间序列预测,https://arxiv.org/abs/2405.14616,https://arxiv.org/pdf/2405.14616,arXiv公开访问,H03_TimeMixer.pdf,downloaded,validated
+H04,De novo design of high-affinity protein binders with AlphaProteo,蛋白质设计,https://arxiv.org/abs/2409.08022,https://arxiv.org/pdf/2409.08022,arXiv公开访问,H04_AlphaProteo.pdf,downloaded,validated
+H05,A Sober Look at LLMs for Material Discovery: Are They Actually Good for Bayesian Optimization Over Molecules?,化学与材料发现,https://arxiv.org/abs/2402.05015,https://arxiv.org/pdf/2402.05015,arXiv公开访问,H05_LLM_Material_Discovery.pdf,downloaded,validated
+H06,GMAI-MMBench: A Comprehensive Multimodal Evaluation Benchmark Towards General Medical AI,医疗多模态评测,https://arxiv.org/abs/2408.03361,https://arxiv.org/pdf/2408.03361,arXiv公开访问；替换无法稳定下载的PMC11519755,H06_GMAI_MMBench.pdf,downloaded,validated
+H07,Can Language Models Solve Olympiad Programming?,代码推理与软件工程,https://arxiv.org/abs/2404.10952,https://arxiv.org/pdf/2404.10952,arXiv公开访问,H07_Olympiad_Programming.pdf,downloaded,validated
+H08,Better than classical? The subtle art of benchmarking quantum machine learning models,量子机器学习,https://arxiv.org/abs/2403.07059,https://arxiv.org/pdf/2403.07059,arXiv公开访问,H08_Quantum_ML_Benchmark.pdf,downloaded,validated

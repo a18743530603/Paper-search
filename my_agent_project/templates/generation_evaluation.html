@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}生成评测 - Paper Hunter{% endblock %}
+{% block content %}
+<section class="section-head evaluation-head">
+  <div>
+    <p class="eyebrow">GENERATION EVALUATION</p>
+    <h1>RAG 生成质量</h1>
+    <p class="section-note">Faithfulness / Relevance / Reference / Citation</p>
+  </div>
+</section>
+
+<section class="experiment-config">
+  <div class="experiment-config-title">
+    <p class="eyebrow">EXPERIMENT CONFIG</p>
+    <h2>选择检索运行</h2>
+  </div>
+  <form action="/generation-evaluation/run" method="post" class="experiment-form">
+    <label class="experiment-field experiment-name-field">
+      <span>实验名称</span>
+      <input name="experiment_name" value="RAG 生成质量评测" maxlength="80" required>
+    </label>
+    <label class="experiment-field experiment-name-field">
+      <span>检索运行</span>
+      <select name="retrieval_run_id" required>
+        {% for run in retrieval_runs %}
+        <option value="{{ run['id'] }}">#{{ run["id"] }} {{ run["name"] }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="experiment-submit">
+      <button type="submit" {% if not retrieval_runs %}disabled{% endif %}>运行生成评测</button>
+    </div>
+  </form>
+</section>
+
+{% if selected_run %}
+<section class="evaluation-summary" {% if selected_run["status"] == "running" %}data-evaluation-running{% endif %}>
+  <div class="evaluation-run-title">
+    <div>
+      <p class="eyebrow">GENERATION RUN #{{ selected_run["id"] }}</p>
+      <h2>{{ selected_run["name"] }}</h2>
+    </div>
+    <span class="status status-{{ selected_run['status'] }}">{{ selected_run["status"] }}</span>
+  </div>
+  <dl class="run-config">
+    <dt>检索运行</dt><dd>#{{ selected_run["retrieval_run_id"] }} {{ selected_run["retrieval_run_name"] }}</dd>
+    <dt>生成模型</dt><dd>{{ selected_run["generator_model"] }}</dd>
+    <dt>评审模型</dt><dd>{{ selected_run["judge_model"] }}</dd>
+    <dt>Prompt</dt><dd>{{ selected_run["prompt_version"] }}</dd>
+    {% if selected_run["metrics"].get("total_duration_seconds") is not none %}
+    <dt>总耗时</dt><dd>{{ "%.2f 秒" | format(selected_run["metrics"]["total_duration_seconds"]) }}</dd>
+    {% endif %}
+    {% set cache = selected_run["metrics"].get("cache_stats", {}) %}
+    {% if cache %}
+    <dt>答案缓存</dt><dd>{{ cache.get("generation_cache_hits", 0) }} 命中 / {{ cache.get("generation_cache_misses", 0) }} 新增</dd>
+    <dt>评审缓存</dt><dd>{{ cache.get("judge_cache_hits", 0) }} 命中 / {{ cache.get("judge_cache_misses", 0) }} 新增</dd>
+    {% endif %}
+  </dl>
+  {% if selected_run["error"] %}<p class="alert">{{ selected_run["error"] }}</p>{% endif %}
+  {% if selected_run["metrics"] %}
+  <div class="metric-grid generation-metric-grid">
+    <div class="metric-item"><span>Faithfulness</span><strong>{{ "%.1f%%" | format(selected_run["metrics"].get("faithfulness", 0) * 100) }}</strong></div>
+    <div class="metric-item"><span>Answer relevance</span><strong>{{ "%.1f%%" | format(selected_run["metrics"].get("answer_relevance", 0) * 100) }}</strong></div>
+    <div class="metric-item"><span>Reference correctness</span><strong>{{ "%.1f%%" | format(selected_run["metrics"].get("reference_correctness", 0) * 100) }}</strong></div>
+    <div class="metric-item"><span>Citation correctness</span><strong>{{ "%.1f%%" | format(selected_run["metrics"].get("citation_correctness", 0) * 100) }}</strong></div>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if results %}
+<section class="evaluation-section">
+  <h2>逐题结果</h2>
+  <div class="table-wrap">
+    <table class="evaluation-table generation-table">
+      <thead><tr><th>论文 / 类型</th><th>问题与答案</th><th>Faith.</th><th>Relevant</th><th>Reference</th><th>Citation</th></tr></thead>
+      <tbody>
+      {% for result in results %}
+        <tr>
+          <td><span class="source">{{ result["question_type"] }}</span><small>{{ result["paper_title"] }}</small></td>
+          <td>
+            <strong>{{ result["question"] }}</strong>
+            <details><summary>查看答案与声明</summary>
+              {% if result["error"] %}<p class="alert">{{ result["error"] }}</p>{% endif %}
+              <p>{{ result["answer"] or "-" }}</p>
+              {% for claim in result["judge"].get("claims", []) %}
+              <p><strong>{{ "支持" if claim["supported"] else "不支持" }}</strong>，引用 {{ claim["cited_pages"] }}：{{ claim["text"] }}</p>
+              {% endfor %}
+            </details>
+          </td>
+          <td>{{ "%.1f%%" | format(result["faithfulness"] * 100) }}</td>
+          <td>{{ "%.1f%%" | format(result["answer_relevance"] * 100) }}</td>
+          <td>{{ "%.1f%%" | format(result["reference_correctness"] * 100) }}</td>
+          <td>{{ "%.1f%%" | format(result["citation_correctness"] * 100) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="evaluation-section">
+  <h2>生成评测运行</h2>
+  {% if runs %}
+  <div class="table-wrap">
+    <table class="evaluation-table">
+      <thead><tr><th>运行</th><th>检索来源</th><th>状态</th><th>Faithfulness</th><th>Reference</th><th>完成时间</th></tr></thead>
+      <tbody>
+      {% for run in runs %}
+        <tr>
+          <td><a href="/generation-evaluation/runs/{{ run['id'] }}">#{{ run["id"] }} {{ run["name"] }}</a></td>
+          <td>#{{ run["retrieval_run_id"] }}</td>
+          <td>{{ run["status"] }}</td>
+          <td>{{ "%.1f%%" | format(run["metrics"].get("faithfulness", 0) * 100) if run["metrics"] else "-" }}</td>
+          <td>{{ "%.1f%%" | format(run["metrics"].get("reference_correctness", 0) * 100) if run["metrics"] else "-" }}</td>
+          <td>{{ run["completed_at"] or "-" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">暂无生成评测运行。</p>{% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/evaluation_poll.js') }}" defer></script>
+{% endblock %}

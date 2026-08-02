@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import httpx
@@ -51,6 +52,31 @@ def _extract_answer(payload: dict[str, Any]) -> str:
     return answer.strip()
 
 
+def _request_deepseek(body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        response = httpx.post(
+            f"{DEEPSEEK_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=DEEPSEEK_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip()[:500]
+        raise ModelRequestError(
+            f"DeepSeek 请求失败（HTTP {exc.response.status_code}）：{detail}"
+        ) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ModelRequestError(f"无法连接 DeepSeek：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ModelRequestError("DeepSeek 返回了无法识别的响应格式")
+    return payload
+
+
 def ask_deepseek(system_prompt: str, user_prompt: str) -> tuple[str, str]:
     if not is_deepseek_configured():
         raise ModelConfigurationError(
@@ -71,27 +97,40 @@ def ask_deepseek(system_prompt: str, user_prompt: str) -> tuple[str, str]:
     else:
         body["thinking"] = {"type": "disabled"}
 
-    try:
-        response = httpx.post(
-            f"{DEEPSEEK_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=DEEPSEEK_TIMEOUT,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text.strip()[:500]
-        raise ModelRequestError(
-            f"DeepSeek 请求失败（HTTP {exc.response.status_code}）：{detail}"
-        ) from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise ModelRequestError(f"无法连接 DeepSeek：{exc}") from exc
-
+    payload = _request_deepseek(body)
     return _extract_answer(payload), DEEPSEEK_MODEL
+
+
+def ask_deepseek_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_tokens: int = 1024,
+) -> tuple[dict[str, Any], str]:
+    if not is_deepseek_configured():
+        raise ModelConfigurationError(
+            "尚未配置 DeepSeek。请在项目根目录的 .env 中设置 DEEPSEEK_API_KEY。"
+        )
+    body: dict[str, Any] = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+    }
+    answer = _extract_answer(_request_deepseek(body))
+    try:
+        parsed = json.loads(answer)
+    except json.JSONDecodeError as exc:
+        raise ModelRequestError("DeepSeek 没有返回有效 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ModelRequestError("DeepSeek JSON 顶层必须是对象")
+    return parsed, DEEPSEEK_MODEL
 
 
 def _seed_api_mode() -> str:

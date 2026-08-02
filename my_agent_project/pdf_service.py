@@ -1,8 +1,12 @@
 import hashlib
+import json
+import math
 import re
 from pathlib import Path
+from typing import Callable, Sequence
 
 from .db import (
+    count_paper_parent_chunks,
     get_cached_pdf_pages,
     get_document,
     get_paper,
@@ -10,14 +14,29 @@ from .db import (
     replace_paper_chunks,
     update_parse_status,
 )
-from .schemas import PARSE_FAILED, PARSE_PARSING, PaperChunk
+from .schemas import PARSE_FAILED, PARSE_PARSING, PaperChunk, PaperParentChunk
 
 
 DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 150
 CHUNK_STRATEGY_LENGTH = "length_boundary"
 CHUNK_STRATEGY_ACADEMIC = "academic_section"
-SUPPORTED_CHUNK_STRATEGIES = {CHUNK_STRATEGY_LENGTH, CHUNK_STRATEGY_ACADEMIC}
+CHUNK_STRATEGY_ACADEMIC_NO_PREFIX = "academic_section_no_prefix"
+CHUNK_STRATEGY_PAPER_SENTENCE = "paper_section_sentence"
+CHUNK_STRATEGY_PARENT_CHILD = "paper_parent_child"
+CHUNK_STRATEGY_TABLE_CONTEXT = "paper_table_context"
+CHUNK_STRATEGY_SEMANTIC_LOCAL = "paper_semantic_breakpoint"
+CHUNK_STRATEGY_SEMANTIC = "paper_semantic_breakpoint_global"
+SUPPORTED_CHUNK_STRATEGIES = {
+    CHUNK_STRATEGY_LENGTH,
+    CHUNK_STRATEGY_ACADEMIC,
+    CHUNK_STRATEGY_ACADEMIC_NO_PREFIX,
+    CHUNK_STRATEGY_PAPER_SENTENCE,
+    CHUNK_STRATEGY_PARENT_CHILD,
+    CHUNK_STRATEGY_TABLE_CONTEXT,
+    CHUNK_STRATEGY_SEMANTIC_LOCAL,
+    CHUNK_STRATEGY_SEMANTIC,
+}
 
 NUMBERED_HEADING_PATTERN = re.compile(
     r"^(?P<number>[0-9]+(?:\.[0-9]+)*)(?P<marker>[.)])?\s+"
@@ -73,6 +92,38 @@ EXCLUDED_SECTION_TITLES = {
     "references",
     "bibliography",
 }
+SENTENCE_BOUNDARY_PATTERN = re.compile(
+    r"(?<=[.!?])\s+(?=(?:[\"'(\[])?[A-Z0-9])"
+)
+SENTENCE_ABBREVIATIONS = (
+    "e.g.",
+    "i.e.",
+    "et al.",
+    "Fig.",
+    "Figs.",
+    "Eq.",
+    "Eqs.",
+    "Sec.",
+    "Dr.",
+    "Mr.",
+    "Mrs.",
+    "vs.",
+)
+PROTECTED_PERIOD = "\u0001"
+TABLE_CONTEXT_PREFIX = "[Table Context]"
+TABLE_BODY_PREFIX = "[Table Body]"
+TABLE_CAPTION_PATTERN = re.compile(
+    r"^(?:table|tab\.)\s*(?:[ivxlcdm]+|\d+)\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+TABLE_REFERENCE_VERB_PATTERN = re.compile(
+    r"^[\s.:]*(?:gives?|shows?|presents?|reveals?|reports?|summari[sz]es?|"
+    r"provides?|illustrates?|contains?|compares?|lists?|given)\b",
+    re.IGNORECASE,
+)
+SEMANTIC_UNIT_SIZE = 300
+SEMANTIC_BREAKPOINT_PERCENTILE = 25
+SemanticEmbedder = Callable[[list[str]], list[list[float]]]
 
 
 def _increment_cache_stat(
@@ -240,13 +291,11 @@ def _section_name(heading: str) -> str:
     return without_number.strip().lower()
 
 
-def split_academic_page_text(
+def _academic_page_segments(
     text: str,
     *,
     current_sections: list[str] | None = None,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
-    overlap: int = DEFAULT_CHUNK_OVERLAP,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[tuple[list[str], str]], list[str]]:
     sections = list(current_sections or [])
     normalized = normalize_pdf_text(text)
     if not normalized:
@@ -280,6 +329,20 @@ def split_academic_page_text(
         else:
             sections = _update_section_path(sections, level, title)
     flush()
+    return segments, sections
+
+
+def split_academic_page_text(
+    text: str,
+    *,
+    current_sections: list[str] | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> tuple[list[str], list[str]]:
+    segments, sections = _academic_page_segments(
+        text,
+        current_sections=current_sections,
+    )
 
     chunks: list[str] = []
     for section_path, body in segments:
@@ -298,6 +361,438 @@ def split_academic_page_text(
     return chunks, sections
 
 
+def split_sentence_aligned_text(
+    text: str,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[str]:
+    normalized = re.sub(r"\s+", " ", normalize_pdf_text(text)).strip()
+    if not normalized:
+        return []
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("chunk_size must be positive and overlap smaller than chunk_size")
+
+    protected = normalized
+    for abbreviation in SENTENCE_ABBREVIATIONS:
+        protected_abbreviation = abbreviation.replace(".", PROTECTED_PERIOD)
+        protected = re.sub(
+            re.escape(abbreviation),
+            protected_abbreviation,
+            protected,
+            flags=re.IGNORECASE,
+        )
+    sentences: list[str] = []
+    for sentence in SENTENCE_BOUNDARY_PATTERN.split(protected):
+        restored = re.sub(
+            r"\s+",
+            " ",
+            sentence.replace(PROTECTED_PERIOD, "."),
+        ).strip()
+        if not restored:
+            continue
+        if len(restored) > chunk_size:
+            sentences.extend(
+                split_page_text(
+                    restored,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                )
+            )
+        else:
+            sentences.append(restored)
+    if not sentences:
+        return []
+
+    chunks: list[str] = []
+    current: list[str] = []
+
+    def joined_length(items: list[str]) -> int:
+        return len(" ".join(items))
+
+    def overlap_tail(items: list[str]) -> list[str]:
+        selected: list[str] = []
+        for sentence in reversed(items):
+            selected.insert(0, sentence)
+            if joined_length(selected) >= overlap:
+                break
+        return selected
+
+    for sentence in sentences:
+        if current and joined_length([*current, sentence]) > chunk_size:
+            chunks.append(" ".join(current))
+            current = overlap_tail(current) if overlap else []
+            while current and joined_length([*current, sentence]) > chunk_size:
+                current.pop(0)
+        current.append(sentence)
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def is_table_caption(line: str) -> bool:
+    candidate = re.sub(r"\s+", " ", line).strip()
+    match = TABLE_CAPTION_PATTERN.match(candidate)
+    if match is None:
+        return False
+    return TABLE_REFERENCE_VERB_PATTERN.match(match.group("rest")) is None
+
+
+def extract_table_contexts(
+    text: str,
+    *,
+    max_context_chars: int = 420,
+    max_following_lines: int = 4,
+) -> list[tuple[str, str]]:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    contexts: list[tuple[str, str]] = []
+    for index, line in enumerate(lines):
+        if not is_table_caption(line):
+            continue
+        context_lines = [line]
+        for following in lines[index + 1 : index + 1 + max_following_lines]:
+            if not following:
+                continue
+            if (
+                is_table_caption(following)
+                or detect_section_heading(following) is not None
+                or following.lower().startswith(("figure ", "fig. ", "algorithm "))
+            ):
+                break
+            candidate = "\n".join([*context_lines, following])
+            if len(candidate) > max_context_chars:
+                break
+            context_lines.append(following)
+        contexts.append((line, "\n".join(context_lines)))
+    return contexts
+
+
+def split_table_context_page_text(
+    text: str,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[str]:
+    normalized = normalize_pdf_text(text)
+    chunks = split_page_text(
+        normalized,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
+    contexts = extract_table_contexts(normalized)
+    if not contexts:
+        return chunks
+
+    contextualized: list[str] = []
+    active_context: str | None = None
+    for chunk in chunks:
+        matches = [
+            (chunk.rfind(anchor), context)
+            for anchor, context in contexts
+            if anchor in chunk
+        ]
+        if matches:
+            _, active_context = max(matches, key=lambda item: item[0])
+        if active_context is None:
+            contextualized.append(chunk)
+        else:
+            contextualized.append(
+                f"{TABLE_CONTEXT_PREFIX}\n{active_context}\n"
+                f"{TABLE_BODY_PREFIX}\n{chunk}"
+            )
+    return contextualized
+
+
+def split_academic_sentence_page_text(
+    text: str,
+    *,
+    current_sections: list[str] | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> tuple[list[str], list[str]]:
+    segments, sections = _academic_page_segments(
+        text,
+        current_sections=current_sections,
+    )
+    chunks: list[str] = []
+    for section_path, body in segments:
+        if section_path and _section_name(section_path[-1]) in EXCLUDED_SECTION_TITLES:
+            continue
+        section_label = " > ".join(section_path) if section_path else "Front Matter"
+        prefix = f"[Section: {section_label}]"
+        body_size = max(120, chunk_size - len(prefix) - 1)
+        body_overlap = min(overlap, body_size - 1)
+        for body_chunk in split_sentence_aligned_text(
+            body,
+            chunk_size=body_size,
+            overlap=body_overlap,
+        ):
+            chunks.append(f"{prefix}\n{body_chunk}")
+    return chunks, sections
+
+
+def _vector_cosine_similarity(
+    left: Sequence[float],
+    right: Sequence[float],
+) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def semantic_breakpoint_threshold(
+    similarities: Sequence[float],
+    *,
+    percentile: int = SEMANTIC_BREAKPOINT_PERCENTILE,
+) -> float | None:
+    if not similarities:
+        return None
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be between 0 and 100")
+    ordered = sorted(similarities)
+    position = (len(ordered) - 1) * percentile / 100
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def merge_semantic_units(
+    units: Sequence[str],
+    vectors: Sequence[Sequence[float]],
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    percentile: int = SEMANTIC_BREAKPOINT_PERCENTILE,
+    threshold_override: float | None = None,
+) -> tuple[list[str], int]:
+    if len(units) != len(vectors):
+        raise ValueError("semantic unit and vector counts must match")
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("chunk_size must be positive and overlap smaller than chunk_size")
+    if not units:
+        return [], 0
+
+    similarities = [
+        _vector_cosine_similarity(vectors[index - 1], vectors[index])
+        for index in range(1, len(vectors))
+    ]
+    threshold = (
+        threshold_override
+        if threshold_override is not None
+        else semantic_breakpoint_threshold(
+            similarities,
+            percentile=percentile,
+        )
+    )
+    minimum_body_size = min(chunk_size, max(300, chunk_size // 3))
+    chunks: list[str] = []
+    current: list[str] = []
+    semantic_break_count = 0
+
+    def joined_length(items: Sequence[str]) -> int:
+        return len(" ".join(items))
+
+    def overlap_tail(items: Sequence[str]) -> list[str]:
+        selected: list[str] = []
+        for unit in reversed(items):
+            selected.insert(0, unit)
+            if joined_length(selected) >= overlap:
+                break
+        return selected
+
+    for index, unit in enumerate(units):
+        semantic_break = (
+            bool(current)
+            and threshold is not None
+            and similarities[index - 1] <= threshold
+            and joined_length(current) >= minimum_body_size
+        )
+        forced_break = bool(current) and joined_length([*current, unit]) > chunk_size
+        if semantic_break or forced_break:
+            chunks.append(" ".join(current))
+            if semantic_break:
+                semantic_break_count += 1
+            current = overlap_tail(current) if overlap else []
+            while current and joined_length([*current, unit]) > chunk_size:
+                current.pop(0)
+        current.append(unit)
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks, semantic_break_count
+
+
+def collect_semantic_segments(
+    pages: Sequence[str],
+) -> list[tuple[int, list[str], list[str]]]:
+    segments: list[tuple[int, list[str], list[str]]] = []
+    current_sections: list[str] = []
+    for page_number, page_text in enumerate(pages, start=1):
+        page_segments, current_sections = _academic_page_segments(
+            page_text,
+            current_sections=current_sections,
+        )
+        for section_path, body in page_segments:
+            if (
+                section_path
+                and _section_name(section_path[-1]) in EXCLUDED_SECTION_TITLES
+            ):
+                continue
+            units = split_sentence_aligned_text(
+                body,
+                chunk_size=SEMANTIC_UNIT_SIZE,
+                overlap=0,
+            )
+            if units:
+                segments.append((page_number, section_path, units))
+    return segments
+
+
+def build_semantic_pdf_chunks(
+    pages: Sequence[str],
+    *,
+    semantic_embedder: SemanticEmbedder,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    layout_stats: dict[str, object] | None = None,
+    threshold_scope: str = "paper",
+) -> list[PaperChunk]:
+    if threshold_scope not in {"paper", "segment"}:
+        raise ValueError("threshold_scope must be paper or segment")
+    segments = collect_semantic_segments(pages)
+    index_texts: list[str] = []
+    for _page_number, section_path, units in segments:
+        section_label = " > ".join(section_path) if section_path else "Front Matter"
+        prefix = f"[Section: {section_label}]"
+        index_texts.extend(f"{prefix}\n{unit}" for unit in units)
+
+    vectors = semantic_embedder(index_texts)
+    if len(vectors) != len(index_texts):
+        raise RuntimeError("semantic embedder returned an unexpected vector count")
+
+    global_similarities: list[float] = []
+    vector_offset = 0
+    for _page_number, _section_path, units in segments:
+        segment_vectors = vectors[vector_offset : vector_offset + len(units)]
+        vector_offset += len(units)
+        global_similarities.extend(
+            _vector_cosine_similarity(
+                segment_vectors[index - 1],
+                segment_vectors[index],
+            )
+            for index in range(1, len(segment_vectors))
+        )
+    global_threshold = (
+        semantic_breakpoint_threshold(
+            global_similarities,
+            percentile=SEMANTIC_BREAKPOINT_PERCENTILE,
+        )
+        if threshold_scope == "paper"
+        else None
+    )
+
+    chunks: list[PaperChunk] = []
+    chunk_index = 0
+    vector_offset = 0
+    semantic_break_count = 0
+    for page_number, section_path, units in segments:
+        segment_vectors = vectors[vector_offset : vector_offset + len(units)]
+        vector_offset += len(units)
+        body_chunks, break_count = merge_semantic_units(
+            units,
+            segment_vectors,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            threshold_override=global_threshold,
+        )
+        semantic_break_count += break_count
+        section_label = " > ".join(section_path) if section_path else "Front Matter"
+        prefix = f"[Section: {section_label}]"
+        for body_chunk in body_chunks:
+            chunks.append(
+                PaperChunk(
+                    page_number=page_number,
+                    chunk_index=chunk_index,
+                    content=f"{prefix}\n{body_chunk}",
+                )
+            )
+            chunk_index += 1
+
+    if layout_stats is not None:
+        layout_stats.update(
+            {
+                "semantic_unit_count": len(index_texts),
+                "semantic_break_count": semantic_break_count,
+                "semantic_threshold_scope": threshold_scope,
+                "semantic_threshold": (
+                    round(global_threshold, 6)
+                    if global_threshold is not None
+                    else None
+                ),
+            }
+        )
+    return chunks
+
+
+def parent_child_sizes(parent_size: int, parent_overlap: int) -> tuple[int, int]:
+    child_size = max(240, parent_size // 2)
+    child_overlap = min(max(0, parent_overlap // 2), child_size - 1)
+    return child_size, child_overlap
+
+
+def build_parent_child_chunks(
+    pages: list[str],
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> tuple[list[PaperChunk], list[PaperParentChunk]]:
+    child_size, child_overlap = parent_child_sizes(chunk_size, overlap)
+    children: list[PaperChunk] = []
+    parents: list[PaperParentChunk] = []
+    child_index = 0
+    parent_index = 0
+
+    for page_number, page_text in enumerate(pages, start=1):
+        parent_contents = split_page_text(
+            page_text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+        for parent_content in parent_contents:
+            parents.append(
+                PaperParentChunk(
+                    page_number=page_number,
+                    parent_index=parent_index,
+                    content=parent_content,
+                )
+            )
+            for child_content in split_sentence_aligned_text(
+                parent_content,
+                chunk_size=child_size,
+                overlap=child_overlap,
+            ):
+                children.append(
+                    PaperChunk(
+                        page_number=page_number,
+                        chunk_index=child_index,
+                        content=child_content,
+                        parent_index=parent_index,
+                    )
+                )
+                child_index += 1
+            parent_index += 1
+    return children, parents
+
+
 def extract_pdf_pages(path: Path) -> list[str]:
     try:
         from pypdf import PdfReader
@@ -308,24 +803,70 @@ def extract_pdf_pages(path: Path) -> list[str]:
     return [page.extract_text() or "" for page in reader.pages]
 
 
-def build_pdf_chunks(
+def build_pdf_chunk_layout(
     pages: list[str],
     *,
     strategy: str = CHUNK_STRATEGY_LENGTH,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_CHUNK_OVERLAP,
-) -> list[PaperChunk]:
+    semantic_embedder: SemanticEmbedder | None = None,
+    layout_stats: dict[str, object] | None = None,
+) -> tuple[list[PaperChunk], list[PaperParentChunk]]:
     if strategy not in SUPPORTED_CHUNK_STRATEGIES:
         raise ValueError(f"unsupported chunk strategy: {strategy}")
+
+    if strategy == CHUNK_STRATEGY_PARENT_CHILD:
+        return build_parent_child_chunks(
+            pages,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+    if strategy in {
+        CHUNK_STRATEGY_SEMANTIC_LOCAL,
+        CHUNK_STRATEGY_SEMANTIC,
+    }:
+        if semantic_embedder is None:
+            raise ValueError("semantic_embedder is required for semantic chunking")
+        return (
+            build_semantic_pdf_chunks(
+                pages,
+                semantic_embedder=semantic_embedder,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                layout_stats=layout_stats,
+                threshold_scope=(
+                    "paper"
+                    if strategy == CHUNK_STRATEGY_SEMANTIC
+                    else "segment"
+                ),
+            ),
+            [],
+        )
 
     chunks: list[PaperChunk] = []
     chunk_index = 0
     current_sections: list[str] = []
     for page_number, page_text in enumerate(pages, start=1):
-        if strategy == CHUNK_STRATEGY_ACADEMIC:
+        if strategy in {
+            CHUNK_STRATEGY_ACADEMIC,
+            CHUNK_STRATEGY_ACADEMIC_NO_PREFIX,
+        }:
             page_chunks, current_sections = split_academic_page_text(
                 page_text,
                 current_sections=current_sections,
+                chunk_size=chunk_size,
+                overlap=overlap,
+            )
+        elif strategy == CHUNK_STRATEGY_PAPER_SENTENCE:
+            page_chunks, current_sections = split_academic_sentence_page_text(
+                page_text,
+                current_sections=current_sections,
+                chunk_size=chunk_size,
+                overlap=overlap,
+            )
+        elif strategy == CHUNK_STRATEGY_TABLE_CONTEXT:
+            page_chunks = split_table_context_page_text(
+                page_text,
                 chunk_size=chunk_size,
                 overlap=overlap,
             )
@@ -344,6 +885,24 @@ def build_pdf_chunks(
                 )
             )
             chunk_index += 1
+    return chunks, []
+
+
+def build_pdf_chunks(
+    pages: list[str],
+    *,
+    strategy: str = CHUNK_STRATEGY_LENGTH,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    semantic_embedder: SemanticEmbedder | None = None,
+) -> list[PaperChunk]:
+    chunks, _parents = build_pdf_chunk_layout(
+        pages,
+        strategy=strategy,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        semantic_embedder=semantic_embedder,
+    )
     return chunks
 
 
@@ -353,6 +912,7 @@ def extract_pdf_chunks(
     strategy: str = CHUNK_STRATEGY_LENGTH,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_CHUNK_OVERLAP,
+    semantic_embedder: SemanticEmbedder | None = None,
 ) -> tuple[int, list[PaperChunk]]:
     pages = extract_pdf_pages(path)
     chunks = build_pdf_chunks(
@@ -360,6 +920,7 @@ def extract_pdf_chunks(
         strategy=strategy,
         chunk_size=chunk_size,
         overlap=overlap,
+        semantic_embedder=semantic_embedder,
     )
     return len(pages), chunks
 
@@ -371,7 +932,8 @@ def parse_paper_pdf(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_CHUNK_OVERLAP,
     cache_stats: dict[str, int] | None = None,
-) -> dict[str, int | str | bool]:
+    semantic_embedder: SemanticEmbedder | None = None,
+) -> dict[str, object]:
     paper = get_paper(paper_id)
     if paper is None:
         return {"chunks_reused": False}
@@ -394,7 +956,16 @@ def parse_paper_pdf(
             and document["chunk_size"] == chunk_size
             and document["chunk_overlap"] == overlap
             and int(document["chunk_count"] or 0) > 0
+            and (
+                strategy != CHUNK_STRATEGY_PARENT_CHILD
+                or count_paper_parent_chunks(paper_id) > 0
+            )
         ):
+            parent_chunk_count = count_paper_parent_chunks(paper_id)
+            try:
+                layout_stats = json.loads(document["layout_stats_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                layout_stats = {}
             _increment_cache_stat(
                 cache_stats,
                 "chunk_layout_hits",
@@ -405,6 +976,8 @@ def parse_paper_pdf(
                 "source_hash": source_hash,
                 "page_count": int(document["page_count"]),
                 "chunk_count": int(document["chunk_count"]),
+                "parent_chunk_count": parent_chunk_count,
+                "layout_stats": layout_stats,
             }
 
         update_parse_status(paper_id, PARSE_PARSING)
@@ -420,11 +993,14 @@ def parse_paper_pdf(
             _increment_cache_stat(cache_stats, "pdf_document_misses")
             _increment_cache_stat(cache_stats, "pdf_page_misses", len(pages))
 
-        chunks = build_pdf_chunks(
+        layout_stats: dict[str, object] = {}
+        chunks, parent_chunks = build_pdf_chunk_layout(
             pages,
             strategy=strategy,
             chunk_size=chunk_size,
             overlap=overlap,
+            semantic_embedder=semantic_embedder,
+            layout_stats=layout_stats,
         )
         if not chunks:
             raise RuntimeError("PDF 未提取到可用文本，文件可能是扫描版")
@@ -432,10 +1008,12 @@ def parse_paper_pdf(
             paper_id,
             chunks,
             page_count=len(pages),
+            parent_chunks=parent_chunks,
             source_hash=source_hash,
             chunk_strategy=strategy,
             chunk_size=chunk_size,
             chunk_overlap=overlap,
+            layout_stats=layout_stats,
         )
         _increment_cache_stat(cache_stats, "chunk_layout_misses", len(chunks))
         return {
@@ -443,6 +1021,8 @@ def parse_paper_pdf(
             "source_hash": source_hash,
             "page_count": len(pages),
             "chunk_count": len(chunks),
+            "parent_chunk_count": len(parent_chunks),
+            "layout_stats": layout_stats,
         }
     except Exception as exc:
         update_parse_status(paper_id, PARSE_FAILED, error=str(exc)[:500])

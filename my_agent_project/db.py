@@ -12,6 +12,7 @@ from .schemas import (
     RAG_ANSWERING,
     PaperCandidate,
     PaperChunk,
+    PaperParentChunk,
 )
 
 
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS paper_documents (
     chunk_strategy TEXT,
     chunk_size INTEGER,
     chunk_overlap INTEGER,
+    layout_stats_json TEXT,
     index_status TEXT NOT NULL DEFAULT 'not_indexed',
     index_error TEXT,
     vectorizer TEXT,
@@ -59,16 +61,32 @@ CREATE TABLE IF NOT EXISTS paper_documents (
     FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS paper_parent_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL,
+    page_number INTEGER NOT NULL,
+    parent_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
+    UNIQUE (paper_id, parent_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_parent_chunks_paper_id
+ON paper_parent_chunks(paper_id);
+
 CREATE TABLE IF NOT EXISTS paper_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     paper_id INTEGER NOT NULL,
     page_number INTEGER NOT NULL,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
+    parent_chunk_id INTEGER,
     vector_json TEXT,
     dense_vector_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_chunk_id) REFERENCES paper_parent_chunks(id) ON DELETE CASCADE,
     UNIQUE (paper_id, chunk_index)
 );
 
@@ -91,10 +109,21 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     PRIMARY KEY (cache_namespace, content_hash)
 );
 
+CREATE TABLE IF NOT EXISTS llm_response_cache (
+    cache_namespace TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (cache_namespace, input_hash)
+);
+
 CREATE TABLE IF NOT EXISTS rag_queries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     paper_id INTEGER NOT NULL,
     question TEXT NOT NULL,
+    reranker TEXT NOT NULL DEFAULT 'none',
+    rerank_error TEXT,
     answer TEXT,
     evidence_json TEXT,
     model TEXT,
@@ -130,6 +159,9 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     name TEXT NOT NULL,
     status TEXT NOT NULL,
     chunk_strategy TEXT NOT NULL,
+    query_mode TEXT NOT NULL DEFAULT 'original',
+    keyword_retriever TEXT NOT NULL DEFAULT 'tfidf',
+    reranker TEXT NOT NULL DEFAULT 'none',
     chunk_size INTEGER NOT NULL,
     chunk_overlap INTEGER NOT NULL,
     embedding_model TEXT NOT NULL,
@@ -160,6 +192,45 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
 
 CREATE INDEX IF NOT EXISTS idx_evaluation_results_run_id
 ON evaluation_results(run_id, case_id);
+
+CREATE TABLE IF NOT EXISTS generation_evaluation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    retrieval_run_id INTEGER NOT NULL,
+    generator_model TEXT NOT NULL,
+    judge_model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    case_count INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY (retrieval_run_id) REFERENCES evaluation_runs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS generation_evaluation_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    case_id INTEGER NOT NULL,
+    answer TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    faithfulness REAL NOT NULL DEFAULT 0,
+    answer_relevance REAL NOT NULL DEFAULT 0,
+    reference_correctness REAL NOT NULL DEFAULT 0,
+    citation_correctness REAL NOT NULL DEFAULT 0,
+    judge_json TEXT NOT NULL DEFAULT '{}',
+    generation_seconds REAL NOT NULL DEFAULT 0,
+    judge_seconds REAL NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES generation_evaluation_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (case_id) REFERENCES evaluation_cases(id) ON DELETE CASCADE,
+    UNIQUE (run_id, case_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_evaluation_results_run_id
+ON generation_evaluation_results(run_id, case_id);
 """
 
 
@@ -191,6 +262,7 @@ def init_db() -> None:
             ("chunk_strategy", "TEXT"),
             ("chunk_size", "INTEGER"),
             ("chunk_overlap", "INTEGER"),
+            ("layout_stats_json", "TEXT"),
             ("index_status", "TEXT NOT NULL DEFAULT 'not_indexed'"),
             ("index_error", "TEXT"),
             ("vectorizer", "TEXT"),
@@ -209,6 +281,38 @@ def init_db() -> None:
             conn.execute("ALTER TABLE paper_chunks ADD COLUMN vector_json TEXT")
         if "dense_vector_json" not in chunk_columns:
             conn.execute("ALTER TABLE paper_chunks ADD COLUMN dense_vector_json TEXT")
+        if "parent_chunk_id" not in chunk_columns:
+            conn.execute("ALTER TABLE paper_chunks ADD COLUMN parent_chunk_id INTEGER")
+        evaluation_run_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(evaluation_runs)").fetchall()
+        }
+        if "query_mode" not in evaluation_run_columns:
+            conn.execute(
+                "ALTER TABLE evaluation_runs "
+                "ADD COLUMN query_mode TEXT NOT NULL DEFAULT 'original'"
+            )
+        if "keyword_retriever" not in evaluation_run_columns:
+            conn.execute(
+                "ALTER TABLE evaluation_runs "
+                "ADD COLUMN keyword_retriever TEXT NOT NULL DEFAULT 'tfidf'"
+            )
+        if "reranker" not in evaluation_run_columns:
+            conn.execute(
+                "ALTER TABLE evaluation_runs "
+                "ADD COLUMN reranker TEXT NOT NULL DEFAULT 'none'"
+            )
+        rag_query_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(rag_queries)").fetchall()
+        }
+        if "reranker" not in rag_query_columns:
+            conn.execute(
+                "ALTER TABLE rag_queries "
+                "ADD COLUMN reranker TEXT NOT NULL DEFAULT 'none'"
+            )
+        if "rerank_error" not in rag_query_columns:
+            conn.execute("ALTER TABLE rag_queries ADD COLUMN rerank_error TEXT")
         conn.execute(
             """
             UPDATE papers
@@ -396,13 +500,28 @@ def list_indexed_chunks(paper_id: int) -> list[sqlite3.Row]:
         return list(
             conn.execute(
                 """
-                SELECT * FROM paper_chunks
-                WHERE paper_id = ? AND vector_json IS NOT NULL
-                ORDER BY chunk_index
+                SELECT
+                    c.*,
+                    p.page_number AS parent_page_number,
+                    p.parent_index,
+                    p.content AS parent_content
+                FROM paper_chunks AS c
+                LEFT JOIN paper_parent_chunks AS p ON p.id = c.parent_chunk_id
+                WHERE c.paper_id = ? AND c.vector_json IS NOT NULL
+                ORDER BY c.chunk_index
                 """,
                 (paper_id,),
             )
         )
+
+
+def count_paper_parent_chunks(paper_id: int) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM paper_parent_chunks WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+    return int(row[0])
 
 
 def get_cached_pdf_pages(source_hash: str) -> list[str]:
@@ -487,6 +606,51 @@ def upsert_cached_embeddings(
     return len(vectors)
 
 
+def get_cached_llm_response(
+    cache_namespace: str,
+    input_hash: str,
+) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT response_json FROM llm_response_cache
+            WHERE cache_namespace = ? AND input_hash = ?
+            """,
+            (cache_namespace, input_hash),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        response = json.loads(row["response_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return response if isinstance(response, dict) else None
+
+
+def upsert_cached_llm_response(
+    cache_namespace: str,
+    input_hash: str,
+    response: dict,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO llm_response_cache (
+                cache_namespace, input_hash, response_json
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_namespace, input_hash) DO UPDATE SET
+                response_json = excluded.response_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                cache_namespace,
+                input_hash,
+                json.dumps(response, ensure_ascii=False),
+            ),
+        )
+
+
 def update_parse_status(
     paper_id: int,
     status: str,
@@ -518,21 +682,64 @@ def replace_paper_chunks(
     chunks: Iterable[PaperChunk],
     *,
     page_count: int,
+    parent_chunks: Iterable[PaperParentChunk] = (),
     source_hash: Optional[str] = None,
     chunk_strategy: Optional[str] = None,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
+    layout_stats: Optional[dict] = None,
 ) -> int:
     chunk_list = list(chunks)
+    parent_list = list(parent_chunks)
     with connect() as conn:
         conn.execute("DELETE FROM paper_chunks WHERE paper_id = ?", (paper_id,))
+        conn.execute("DELETE FROM paper_parent_chunks WHERE paper_id = ?", (paper_id,))
         conn.executemany(
             """
-            INSERT INTO paper_chunks (paper_id, page_number, chunk_index, content)
+            INSERT INTO paper_parent_chunks (
+                paper_id, page_number, parent_index, content
+            )
             VALUES (?, ?, ?, ?)
             """,
             [
-                (paper_id, chunk.page_number, chunk.chunk_index, chunk.content)
+                (paper_id, parent.page_number, parent.parent_index, parent.content)
+                for parent in parent_list
+            ],
+        )
+        parent_ids = {
+            int(row["parent_index"]): int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT id, parent_index FROM paper_parent_chunks
+                WHERE paper_id = ?
+                """,
+                (paper_id,),
+            )
+        }
+        missing_parent_indexes = {
+            chunk.parent_index
+            for chunk in chunk_list
+            if chunk.parent_index is not None and chunk.parent_index not in parent_ids
+        }
+        if missing_parent_indexes:
+            raise ValueError(
+                f"missing parent chunks: {sorted(missing_parent_indexes)}"
+            )
+        conn.executemany(
+            """
+            INSERT INTO paper_chunks (
+                paper_id, page_number, chunk_index, content, parent_chunk_id
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    paper_id,
+                    chunk.page_number,
+                    chunk.chunk_index,
+                    chunk.content,
+                    parent_ids.get(chunk.parent_index),
+                )
                 for chunk in chunk_list
             ],
         )
@@ -541,11 +748,13 @@ def replace_paper_chunks(
             INSERT INTO paper_documents (
                 paper_id, parse_status, page_count, chunk_count, error,
                 source_hash, chunk_strategy, chunk_size, chunk_overlap,
+                layout_stats_json,
                 index_status, index_error, vectorizer, embedding_namespace,
                 indexed_at
             )
             VALUES (
                 ?, 'parsed', ?, ?, NULL, ?, ?, ?, ?,
+                ?,
                 'not_indexed', NULL, NULL, NULL, NULL
             )
             ON CONFLICT(paper_id) DO UPDATE SET
@@ -557,6 +766,7 @@ def replace_paper_chunks(
                 chunk_strategy = excluded.chunk_strategy,
                 chunk_size = excluded.chunk_size,
                 chunk_overlap = excluded.chunk_overlap,
+                layout_stats_json = excluded.layout_stats_json,
                 index_status = 'not_indexed',
                 index_error = NULL,
                 vectorizer = NULL,
@@ -572,6 +782,7 @@ def replace_paper_chunks(
                 chunk_strategy,
                 chunk_size,
                 chunk_overlap,
+                json.dumps(layout_stats or {}, ensure_ascii=False),
             ),
         )
     return len(chunk_list)
@@ -662,14 +873,18 @@ def replace_chunk_vectors(
         )
 
 
-def create_rag_query(paper_id: int, question: str) -> int:
+def create_rag_query(
+    paper_id: int,
+    question: str,
+    reranker: str = "none",
+) -> int:
     with connect() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO rag_queries (paper_id, question, status)
-            VALUES (?, ?, ?)
+            INSERT INTO rag_queries (paper_id, question, reranker, status)
+            VALUES (?, ?, ?, ?)
             """,
-            (paper_id, question, RAG_ANSWERING),
+            (paper_id, question, reranker, RAG_ANSWERING),
         )
         return int(cursor.lastrowid)
 
@@ -712,12 +927,14 @@ def update_rag_query(
     evidence: Optional[list[dict]] = None,
     model: Optional[str] = None,
     error: Optional[str] = None,
+    rerank_error: Optional[str] = None,
 ) -> None:
     with connect() as conn:
         conn.execute(
             """
             UPDATE rag_queries
             SET status = ?, answer = ?, evidence_json = ?, model = ?, error = ?,
+                rerank_error = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
@@ -727,6 +944,7 @@ def update_rag_query(
                 json.dumps(evidence or [], ensure_ascii=False),
                 model,
                 error,
+                rerank_error,
                 query_id,
             ),
         )
@@ -793,6 +1011,8 @@ def create_evaluation_run(
     *,
     name: str,
     chunk_strategy: str,
+    query_mode: str,
+    keyword_retriever: str,
     chunk_size: int,
     chunk_overlap: int,
     embedding_model: str,
@@ -800,20 +1020,24 @@ def create_evaluation_run(
     keyword_weight: float,
     top_k: int,
     case_count: int,
+    reranker: str = "none",
 ) -> int:
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO evaluation_runs (
-                name, status, chunk_strategy, chunk_size, chunk_overlap,
-                embedding_model, semantic_weight, keyword_weight, top_k,
-                case_count
+                name, status, chunk_strategy, query_mode, keyword_retriever, reranker,
+                chunk_size, chunk_overlap, embedding_model, semantic_weight,
+                keyword_weight, top_k, case_count
             )
-            VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
                 chunk_strategy,
+                query_mode,
+                keyword_retriever,
+                reranker,
                 chunk_size,
                 chunk_overlap,
                 embedding_model,
@@ -925,7 +1149,7 @@ def list_evaluation_results(run_id: int) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT r.*, c.question_type, c.question, c.reference_answer,
+            SELECT r.*, c.paper_id, c.question_type, c.question, c.reference_answer,
                    c.evidence_page, c.evidence_text, p.title AS paper_title
             FROM evaluation_results AS r
             JOIN evaluation_cases AS c ON c.id = r.case_id
@@ -942,6 +1166,181 @@ def list_evaluation_results(run_id: int) -> list[dict]:
             item["retrieved"] = json.loads(item["retrieved_json"] or "[]")
         except json.JSONDecodeError:
             item["retrieved"] = []
+        results.append(item)
+    return results
+
+
+def create_generation_evaluation_run(
+    *,
+    name: str,
+    retrieval_run_id: int,
+    generator_model: str,
+    judge_model: str,
+    prompt_version: str,
+    case_count: int,
+) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO generation_evaluation_runs (
+                name, status, retrieval_run_id, generator_model,
+                judge_model, prompt_version, case_count
+            )
+            VALUES (?, 'running', ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                retrieval_run_id,
+                generator_model,
+                judge_model,
+                prompt_version,
+                case_count,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def save_generation_evaluation_result(
+    run_id: int,
+    case_id: int,
+    *,
+    answer: Optional[str],
+    evidence: list[dict],
+    faithfulness: float,
+    answer_relevance: float,
+    reference_correctness: float,
+    citation_correctness: float,
+    judge: dict,
+    generation_seconds: float,
+    judge_seconds: float,
+    error: Optional[str] = None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO generation_evaluation_results (
+                run_id, case_id, answer, evidence_json, faithfulness,
+                answer_relevance, reference_correctness,
+                citation_correctness, judge_json, generation_seconds,
+                judge_seconds, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, case_id) DO UPDATE SET
+                answer = excluded.answer,
+                evidence_json = excluded.evidence_json,
+                faithfulness = excluded.faithfulness,
+                answer_relevance = excluded.answer_relevance,
+                reference_correctness = excluded.reference_correctness,
+                citation_correctness = excluded.citation_correctness,
+                judge_json = excluded.judge_json,
+                generation_seconds = excluded.generation_seconds,
+                judge_seconds = excluded.judge_seconds,
+                error = excluded.error
+            """,
+            (
+                run_id,
+                case_id,
+                answer,
+                json.dumps(evidence, ensure_ascii=False),
+                faithfulness,
+                answer_relevance,
+                reference_correctness,
+                citation_correctness,
+                json.dumps(judge, ensure_ascii=False),
+                generation_seconds,
+                judge_seconds,
+                error,
+            ),
+        )
+
+
+def finish_generation_evaluation_run(
+    run_id: int,
+    status: str,
+    *,
+    metrics: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> None:
+    completed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE generation_evaluation_runs
+            SET status = ?, metrics_json = ?, error = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                json.dumps(metrics or {}, ensure_ascii=False),
+                error,
+                completed_at,
+                run_id,
+            ),
+        )
+
+
+def _generation_run_from_row(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    try:
+        item["metrics"] = json.loads(item["metrics_json"] or "{}")
+    except json.JSONDecodeError:
+        item["metrics"] = {}
+    return item
+
+
+def list_generation_evaluation_runs(limit: int = 20) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT g.*, e.name AS retrieval_run_name
+            FROM generation_evaluation_runs AS g
+            JOIN evaluation_runs AS e ON e.id = g.retrieval_run_id
+            ORDER BY g.id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_generation_run_from_row(row) for row in rows]
+
+
+def get_generation_evaluation_run(run_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT g.*, e.name AS retrieval_run_name
+            FROM generation_evaluation_runs AS g
+            JOIN evaluation_runs AS e ON e.id = g.retrieval_run_id
+            WHERE g.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    return _generation_run_from_row(row) if row is not None else None
+
+
+def list_generation_evaluation_results(run_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, c.question_type, c.question, c.reference_answer,
+                   c.evidence_page, p.title AS paper_title
+            FROM generation_evaluation_results AS r
+            JOIN evaluation_cases AS c ON c.id = r.case_id
+            JOIN papers AS p ON p.id = c.paper_id
+            WHERE r.run_id = ?
+            ORDER BY c.paper_id, c.id
+            """,
+            (run_id,),
+        ).fetchall()
+    results: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        for source, target, fallback in (
+            ("evidence_json", "evidence", []),
+            ("judge_json", "judge", {}),
+        ):
+            try:
+                item[target] = json.loads(item[source] or json.dumps(fallback))
+            except json.JSONDecodeError:
+                item[target] = fallback
         results.append(item)
     return results
 

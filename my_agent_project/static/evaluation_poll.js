@@ -7,7 +7,11 @@ if (activeRun) {
 const semanticWeight = document.querySelector("[data-semantic-weight]");
 const semanticOutput = document.querySelector("[data-semantic-output]");
 const keywordOutput = document.querySelector("[data-keyword-output]");
+const keywordName = document.querySelector("[data-keyword-name]");
 const chunkStrategy = document.querySelector("[data-chunk-strategy]");
+const queryMode = document.querySelector("[data-query-mode]");
+const keywordRetriever = document.querySelector("[data-keyword-retriever]");
+const reranker = document.querySelector("[data-reranker]");
 const experimentName = document.querySelector('input[name="experiment_name"]');
 
 function updateWeightOutputs() {
@@ -15,18 +19,43 @@ function updateWeightOutputs() {
   const semantic = Number(semanticWeight.value);
   semanticOutput.value = semantic.toFixed(2);
   keywordOutput.value = (1 - semantic).toFixed(2);
+  if (keywordName) {
+    keywordName.textContent = keywordRetriever?.value === "bm25" ? "BM25" : "TF-IDF";
+  }
 }
 
 semanticWeight?.addEventListener("input", updateWeightOutputs);
 updateWeightOutputs();
 
-chunkStrategy?.addEventListener("change", () => {
+function updateExperimentName() {
   if (!experimentName) return;
-  experimentName.value =
-    chunkStrategy.value === "academic_section"
-      ? "论文章节感知分块"
-      : "固定边界分块实验";
+  const strategyNames = {
+    paper_semantic_breakpoint_global: "Seed semantic breakpoint",
+    length_boundary: "固定边界分块",
+    academic_section: "论文章节感知分块",
+    academic_section_no_prefix: "论文章节无前缀",
+    paper_section_sentence: "论文章节完整句子分块",
+    paper_parent_child: "小块检索父块返回",
+    paper_table_context: "表题表头上下文分块",
+  };
+  const queryNames = {
+    original: "原始中文查询",
+    english: "固定英文查询",
+    bilingual_rrf: "中英文双路RRF",
+  };
+  const queryName = queryNames[queryMode?.value] || "查询";
+  const keywordName = keywordRetriever?.value === "bm25" ? "BM25" : "TF-IDF";
+  const rerankerName = reranker?.value === "deepseek_listwise" ? " + DeepSeek重排" : "";
+  experimentName.value = `${strategyNames[chunkStrategy?.value] || "分块"} + ${queryName} + ${keywordName}${rerankerName}`;
+}
+
+chunkStrategy?.addEventListener("change", updateExperimentName);
+queryMode?.addEventListener("change", updateExperimentName);
+keywordRetriever?.addEventListener("change", () => {
+  updateWeightOutputs();
+  updateExperimentName();
 });
+reranker?.addEventListener("change", updateExperimentName);
 
 const chartColors = {
   grid: "#d9dfe6",

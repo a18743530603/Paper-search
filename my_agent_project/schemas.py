@@ -42,3 +42,11 @@ class PaperChunk:
     page_number: int
     chunk_index: int
     content: str
+    parent_index: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PaperParentChunk:
+    page_number: int
+    parent_index: int
+    content: str

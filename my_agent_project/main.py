@@ -19,6 +19,7 @@ from .db import (
     export_papers_json,
     get_document,
     get_evaluation_run,
+    get_generation_evaluation_run,
     get_or_create_document,
     get_paper,
     init_db,
@@ -26,6 +27,8 @@ from .db import (
     list_evaluation_cases,
     list_evaluation_results,
     list_evaluation_runs,
+    list_generation_evaluation_results,
+    list_generation_evaluation_runs,
     list_paper_chunks,
     list_paper_statuses,
     list_papers,
@@ -39,9 +42,15 @@ from .evaluation_service import (
     prepare_benchmark,
     run_configured_experiment,
 )
+from .generation_evaluation_service import (
+    create_generation_run,
+    run_generation_evaluation,
+)
 from .origin_service import create_origin_outputs
 from .pdf_service import parse_paper_pdf
 from .rag_service import (
+    RERANKER_DEEPSEEK_LISTWISE,
+    RERANKER_NONE,
     answer_rag_query,
     build_access_notice,
     index_paper_chunks,
@@ -57,7 +66,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.7.0")
+app = FastAPI(title="Paper Hunter", version="0.8.1")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -176,6 +185,7 @@ def ask_paper(
     paper_id: int,
     background_tasks: BackgroundTasks,
     question: str = Form(...),
+    use_reranker: bool = Form(False),
 ):
     paper = get_paper(paper_id)
     if paper is None:
@@ -188,7 +198,10 @@ def ask_paper(
         raise HTTPException(status_code=400, detail="Question is required")
     if len(question) > 1000:
         raise HTTPException(status_code=400, detail="Question is too long")
-    query_id = create_rag_query(paper_id, question)
+    reranker = (
+        RERANKER_DEEPSEEK_LISTWISE if use_reranker else RERANKER_NONE
+    )
+    query_id = create_rag_query(paper_id, question, reranker)
     background_tasks.add_task(answer_rag_query, query_id)
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
@@ -251,6 +264,9 @@ def start_evaluation(
     background_tasks: BackgroundTasks,
     experiment_name: str = Form("固定边界分块实验"),
     chunk_strategy: str = Form("length_boundary"),
+    query_mode: str = Form("original"),
+    keyword_retriever: str = Form("tfidf"),
+    reranker: str = Form("none"),
     chunk_size: int = Form(1200),
     chunk_overlap: int = Form(150),
     top_k: int = Form(5),
@@ -260,6 +276,9 @@ def start_evaluation(
         run_id, config = create_experiment_run(
             name=experiment_name,
             chunk_strategy=chunk_strategy,
+            query_mode=query_mode,
+            keyword_retriever=keyword_retriever,
+            reranker=reranker,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             top_k=top_k,
@@ -285,6 +304,74 @@ def evaluation_run_detail(request: Request, run_id: int):
             "selected_run": selected_run,
             "results": (
                 list_evaluation_results(run_id)
+                if selected_run["status"] == "completed"
+                else []
+            ),
+        },
+    )
+
+
+@app.get("/generation-evaluation")
+def generation_evaluation_dashboard(request: Request):
+    generation_runs = list_generation_evaluation_runs()
+    selected_run = generation_runs[0] if generation_runs else None
+    return templates.TemplateResponse(
+        request,
+        "generation_evaluation.html",
+        {
+            "retrieval_runs": [
+                run for run in list_evaluation_runs(100)
+                if run["status"] == "completed"
+            ],
+            "runs": generation_runs,
+            "selected_run": selected_run,
+            "results": (
+                list_generation_evaluation_results(selected_run["id"])
+                if selected_run and selected_run["status"] == "completed"
+                else []
+            ),
+        },
+    )
+
+
+@app.post("/generation-evaluation/run")
+def start_generation_evaluation(
+    background_tasks: BackgroundTasks,
+    retrieval_run_id: int = Form(...),
+    experiment_name: str = Form("RAG 生成质量评测"),
+):
+    try:
+        run_id = create_generation_run(retrieval_run_id, experiment_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background_tasks.add_task(
+        run_generation_evaluation,
+        run_id,
+        retrieval_run_id,
+    )
+    return RedirectResponse(
+        url=f"/generation-evaluation/runs/{run_id}",
+        status_code=303,
+    )
+
+
+@app.get("/generation-evaluation/runs/{run_id}")
+def generation_evaluation_run_detail(request: Request, run_id: int):
+    selected_run = get_generation_evaluation_run(run_id)
+    if selected_run is None:
+        raise HTTPException(status_code=404, detail="Generation run not found")
+    return templates.TemplateResponse(
+        request,
+        "generation_evaluation.html",
+        {
+            "retrieval_runs": [
+                run for run in list_evaluation_runs(100)
+                if run["status"] == "completed"
+            ],
+            "runs": list_generation_evaluation_runs(),
+            "selected_run": selected_run,
+            "results": (
+                list_generation_evaluation_results(run_id)
                 if selected_run["status"] == "completed"
                 else []
             ),
