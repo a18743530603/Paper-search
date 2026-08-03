@@ -1,0 +1,41 @@
+﻿question,retrieval_query_en
+Mamba的induction heads实验使用什么训练序列长度和词表大小？,What training sequence length and vocabulary size are used for Mamba's induction heads experiment?
+Mamba的融合selective scan内核按什么步骤处理数据？,What processing steps are performed by Mamba's fused selective scan kernel?
+Mamba的selective copying实验采用了哪些主要训练参数？,What are the main training parameters for Mamba's selective copying experiment?
+Mamba相对同规模Transformer实现了多大的推理吞吐量提升，原因是什么？,"How much higher inference throughput does Mamba achieve than a similarly sized Transformer, and why?"
+为什么选择性参数Δ在Mamba的消融实验中最重要？,Why is the selective delta parameter the most important parameter in Mamba's ablation study?
+QLoRA聊天模型评测中的Vicuna和OA基准分别包含多少查询？,How many queries are included in the Vicuna and OA benchmarks used to evaluate QLoRA chat models?
+Paged Optimizers如何处理偶发的GPU显存不足？,How do Paged Optimizers handle occasional GPU out-of-memory situations?
+QLoRA对权重和二次量化常数分别使用什么数据类型和块大小？,Which data types and block sizes does QLoRA use for weights and second-level quantization constants?
+Guanaco 65B在Vicuna基准上相对ChatGPT达到了多少性能？,What performance relative to ChatGPT did Guanaco 65B achieve on the Vicuna benchmark?
+作者为什么认为指令微调数据质量比数据规模更重要？,Why do the authors conclude that instruction-finetuning dataset quality is more important than dataset size?
+SA-1B数据集包含多少图像和掩码，与既有分割数据集相比规模如何？,"How many images and masks does SA-1B contain, and how does its scale compare with existing segmentation datasets?"
+SAM数据引擎由哪三个阶段组成？,What are the three stages of the SAM data engine?
+SAM训练使用了多少块A100 GPU以及多长时间？,"How many A100 GPUs were used to train SAM, and for how long?"
+在23个数据集的单点分割评测中，SAM相对RITM表现如何？,How did SAM perform against RITM in the single-point segmentation evaluation across 23 datasets?
+作者为什么选择promptable segmentation作为任务？,Why do the authors choose promptable segmentation as the task for SAM?
+Dreamer使用固定超参数评估了多少个领域和任务？,Across how many domains and tasks is Dreamer evaluated using fixed hyperparameters?
+Dreamer算法的三个神经网络分别承担什么职责？,What roles do the three neural networks in Dreamer play?
+Dreamer的批量大小、批序列长度和学习率分别是多少？,"What batch size, batch length, and learning rate are used by Dreamer?"
+Minecraft训练期间，Dreamer和基线智能体获得至少一颗钻石的比例分别是多少？,"During Minecraft training, what proportions of Dreamer agents and baseline agents obtained at least one diamond?"
+作者为什么在Minecraft实验中直接使用Dreamer默认超参数？,Why do the authors apply Dreamer with default hyperparameters in Minecraft?
+TabPFN在OpenML-CC18上的18个评测数据集满足哪些规模限制？,What size constraints define the 18 OpenML-CC18 datasets used to evaluate TabPFN?
+Prior-fitting如何训练PFN来近似后验预测分布？,How does prior-fitting train a PFN to approximate the posterior predictive distribution?
+TabPFN离线预训练使用了怎样的Transformer、批次数和硬件配置？,"What Transformer depth, number of batches, and hardware configuration were used to pretrain TabPFN?"
+TabPFN相对复杂AutoML系统实现了多大的加速？,How much speedup does TabPFN achieve relative to complex AutoML systems?
+作者为什么将TabPFN的先验建立在结构因果模型上？,Why do the authors base the TabPFN prior on structural causal models?
+MatterGen基础模型的Alex-MP-20训练集包含多少结构，来自哪些数据源？,"How many structures are in MatterGen's Alex-MP-20 training set, and which sources do they come from?"
+MatterGen如何预训练基础模型并针对目标属性进行微调？,How does MatterGen pretrain its base model and fine-tune it toward target properties?
+MatterGen基础无条件模型采用了哪些主要训练参数？,What are the main training hyperparameters of MatterGen's unconditional base model?
+与先前生成模型相比，MatterGen生成结构的新颖稳定概率和局部能量表现提高了多少？,How much does MatterGen improve novelty and stability likelihood and proximity to the local energy minimum over prior generative models?
+为什么使用adapter微调对MatterGen特别有吸引力？,Why is adapter-based fine-tuning particularly appealing for MatterGen?
+scGPT预训练数据包含多少细胞，覆盖多少器官或组织和研究？,"How many cells, organs or tissues, and studies are represented in scGPT's pretraining data?"
+scGPT如何通过预训练和微调适配单细胞任务？,How does scGPT use pretraining and fine-tuning to adapt to single-cell tasks?
+scGPT全人类细胞预训练模型的主要结构和训练参数是什么？,What are the main architecture and training hyperparameters of the whole-human scGPT pretraining model?
+scGPT与TOSICA和scBert相比在细胞类型标注上表现如何？,How does scGPT perform against TOSICA and scBert for cell-type annotation?
+为什么Transformer的token设计适合建模单细胞测序数据？,Why is the Transformer's token design suitable for modeling single-cell sequencing data?
+GraphRAG实验使用了哪两个语料库，它们的文本块和规模分别是多少？,"Which two corpora are used in the GraphRAG experiment, and what are their chunk counts and token scales?"
+GraphRAG如何从源文档生成面向全局问题的最终回答？,How does GraphRAG generate a final answer to a global question from source documents?
+GraphRAG实验生成摘要和回答时使用多大的上下文窗口，建图时使用多大的文本窗口？,What context-window sizes are used for answer generation and graph indexing in the GraphRAG experiment?
+GraphRAG全局方法相对向量RAG在两个数据集上的comprehensiveness和diversity胜率范围是多少？,What comprehensiveness and diversity win-rate ranges do GraphRAG's global approaches achieve over vector RAG on both datasets?
+为什么传统RAG难以回答面向整个语料库的全局问题？,Why does conventional RAG fail on global questions about an entire text corpus?

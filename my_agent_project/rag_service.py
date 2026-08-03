@@ -28,8 +28,13 @@ from .model_service import (
     is_seed_configured,
     seed_embedding_cache_namespace,
 )
-from .pdf_service import CHUNK_STRATEGY_ACADEMIC_NO_PREFIX
+from .pdf_service import (
+    CHUNK_STRATEGY_ACADEMIC_NO_PREFIX,
+    CHUNK_STRATEGY_MULTI_GRANULARITY,
+)
 from .schemas import (
+    CHUNK_ROLE_CHILD,
+    CHUNK_ROLE_PARENT,
     INDEX_FAILED,
     INDEX_INDEXED,
     INDEX_INDEXING,
@@ -52,6 +57,7 @@ BM25_B = 0.75
 SEED_BATCH_SIZE = 64
 RRF_RANK_CONSTANT = 60
 FUSION_CANDIDATE_K = 20
+MULTI_GRANULARITY_CANDIDATE_K = 20
 RERANK_CANDIDATE_K = 20
 RERANK_RESULT_K = 5
 RERANKER_NONE = "none"
@@ -372,6 +378,7 @@ def retrieve_relevant_chunks(
     keyword_weight: float = KEYWORD_WEIGHT,
     keyword_retriever: str = KEYWORD_RETRIEVER_TFIDF,
     cache_stats: dict[str, int] | None = None,
+    chunk_role: str | None = None,
 ) -> list[dict]:
     if keyword_retriever not in SUPPORTED_KEYWORD_RETRIEVERS:
         raise ValueError(f"unsupported keyword retriever: {keyword_retriever}")
@@ -383,7 +390,25 @@ def retrieve_relevant_chunks(
     semantic_weight /= total_weight
     keyword_weight /= total_weight
 
+    document = get_document(paper_id)
+    if (
+        chunk_role is None
+        and document is not None
+        and document["chunk_strategy"] == CHUNK_STRATEGY_MULTI_GRANULARITY
+    ):
+        return retrieve_multi_granularity_chunks(
+            paper_id,
+            question,
+            top_k=top_k,
+            semantic_weight=semantic_weight,
+            keyword_weight=keyword_weight,
+            keyword_retriever=keyword_retriever,
+            cache_stats=cache_stats,
+        )
+
     rows = list_indexed_chunks(paper_id)
+    if chunk_role is not None:
+        rows = [row for row in rows if row["chunk_role"] == chunk_role]
     if not rows:
         return []
 
@@ -398,7 +423,6 @@ def retrieve_relevant_chunks(
         document_frequency.update(vector.keys())
 
     if keyword_retriever == KEYWORD_RETRIEVER_BM25:
-        document = get_document(paper_id)
         chunk_strategy = document["chunk_strategy"] if document is not None else None
         keyword_scores = _bm25_keyword_scores(
             question,
@@ -528,6 +552,13 @@ def reciprocal_rank_fusion(
                 order += 1
             fused[identity]["score"] += 1 / (rank_constant + rank)
             fused[identity]["fusion_ranks"][route] = rank
+            if route == CHUNK_ROLE_CHILD:
+                fused[identity]["child_chunk_index"] = item.get(
+                    "child_chunk_index"
+                )
+                fused[identity]["retrieval_content"] = item.get(
+                    "retrieval_content", ""
+                )
 
     ranked = sorted(
         fused.values(),
@@ -537,6 +568,44 @@ def reciprocal_rank_fusion(
         item["score"] = round(item["score"], 6)
         item.pop("fusion_order", None)
     return ranked[:top_k]
+
+
+def retrieve_multi_granularity_chunks(
+    paper_id: int,
+    question: str,
+    *,
+    top_k: int = 6,
+    semantic_weight: float = SEMANTIC_WEIGHT,
+    keyword_weight: float = KEYWORD_WEIGHT,
+    keyword_retriever: str = KEYWORD_RETRIEVER_TFIDF,
+    cache_stats: dict[str, int] | None = None,
+    candidate_k: int = MULTI_GRANULARITY_CANDIDATE_K,
+) -> list[dict]:
+    candidate_k = max(top_k, candidate_k)
+    common = {
+        "top_k": candidate_k,
+        "semantic_weight": semantic_weight,
+        "keyword_weight": keyword_weight,
+        "keyword_retriever": keyword_retriever,
+        "cache_stats": cache_stats,
+    }
+    return reciprocal_rank_fusion(
+        {
+            CHUNK_ROLE_PARENT: retrieve_relevant_chunks(
+                paper_id,
+                question,
+                chunk_role=CHUNK_ROLE_PARENT,
+                **common,
+            ),
+            CHUNK_ROLE_CHILD: retrieve_relevant_chunks(
+                paper_id,
+                question,
+                chunk_role=CHUNK_ROLE_CHILD,
+                **common,
+            ),
+        },
+        top_k=top_k,
+    )
 
 
 def retrieve_bilingual_rrf_chunks(

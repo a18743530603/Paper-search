@@ -36,6 +36,7 @@ function updateExperimentName() {
     academic_section_no_prefix: "论文章节无前缀",
     paper_section_sentence: "论文章节完整句子分块",
     paper_parent_child: "小块检索父块返回",
+    paper_multi_granularity: "父块句子子块双路融合",
     paper_table_context: "表题表头上下文分块",
   };
   const queryNames = {

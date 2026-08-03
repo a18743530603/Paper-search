@@ -38,7 +38,12 @@ from my_agent_project.rag_service import (
     reciprocal_rank_fusion,
     retrieve_relevant_chunks,
 )
-from my_agent_project.schemas import PaperChunk, PaperParentChunk
+from my_agent_project.schemas import (
+    CHUNK_ROLE_CHILD,
+    CHUNK_ROLE_PARENT,
+    PaperChunk,
+    PaperParentChunk,
+)
 from my_agent_project.schemas import STATUS_AVAILABLE, STATUS_LINK_ONLY
 from my_agent_project.search_service import (
     parse_arxiv_feed,
@@ -325,6 +330,113 @@ def test_parent_child_layout_uses_small_sentence_children_and_fixed_parents():
     assert all(child.parent_index == parents[0].parent_index for child in children)
     assert all(len(child.content) <= 300 for child in children)
     assert parents[0].content == text
+
+
+def test_multi_granularity_layout_indexes_parent_and_child_routes():
+    text = " ".join(
+        [
+            "The model extracts multimodal features from every input.",
+            "AdamW trains the classifier with a stable learning rate.",
+            "The validation split is used for early stopping.",
+            "The final evaluation reports accuracy and calibration error.",
+            "Ablation studies compare every component of the method.",
+            "The discussion explains the remaining limitations.",
+        ]
+    )
+    layout_stats = {}
+
+    chunks, parents = build_pdf_chunk_layout(
+        [text],
+        strategy="paper_multi_granularity",
+        chunk_size=600,
+        overlap=60,
+        layout_stats=layout_stats,
+    )
+
+    parent_routes = [chunk for chunk in chunks if chunk.role == CHUNK_ROLE_PARENT]
+    child_routes = [chunk for chunk in chunks if chunk.role == CHUNK_ROLE_CHILD]
+    assert len(parents) == 1
+    assert len(parent_routes) == 1
+    assert len(child_routes) >= 2
+    assert parent_routes[0].content == parents[0].content
+    assert all(chunk.parent_index == parents[0].parent_index for chunk in chunks)
+    assert layout_stats == {
+        "parent_retrieval_chunk_count": 1,
+        "child_retrieval_chunk_count": len(child_routes),
+    }
+
+
+def test_multi_granularity_retrieval_fuses_parent_and_child_routes(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    monkeypatch.setattr(rag_service, "is_seed_configured", lambda: False)
+    db.init_db()
+    paper_id = db.insert_papers("agent", [parse_arxiv_feed(ARXIV_XML)[0]])[0]
+    db.replace_paper_chunks(
+        paper_id,
+        [
+            PaperChunk(
+                1,
+                0,
+                "AdamW optimizer trains the model with learning rate 1e-3.",
+                0,
+                CHUNK_ROLE_PARENT,
+            ),
+            PaperChunk(
+                2,
+                1,
+                "SGD optimizer is used for the baseline model.",
+                1,
+                CHUNK_ROLE_PARENT,
+            ),
+            PaperChunk(
+                1,
+                2,
+                "The AdamW learning rate is 1e-3.",
+                0,
+                CHUNK_ROLE_CHILD,
+            ),
+            PaperChunk(
+                2,
+                3,
+                "The baseline uses SGD.",
+                1,
+                CHUNK_ROLE_CHILD,
+            ),
+        ],
+        parent_chunks=[
+            PaperParentChunk(
+                1,
+                0,
+                "AdamW optimizer trains the model with learning rate 1e-3.",
+            ),
+            PaperParentChunk(
+                2,
+                1,
+                "SGD optimizer is used for the baseline model.",
+            ),
+        ],
+        page_count=2,
+        chunk_strategy="paper_multi_granularity",
+        chunk_size=1200,
+        chunk_overlap=150,
+    )
+
+    index_paper_chunks(paper_id)
+    results = retrieve_relevant_chunks(
+        paper_id,
+        "What learning rate does AdamW use?",
+        semantic_weight=0,
+        keyword_weight=1,
+        top_k=5,
+    )
+
+    assert results[0]["content"].endswith("learning rate 1e-3.")
+    assert results[0]["fusion_ranks"] == {"parent": 1, "child": 1}
+    assert results[0]["retrieval_content"] == "The AdamW learning rate is 1e-3."
+    assert len({result["parent_chunk_id"] for result in results}) == len(results)
 
 
 def test_parent_child_retrieval_returns_and_deduplicates_parent(
@@ -1362,6 +1474,37 @@ def test_init_db_adds_rag_reranker_audit_columns(tmp_path, monkeypatch):
     assert {"reranker", "rerank_error"} <= columns
 
 
+def test_init_db_adds_chunk_role_for_existing_databases(tmp_path, monkeypatch):
+    database_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE paper_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id INTEGER NOT NULL,
+                page_number INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL
+            )
+            """
+        )
+
+    db.init_db()
+
+    with sqlite3.connect(database_path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(paper_chunks)")
+        }
+        role_default = next(
+            row[4]
+            for row in conn.execute("PRAGMA table_info(paper_chunks)")
+            if row[1] == "chunk_role"
+        )
+    assert "chunk_role" in columns
+    assert role_default == "'retrieval'"
+
+
 def test_rag_query_can_rerank_top_twenty_to_top_five(tmp_path, monkeypatch):
     database_path = tmp_path / "metadata.db"
     monkeypatch.setattr(db, "DATABASE_PATH", database_path)
@@ -1597,6 +1740,57 @@ def test_fixed_english_queries_match_every_benchmark_question():
     assert all(
         not any("\u4e00" <= character <= "\u9fff" for character in query)
         for query in english_queries.values()
+    )
+
+
+def test_heldout_v2_dataset_is_balanced_and_frozen_for_eight_papers():
+    root = Path(__file__).parents[1]
+    benchmark_path = root / "benchmarks" / "heldout_v2.csv"
+    manifest_path = root / "benchmarks" / "heldout_v2_manifest.csv"
+    with benchmark_path.open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+    with manifest_path.open(encoding="utf-8-sig", newline="") as file:
+        manifest_rows = list(csv.DictReader(file))
+
+    paper_counts = Counter(row["paper_title"] for row in rows)
+    type_counts = Counter(row["question_type"] for row in rows)
+
+    assert len(rows) == 40
+    assert len(paper_counts) == 8
+    assert set(paper_counts.values()) == {5}
+    assert type_counts == {
+        "事实型": 8,
+        "方法型": 8,
+        "参数型": 8,
+        "结果型": 8,
+        "原因型": 8,
+    }
+    assert len({row["question"] for row in rows}) == 40
+    assert all(int(row["evidence_page"]) > 0 for row in rows)
+    assert all(row["evidence_text"].strip() for row in rows)
+    assert {row["paper_title"] for row in rows} == {
+        row["paper_title"] for row in manifest_rows
+    }
+    assert all(row["download_status"] == "downloaded" for row in manifest_rows)
+    assert all(row["annotation_status"] == "validated" for row in manifest_rows)
+
+
+def test_heldout_v2_english_queries_match_all_frozen_questions():
+    root = Path(__file__).parents[1]
+    benchmark_path = root / "benchmarks" / "heldout_v2.csv"
+    query_path = root / "benchmarks" / "heldout_v2_queries_en.csv"
+    with benchmark_path.open(encoding="utf-8-sig", newline="") as file:
+        benchmark_questions = {row["question"] for row in csv.DictReader(file)}
+    with query_path.open(encoding="utf-8-sig", newline="") as file:
+        query_rows = list(csv.DictReader(file))
+
+    assert len(query_rows) == 40
+    assert {row["question"] for row in query_rows} == benchmark_questions
+    assert len({row["retrieval_query_en"] for row in query_rows}) == 40
+    assert all(row["retrieval_query_en"].strip() for row in query_rows)
+    assert all(
+        not any("\u4e00" <= character <= "\u9fff" for character in row["retrieval_query_en"])
+        for row in query_rows
     )
 
 
@@ -2279,6 +2473,7 @@ def test_evaluation_page_exposes_chart_metrics():
     assert '<option value="academic_section_no_prefix">' in html
     assert '<option value="paper_section_sentence">' in html
     assert '<option value="paper_parent_child">' in html
+    assert '<option value="paper_multi_granularity">' in html
     assert '<option value="paper_table_context">' in html
     assert '<option value="paper_semantic_breakpoint_global">' in html
     assert "2.50 秒" in html

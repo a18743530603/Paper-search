@@ -22,6 +22,10 @@ RAG_ANSWERING = "answering"
 RAG_ANSWERED = "answered"
 RAG_FAILED = "answer_failed"
 
+CHUNK_ROLE_RETRIEVAL = "retrieval"
+CHUNK_ROLE_PARENT = "parent"
+CHUNK_ROLE_CHILD = "child"
+
 
 @dataclass(frozen=True)
 class PaperCandidate:
@@ -43,6 +47,7 @@ class PaperChunk:
     chunk_index: int
     content: str
     parent_index: Optional[int] = None
+    role: str = CHUNK_ROLE_RETRIEVAL
 
 
 @dataclass(frozen=True)

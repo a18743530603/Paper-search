@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS paper_chunks (
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
     parent_chunk_id INTEGER,
+    chunk_role TEXT NOT NULL DEFAULT 'retrieval',
     vector_json TEXT,
     dense_vector_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -283,6 +284,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE paper_chunks ADD COLUMN dense_vector_json TEXT")
         if "parent_chunk_id" not in chunk_columns:
             conn.execute("ALTER TABLE paper_chunks ADD COLUMN parent_chunk_id INTEGER")
+        if "chunk_role" not in chunk_columns:
+            conn.execute(
+                "ALTER TABLE paper_chunks "
+                "ADD COLUMN chunk_role TEXT NOT NULL DEFAULT 'retrieval'"
+            )
         evaluation_run_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(evaluation_runs)").fetchall()
@@ -728,9 +734,10 @@ def replace_paper_chunks(
         conn.executemany(
             """
             INSERT INTO paper_chunks (
-                paper_id, page_number, chunk_index, content, parent_chunk_id
+                paper_id, page_number, chunk_index, content, parent_chunk_id,
+                chunk_role
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -739,6 +746,7 @@ def replace_paper_chunks(
                     chunk.chunk_index,
                     chunk.content,
                     parent_ids.get(chunk.parent_index),
+                    chunk.role,
                 )
                 for chunk in chunk_list
             ],

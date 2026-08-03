@@ -34,6 +34,7 @@
         <option value="academic_section_no_prefix">论文章节无前缀 academic_section_no_prefix</option>
         <option value="paper_section_sentence">论文章节 + 完整句子 paper_section_sentence</option>
         <option value="paper_parent_child">小块检索 + 父块返回 paper_parent_child</option>
+        <option value="paper_multi_granularity">父块 + 句子子块双路融合 paper_multi_granularity</option>
         <option value="paper_table_context">表题表头上下文 paper_table_context</option>
       </select>
     </label>
@@ -110,6 +111,9 @@
     {% if selected_run["metrics"].get("parent_chunk_count") %}
     <dt>返回父块</dt><dd>{{ selected_run["metrics"]["parent_chunk_count"] }}</dd>
     <dt>子块大小 / 重叠</dt><dd>{{ selected_run["metrics"]["child_chunk_size"] }} / {{ selected_run["metrics"]["child_chunk_overlap"] }}</dd>
+    {% endif %}
+    {% if selected_run["metrics"].get("multi_granularity_candidate_k") %}
+    <dt>多粒度候选池</dt><dd>父块/子块各 {{ selected_run["metrics"]["multi_granularity_candidate_k"] }} 条</dd>
     {% endif %}
     {% if selected_run["metrics"].get("detected_section_count") %}
     <dt>识别章节路径</dt><dd>{{ selected_run["metrics"]["detected_section_count"] }}</dd>

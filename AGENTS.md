@@ -1,8 +1,8 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.8.1`
+> 当前版本：`v0.8.3`
 >
-> 更新日期：`2026-08-02`
+> 更新日期：`2026-08-03`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -484,13 +484,49 @@ git push
 - 问答历史展示实际请求的检索模式、降级原因及证据的 `retrieval_rank → rerank_rank`，便于演示和审计。
 - 新增旧库迁移、Top-20到Top-5、重排失败降级和页面控件测试；聚焦测试 `4 passed`，完整离线测试 `73 passed`，未调用真实外部API。
 
+## v0.8.2 M1 论文多粒度父子融合候选策略
+
+- 新增 `CHUNK_STRATEGY_MULTI_GRANULARITY = "paper_multi_granularity"`；每个固定父块 `1200/150` 同时生成约 `600/75` 的完整句子子块，父块与子块都进入索引。
+- `PaperChunk.role` 与 `paper_chunks.chunk_role` 区分 `retrieval`、`parent` 和 `child`；`init_db()` 为旧SQLite自动补列，已有策略默认保持 `retrieval`。
+- `build_multi_granularity_chunks()` 复用已有父子布局，建立785个父块与2196个子块，共2981个索引单元；没有加入表格前缀、语义断点或新分块参数。
+- `retrieve_multi_granularity_chunks()` 使用相同问题、Seed/TF-IDF权重分别召回父块Top-20与子块Top-20，再通过现有 `reciprocal_rank_fusion()` 按共同父块ID融合并返回父块正文。
+- 唯一变量为“固定父块单路排序”改为“父块/子块双路父ID融合”；英文问题、`1200/150`、Seed/TF-IDF `0.75/0.25`、Top-5、RRF常数60和候选池20全部冻结，不启用DeepSeek重排。
+- 首次运行 `#38` 与全缓存复跑 `#39` 指标完全一致：`Hit@1/3/5=48.33%/76.67%/88.33%`、`MRR=0.6219`、覆盖率`85.28%`；相对固定基线`#21`，Hit@3提高10个百分点、Hit@5不变、MRR提高0.0183、覆盖率下降0.68个百分点。
+- 逐题为12题改善、6题变差、42题不变，Top-5新增1题并丢失1题；10,000次配对bootstrap中Hit@3差值区间`[-1.67,+21.67]`个百分点，仍跨0，因此只能称为达到开发集门槛的候选策略。
+- 两次运行均为0次Seed与DeepSeek新请求；`#38`复用2977个唯一块向量与120次双路问题向量，耗时25.880秒，`#39`全布局/索引缓存耗时19.635秒。
+- 完整离线测试为`76 passed`。实验后运行`#40`恢复固定边界当前索引，指标与`#21`完全一致；普通解析默认仍为`length_boundary`。
+- `heldout_v1`已经关闭，不得用于M1调参或宣传泛化；最终采用前必须建立`heldout_v2`或使用预注册交叉验证。
+
+## v0.8.2 H3 M1独立测试集预注册与冻结
+
+- 新增`benchmarks/heldout_v2_manifest.csv`和`HELDOUT_V2_DATASET.md`，选定8篇与开发集及`heldout_v1`标题零重叠的开放论文。
+- `heldout_v2`只比较固定边界`length_boundary 1200/150`与M1 `paper_multi_granularity`；英文问题、Seed/TF-IDF `0.75/0.25`、TF-IDF、父/子Top-20、RRF常数60、Top-5和关闭DeepSeek重排均预先冻结。
+- 用户授权后已下载并验证8篇PDF，共308个物理页、81,962,255字节；PDF、页文本和构建脚本只保存在Git忽略的`downloads/`中。
+- 新增`benchmarks/heldout_v2.csv`，每篇事实型、方法型、参数型、结果型和原因型各1题，共40题；构建脚本按物理页和原文起止标记截取连续英文证据，40段证据均通过指定页校验。
+- 新增`benchmarks/heldout_v2_queries_en.csv`，40条英文问题与中文问题一一对应且无中文字符；每篇5题、每种题型8题、问题和查询均无重复。
+- M1正式采用门槛：Hit@3差值为正且配对bootstrap 95%区间下界大于0；Hit@5最多下降1题；覆盖率下降不超过1个百分点；MRR不下降。
+- 冻结SHA-256：案例`0A1A29758B332F53D9F898CA08A94E83CC29DA071F2C7FA066FF746534A27FF5`，英文查询`4F3E83266476E008F1F9DE81F5E2D28CAA63985EA218D5702D667CE5CF2A2AA5`，清单`4F76E5850A0E72C8AFBD5892586B8F1242B1617A607AB4988C734C1DC3FE2C85`；8篇状态均为`downloaded/validated`。
+- 本步骤没有调用Seed或DeepSeek，也没有运行指标；新增2个完整性测试，完整离线测试为`78 passed`。下一步只能按冻结配置在隔离数据库中先跑基线、再跑M1，禁止根据结果修改案例或查询。
+
+## v0.8.3 H4 M1独立泛化验证
+
+- 在隔离数据库`downloads/heldout_v2_runtime/metadata.db`完成冻结基线`#1`和M1`#2`；8篇论文、40题均成功，错误数为0，冻结案例、查询和清单指纹未改变。
+- 基线`#1`使用`length_boundary 1200/150`，1084个块，`Hit@1/3/5=50.00%/82.50%/90.00%`、`MRR=0.6675`、覆盖率`87.04%`，总耗时`1500.422`秒。
+- M1`#2`使用1084个父块和2991个句子子块，共4075个索引单元；`Hit@1/3/5=55.00%/77.50%/90.00%`、`MRR=0.6925`、覆盖率`88.66%`，总耗时`1888.767`秒。
+- 10,000次配对bootstrap差值：Hit@1`+5.00`个百分点，区间`[-5.00,+15.00]`；Hit@3`-5.00`个百分点，区间`[-12.50,0.00]`；Hit@5`0`，区间`[-10.00,+10.00]`；MRR`+0.0250`，区间`[-0.0333,+0.0896]`；覆盖率`+1.62`个百分点，区间`[-6.91,+10.37]`。
+- 逐题为6题改善、5题变差、29题不变，Top-5新增2题并丢失2题。Hit@5、覆盖率和MRR保护门槛通过，但主指标Hit@3为负，因此`adopt_m1=false`。
+- M1恢复期间两次遇到Seed SSL EOF；受控评测的严格索引一致性门禁拒绝TF-IDF静默降级。保持同一数据、参数和运行重试成功，异常未进入正式指标。
+- M1只保留为实验选项，普通解析默认继续使用`length_boundary`；不得在`heldout_v2`上调块大小、候选池、RRF常数或查询后再次宣称独立验证。该测试集已正式关闭。
+- 本轮最重要的工程结论是：开发集点估计不能直接代表泛化；冻结数据、预注册门槛、配对区间和降级门禁共同防止了挑结果与错误降级污染。
+- GitHub README用策略总览区分正式链路与实验候选：默认采用固定边界 + Seed/TF-IDF，DeepSeek列表重排为已通过独立集验证的可选能力；M1只宣传开发集Hit@3提高、独立集Hit@5保持与覆盖率提高，不得省略其独立集Hit@3下降的限制。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前正式版本为 `v0.8.1`：生成评测证据截断已修复，G2-R开发集和H2-R独立未见集均已完成，普通问答可按题启用DeepSeek重排，完整自动化测试为 `73 passed`。
+- 当前版本为 `v0.8.3`：M1已完成`heldout_v2`一次性独立验证并因Hit@3下降5个百分点未通过主门槛；默认策略仍为固定边界，完整自动化测试为`78 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。

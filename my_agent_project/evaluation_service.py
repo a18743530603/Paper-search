@@ -19,6 +19,7 @@ from .db import (
 )
 from .pdf_service import (
     CHUNK_STRATEGY_LENGTH,
+    CHUNK_STRATEGY_MULTI_GRANULARITY,
     CHUNK_STRATEGY_PARENT_CHILD,
     CHUNK_STRATEGY_SEMANTIC,
     CHUNK_STRATEGY_SEMANTIC_LOCAL,
@@ -36,6 +37,7 @@ from .pdf_service import (
 from .rag_service import (
     KEYWORD_WEIGHT,
     KEYWORD_RETRIEVER_TFIDF,
+    MULTI_GRANULARITY_CANDIDATE_K,
     RERANK_CANDIDATE_K,
     RERANKER_DEEPSEEK_LISTWISE,
     RERANKER_NONE,
@@ -518,7 +520,10 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
     semantic_thresholds: list[float] = []
     cache_stats: dict[str, int] = {}
     strategy_metrics: dict[str, object] = {}
-    if config.chunk_strategy == CHUNK_STRATEGY_PARENT_CHILD:
+    if config.chunk_strategy in {
+        CHUNK_STRATEGY_PARENT_CHILD,
+        CHUNK_STRATEGY_MULTI_GRANULARITY,
+    }:
         child_size, child_overlap = parent_child_sizes(
             config.chunk_size,
             config.chunk_overlap,
@@ -527,6 +532,10 @@ def run_configured_experiment(run_id: int, config: ExperimentConfig) -> None:
             "child_chunk_size": child_size,
             "child_chunk_overlap": child_overlap,
         }
+        if config.chunk_strategy == CHUNK_STRATEGY_MULTI_GRANULARITY:
+            strategy_metrics["multi_granularity_candidate_k"] = (
+                MULTI_GRANULARITY_CANDIDATE_K
+            )
     elif config.chunk_strategy in {
         CHUNK_STRATEGY_SEMANTIC_LOCAL,
         CHUNK_STRATEGY_SEMANTIC,

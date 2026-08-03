@@ -1,0 +1,9 @@
+heldout_id,paper_title,domain,source_url,pdf_url,access_note,local_filename,download_status,annotation_status
+V201,Mamba: Linear-Time Sequence Modeling with Selective State Spaces,序列建模与状态空间模型,https://arxiv.org/abs/2312.00752,https://arxiv.org/pdf/2312.00752,arXiv公开访问,V201_Mamba.pdf,downloaded,validated
+V202,QLoRA: Efficient Finetuning of Quantized LLMs,大模型高效微调,https://arxiv.org/abs/2305.14314,https://arxiv.org/pdf/2305.14314,arXiv公开访问,V202_QLoRA.pdf,downloaded,validated
+V203,Segment Anything,计算机视觉与图像分割,https://arxiv.org/abs/2304.02643,https://arxiv.org/pdf/2304.02643,arXiv公开访问,V203_Segment_Anything.pdf,downloaded,validated
+V204,Mastering Diverse Domains through World Models,强化学习与世界模型,https://arxiv.org/abs/2301.04104,https://arxiv.org/pdf/2301.04104,arXiv公开访问,V204_DreamerV3.pdf,downloaded,validated
+V205,TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second,表格数据与贝叶斯推断,https://arxiv.org/abs/2207.01848,https://arxiv.org/pdf/2207.01848,arXiv公开访问,V205_TabPFN.pdf,downloaded,validated
+V206,MatterGen: a generative model for inorganic materials design,材料生成与扩散模型,https://arxiv.org/abs/2312.03687,https://arxiv.org/pdf/2312.03687,arXiv公开访问,V206_MatterGen.pdf,downloaded,validated
+V207,scGPT: Towards Building a Foundation Model for Single-Cell Multi-omics Using Generative AI,单细胞生物信息学,https://www.biorxiv.org/content/10.1101/2023.04.30.538439v2,https://www.biorxiv.org/content/10.1101/2023.04.30.538439v2.full.pdf,bioRxiv公开预印本,V207_scGPT.pdf,downloaded,validated
+V208,From Local to Global: A Graph RAG Approach to Query-Focused Summarization,图检索增强生成,https://arxiv.org/abs/2404.16130,https://arxiv.org/pdf/2404.16130,arXiv公开访问,V208_GraphRAG.pdf,downloaded,validated

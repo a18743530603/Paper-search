@@ -14,7 +14,14 @@ from .db import (
     replace_paper_chunks,
     update_parse_status,
 )
-from .schemas import PARSE_FAILED, PARSE_PARSING, PaperChunk, PaperParentChunk
+from .schemas import (
+    CHUNK_ROLE_CHILD,
+    CHUNK_ROLE_PARENT,
+    PARSE_FAILED,
+    PARSE_PARSING,
+    PaperChunk,
+    PaperParentChunk,
+)
 
 
 DEFAULT_CHUNK_SIZE = 1200
@@ -24,6 +31,7 @@ CHUNK_STRATEGY_ACADEMIC = "academic_section"
 CHUNK_STRATEGY_ACADEMIC_NO_PREFIX = "academic_section_no_prefix"
 CHUNK_STRATEGY_PAPER_SENTENCE = "paper_section_sentence"
 CHUNK_STRATEGY_PARENT_CHILD = "paper_parent_child"
+CHUNK_STRATEGY_MULTI_GRANULARITY = "paper_multi_granularity"
 CHUNK_STRATEGY_TABLE_CONTEXT = "paper_table_context"
 CHUNK_STRATEGY_SEMANTIC_LOCAL = "paper_semantic_breakpoint"
 CHUNK_STRATEGY_SEMANTIC = "paper_semantic_breakpoint_global"
@@ -33,6 +41,7 @@ SUPPORTED_CHUNK_STRATEGIES = {
     CHUNK_STRATEGY_ACADEMIC_NO_PREFIX,
     CHUNK_STRATEGY_PAPER_SENTENCE,
     CHUNK_STRATEGY_PARENT_CHILD,
+    CHUNK_STRATEGY_MULTI_GRANULARITY,
     CHUNK_STRATEGY_TABLE_CONTEXT,
     CHUNK_STRATEGY_SEMANTIC_LOCAL,
     CHUNK_STRATEGY_SEMANTIC,
@@ -786,11 +795,55 @@ def build_parent_child_chunks(
                         chunk_index=child_index,
                         content=child_content,
                         parent_index=parent_index,
+                        role=CHUNK_ROLE_CHILD,
                     )
                 )
                 child_index += 1
             parent_index += 1
     return children, parents
+
+
+def build_multi_granularity_chunks(
+    pages: list[str],
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    layout_stats: dict[str, object] | None = None,
+) -> tuple[list[PaperChunk], list[PaperParentChunk]]:
+    children, parents = build_parent_child_chunks(
+        pages,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
+    chunks: list[PaperChunk] = []
+    for parent in parents:
+        chunks.append(
+            PaperChunk(
+                page_number=parent.page_number,
+                chunk_index=len(chunks),
+                content=parent.content,
+                parent_index=parent.parent_index,
+                role=CHUNK_ROLE_PARENT,
+            )
+        )
+    for child in children:
+        chunks.append(
+            PaperChunk(
+                page_number=child.page_number,
+                chunk_index=len(chunks),
+                content=child.content,
+                parent_index=child.parent_index,
+                role=CHUNK_ROLE_CHILD,
+            )
+        )
+    if layout_stats is not None:
+        layout_stats.update(
+            {
+                "parent_retrieval_chunk_count": len(parents),
+                "child_retrieval_chunk_count": len(children),
+            }
+        )
+    return chunks, parents
 
 
 def extract_pdf_pages(path: Path) -> list[str]:
@@ -820,6 +873,13 @@ def build_pdf_chunk_layout(
             pages,
             chunk_size=chunk_size,
             overlap=overlap,
+        )
+    if strategy == CHUNK_STRATEGY_MULTI_GRANULARITY:
+        return build_multi_granularity_chunks(
+            pages,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            layout_stats=layout_stats,
         )
     if strategy in {
         CHUNK_STRATEGY_SEMANTIC_LOCAL,
@@ -957,7 +1017,11 @@ def parse_paper_pdf(
             and document["chunk_overlap"] == overlap
             and int(document["chunk_count"] or 0) > 0
             and (
-                strategy != CHUNK_STRATEGY_PARENT_CHILD
+                strategy
+                not in {
+                    CHUNK_STRATEGY_PARENT_CHILD,
+                    CHUNK_STRATEGY_MULTI_GRANULARITY,
+                }
                 or count_paper_parent_chunks(paper_id) > 0
             )
         ):
