@@ -7,7 +7,8 @@
         <th>来源</th>
         <th>出版商</th>
         <th>时间</th>
-        <th>状态</th>
+        <th>下载状态</th>
+        <th>问答准备</th>
         <th>下载日期</th>
         <th>链接</th>
       </tr>
@@ -24,13 +25,23 @@
         <td>{{ paper["publisher"] or "-" }}</td>
         <td>{{ paper["published"] or "-" }}</td>
         <td><span class="status status-{{ paper["status"] }}" data-download-status>{{ paper["status"] }}</span></td>
+        <td>
+          <span class="status status-{{ paper['preparation_status'] }}" data-preparation-status>{{ paper["preparation_status"] }}</span>
+        </td>
         <td data-downloaded-at>{{ paper["downloaded_at"] or "-" }}</td>
         <td>
           {% if paper["page_url"] %}<a href="{{ paper["page_url"] }}" target="_blank" rel="noreferrer">网页</a>{% endif %}
           {% if paper["pdf_url"] %}<a href="{{ paper["pdf_url"] }}" target="_blank" rel="noreferrer">PDF</a>{% endif %}
+          {% if paper["preparation_status"] in ["available", "download_failed", "awaiting_parse", "parse_failed", "awaiting_index", "index_failed"] %}
+            <form class="inline-form" action="/papers/{{ paper['id'] }}/prepare" method="post">
+              <button class="link-button" type="submit">{{ "重试准备" if "failed" in paper["preparation_status"] else "准备问答" }}</button>
+            </form>
+          {% elif paper["preparation_status"] == "ready" %}
+            <a href="/papers/{{ paper['id'] }}#paper-question">开始提问</a>
+          {% endif %}
           {% if paper["pdf_url"] and paper["status"] in ["available", "failed"] %}
             <form class="inline-form" action="/papers/{{ paper['id'] }}/download" method="post">
-              <button class="link-button" type="submit">{{ "重新下载" if paper["status"] == "failed" else "下载" }}</button>
+              <button class="link-button" type="submit">{{ "重新下载" if paper["status"] == "failed" else "仅下载" }}</button>
             </form>
           {% endif %}
         </td>

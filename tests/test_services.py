@@ -9,6 +9,7 @@ from my_agent_project import db
 from my_agent_project import evaluation_service
 from my_agent_project import generation_evaluation_service
 from my_agent_project import model_service
+from my_agent_project import paper_workflow
 from my_agent_project import pdf_service
 from my_agent_project import rag_service
 
@@ -774,7 +775,7 @@ def test_clear_history_removes_database_records_only(tmp_path, monkeypatch):
     assert local_pdf.exists()
 
 
-def test_available_paper_renders_manual_download_button():
+def test_available_paper_renders_preparation_and_manual_download_buttons():
     template_dir = Path(__file__).parents[1] / "my_agent_project" / "templates"
     template = Environment(loader=FileSystemLoader(template_dir)).get_template("table.html")
     html = template.render(
@@ -787,6 +788,7 @@ def test_available_paper_renders_manual_download_button():
                 "publisher": "arXiv",
                 "published": "2026-01-01",
                 "status": "available",
+                "preparation_status": "available",
                 "downloaded_at": None,
                 "page_url": "https://arxiv.org/abs/1",
                 "pdf_url": "https://arxiv.org/pdf/1.pdf",
@@ -795,8 +797,122 @@ def test_available_paper_renders_manual_download_button():
         ]
     )
 
+    assert 'action="/papers/1/prepare"' in html
+    assert ">准备问答</button>" in html
     assert 'action="/papers/1/download"' in html
-    assert ">下载</button>" in html
+    assert ">仅下载</button>" in html
+
+
+def test_prepare_paper_for_qa_chains_download_parse_and_index(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "metadata.db"
+    local_pdf = tmp_path / "paper.pdf"
+    local_pdf.write_bytes(b"pdf placeholder")
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    db.init_db()
+    paper_id = db.insert_papers("agent", [parse_arxiv_feed(ARXIV_XML)[0]])[0]
+    calls = []
+
+    def fake_download(target_id):
+        calls.append("download")
+        db.update_download_status(
+            target_id,
+            "downloaded",
+            local_path=str(local_pdf),
+        )
+
+    def fake_parse(target_id):
+        calls.append("parse")
+        db.replace_paper_chunks(
+            target_id,
+            [PaperChunk(1, 0, "A complete sentence for indexing.")],
+            page_count=1,
+        )
+
+    def fake_index(target_id):
+        calls.append("index")
+        db.update_index_status(target_id, "indexed", vectorizer="test-vectorizer")
+
+    monkeypatch.setattr(paper_workflow, "download_paper", fake_download)
+    monkeypatch.setattr(paper_workflow, "parse_paper_pdf", fake_parse)
+    monkeypatch.setattr(paper_workflow, "index_paper_chunks", fake_index)
+
+    status = paper_workflow.prepare_paper_for_qa(paper_id)
+
+    assert calls == ["download", "parse", "index"]
+    assert status == "ready"
+
+
+def test_prepare_paper_for_qa_stops_after_download_failure(tmp_path, monkeypatch):
+    database_path = tmp_path / "metadata.db"
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    db.init_db()
+    paper_id = db.insert_papers("agent", [parse_arxiv_feed(ARXIV_XML)[0]])[0]
+    later_calls = []
+
+    def fail_download(target_id):
+        db.update_download_status(target_id, "failed", error="network unavailable")
+
+    monkeypatch.setattr(paper_workflow, "download_paper", fail_download)
+    monkeypatch.setattr(
+        paper_workflow,
+        "parse_paper_pdf",
+        lambda _paper_id: later_calls.append("parse"),
+    )
+    monkeypatch.setattr(
+        paper_workflow,
+        "index_paper_chunks",
+        lambda _paper_id: later_calls.append("index"),
+    )
+
+    status = paper_workflow.prepare_paper_for_qa(paper_id)
+
+    assert status == "download_failed"
+    assert later_calls == []
+    assert db.get_paper(paper_id)["error"] == "network unavailable"
+
+
+def test_prepare_paper_for_qa_resumes_from_index_step(tmp_path, monkeypatch):
+    database_path = tmp_path / "metadata.db"
+    local_pdf = tmp_path / "paper.pdf"
+    local_pdf.write_bytes(b"pdf placeholder")
+    monkeypatch.setattr(db, "DATABASE_PATH", database_path)
+    db.init_db()
+    paper_id = db.insert_papers("agent", [parse_arxiv_feed(ARXIV_XML)[0]])[0]
+    db.update_download_status(
+        paper_id,
+        "downloaded",
+        local_path=str(local_pdf),
+    )
+    db.replace_paper_chunks(
+        paper_id,
+        [PaperChunk(1, 0, "Previously parsed content.")],
+        page_count=1,
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        paper_workflow,
+        "download_paper",
+        lambda _paper_id: calls.append("download"),
+    )
+    monkeypatch.setattr(
+        paper_workflow,
+        "parse_paper_pdf",
+        lambda _paper_id: calls.append("parse"),
+    )
+
+    def fake_index(target_id):
+        calls.append("index")
+        db.update_index_status(target_id, "indexed", vectorizer="test-vectorizer")
+
+    monkeypatch.setattr(paper_workflow, "index_paper_chunks", fake_index)
+
+    status = paper_workflow.prepare_paper_for_qa(paper_id)
+
+    assert calls == ["index"]
+    assert status == "ready"
 
 
 def test_local_tfidf_index_retrieves_relevant_page(tmp_path, monkeypatch):
@@ -1682,6 +1798,7 @@ def test_indexed_paper_renders_deepseek_question_form():
         rag_queries=[],
         deepseek_ready=True,
         access_notice="",
+        preparation_status="ready",
     )
 
     assert 'action="/papers/1/index"' in html
@@ -1689,6 +1806,7 @@ def test_indexed_paper_renders_deepseek_question_form():
     assert 'name="use_reranker"' in html
     assert "DeepSeek 重排" in html
     assert "DeepSeek 论文问答" in html
+    assert "准备完成" in html
 
 
 def test_evidence_coverage_tolerates_pdf_line_breaks():

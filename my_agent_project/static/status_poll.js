@@ -15,6 +15,10 @@ function updatePaperStatus(paper) {
   const row = document.querySelector(`[data-paper-row][data-paper-id="${paper.id}"]`);
   if (row) {
     updateStatusBadge(row.querySelector("[data-download-status]"), paper.status);
+    updateStatusBadge(
+      row.querySelector("[data-preparation-status]"),
+      paper.preparation_status,
+    );
     const dateCell = row.querySelector("[data-downloaded-at]");
     if (dateCell) dateCell.textContent = paper.downloaded_at || "-";
   }
@@ -26,6 +30,27 @@ function updatePaperStatus(paper) {
     const downloadedAt = document.querySelector(".detail [data-downloaded-at]");
     if (downloadedAt) downloadedAt.textContent = paper.downloaded_at || "尚未下载";
     if (previousStatus === "downloading" && paper.status !== "downloading") {
+      window.location.reload();
+    }
+  }
+
+  const preparationStatus = document.querySelector(
+    ".detail [data-preparation-status]",
+  );
+  if (preparationStatus && paper.preparation_status) {
+    const previousPreparationStatus = preparationStatus.textContent.trim();
+    updateStatusBadge(preparationStatus, paper.preparation_status);
+    const terminalStatuses = new Set([
+      "ready",
+      "download_failed",
+      "parse_failed",
+      "index_failed",
+      "link_only",
+    ]);
+    if (
+      previousPreparationStatus !== paper.preparation_status
+      && terminalStatuses.has(paper.preparation_status)
+    ) {
       window.location.reload();
     }
   }

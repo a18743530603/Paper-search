@@ -18,6 +18,34 @@
   <h2>摘要</h2>
   <p>{{ paper["summary"] or "暂无摘要。" }}</p>
 
+  <section class="document-section preparation-section">
+    <h2>论文问答准备</h2>
+    <p>
+      当前状态：
+      <span class="status status-{{ preparation_status }}" data-preparation-status>{{ preparation_status }}</span>
+    </p>
+    <ol class="workflow-steps">
+      <li>下载开放 PDF</li>
+      <li>解析正文与页码</li>
+      <li>建立 Seed + TF-IDF 检索索引</li>
+    </ol>
+    {% if preparation_status == "ready" %}
+      <p class="success-message">准备完成，可以在下方直接向论文提问。</p>
+      <a class="button" href="#paper-question">前往提问</a>
+    {% elif preparation_status in ["downloading", "parsing", "indexing"] %}
+      <p class="task-message">系统正在后台依次处理，页面会自动更新状态。</p>
+    {% elif preparation_status == "link_only" %}
+      <div class="access-notice">
+        <p>当前记录没有明确 PDF 直链，无法自动进入全文问答流程。</p>
+        <a class="button secondary" href="{{ paper['page_url'] }}" target="_blank" rel="noreferrer">前往论文网站</a>
+      </div>
+    {% else %}
+      <form action="/papers/{{ paper['id'] }}/prepare" method="post">
+        <button type="submit">{{ "从失败步骤重试" if "failed" in preparation_status else "准备论文问答" }}</button>
+      </form>
+    {% endif %}
+  </section>
+
   <section class="document-section">
     <h2>全文解析</h2>
     {% if paper["local_path"] %}
@@ -31,9 +59,13 @@
       {% if document and document["error"] %}
         <p class="alert">{{ document["error"] }}</p>
       {% endif %}
-      <form action="/papers/{{ paper["id"] }}/parse" method="post">
-        <button type="submit">{{ "重新解析 PDF" if document and document["parse_status"] == "parsed" else "解析 PDF" }}</button>
-      </form>
+      {% if not document or document["parse_status"] != "parsing" %}
+        <form action="/papers/{{ paper["id"] }}/parse" method="post">
+          <button type="submit">{{ "重新解析 PDF" if document and document["parse_status"] == "parsed" else "解析 PDF" }}</button>
+        </form>
+      {% else %}
+        <p class="task-message">PDF 正在解析，状态会自动更新。</p>
+      {% endif %}
     {% else %}
       <div class="access-notice">
         <strong>暂时无法进行全文问答</strong>
@@ -82,7 +114,7 @@
   {% endif %}
 
   {% if document and document["index_status"] == "indexed" %}
-    <section class="document-section rag-section">
+    <section class="document-section rag-section" id="paper-question">
       <h2>DeepSeek 论文问答</h2>
       <p class="section-note">系统先检索相关原文片段，再交给 DeepSeek 回答，并保留页码证据。</p>
       {% if deepseek_ready %}
@@ -148,7 +180,7 @@
 
   {% if paper["pdf_url"] and not paper["local_path"] and paper["status"] != "downloading" %}
     <form action="/papers/{{ paper["id"] }}/download" method="post">
-      <button type="submit">{{ "重新下载 PDF" if paper["status"] == "failed" else "下载 PDF" }}</button>
+      <button type="submit">{{ "重新下载 PDF" if paper["status"] == "failed" else "仅下载 PDF" }}</button>
     </form>
   {% elif paper["status"] == "downloading" %}
     <p class="task-message">PDF 正在后台下载，状态会自动更新。</p>

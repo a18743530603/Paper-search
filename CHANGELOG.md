@@ -2,6 +2,19 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.9.0` - 2026-08-03
+
+### 论文问答准备闭环
+
+- 新增 `paper_workflow.py`，使用 `prepare_paper_for_qa()` 依次调用已有 `download_paper()`、`parse_paper_pdf()` 和 `index_paper_chunks()`，没有复制下载、解析或索引逻辑。
+- 新增 `paper_preparation_status()`，基于现有 `papers` 与 `paper_documents` 推导 `available`、`downloading`、`parsing`、`indexing`、`ready` 及各阶段失败状态，不新增数据库表。
+- 新增 `mark_preparation_started()` 和 `POST /papers/{paper_id}/prepare`；用户明确点击后才加入 `BackgroundTasks`，搜索行为本身仍不会自动下载文件。
+- 工作流能够跳过已经下载、解析或索引完成的步骤；下载、解析或索引失败时立即停止，再次提交可从未完成阶段继续。
+- 搜索结果、历史页和论文详情页新增统一“问答准备”状态；保留“仅下载”以及原解析、索引按钮，方便单独使用和调试。
+- `GET /api/papers/statuses` 新增 `preparation_status`，`status_poll.js` 每2秒更新统一状态并在完成或失败时刷新详情。
+- 没有明确 PDF 直链的 Crossref 记录继续保持 `link_only`，不会进入全文处理流程；Seed失败时仍由原索引服务降级为TF-IDF。
+- 新增首次完整执行、下载失败停止和从索引阶段恢复三项回归测试；完整自动化测试为 `81 passed`，测试未调用真实外部API。
+
 ## `v0.8.3` - 2026-08-03
 
 ### M1独立泛化验证

@@ -1,6 +1,6 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.8.3`
+> 当前版本：`v0.9.0`
 >
 > 更新日期：`2026-08-03`
 >
@@ -52,6 +52,7 @@ https://github.com/a18743530603/Paper-search.git
 - `schemas.py`：定义 `PaperCandidate` 和 `available`、`downloading`、`downloaded`、`link_only`、`failed` 等状态。
 - `search_service.py`：检索并解析 arXiv XML 和 Crossref JSON，生成论文元数据和下载策略。
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常。
+- `paper_workflow.py`：将用户触发的下载、PDF解析和向量索引串成后台准备流程，按现有状态跳过已完成步骤并在失败阶段停止。
 - `db.py`：初始化和操作 SQLite，保存论文、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
 - `pdf_service.py`：使用 PDF 内容哈希复用页文本，支持固定边界与论文章节感知分块、章节层级继承、参考文献过滤和附录恢复，并在后台更新解析状态。
@@ -70,6 +71,7 @@ POST /search
 GET  /papers
 GET  /papers/{paper_id}
 POST /papers/{paper_id}/retry
+POST /papers/{paper_id}/prepare
 POST /papers/{paper_id}/parse
 POST /papers/{paper_id}/index
 POST /papers/{paper_id}/ask
@@ -520,13 +522,24 @@ git push
 - 本轮最重要的工程结论是：开发集点估计不能直接代表泛化；冻结数据、预注册门槛、配对区间和降级门禁共同防止了挑结果与错误降级污染。
 - GitHub README用策略总览区分正式链路与实验候选：默认采用固定边界 + Seed/TF-IDF，DeepSeek列表重排为已通过独立集验证的可选能力；M1只宣传开发集Hit@3提高、独立集Hit@5保持与覆盖率提高，不得省略其独立集Hit@3下降的限制。
 
+## v0.9.0 论文问答准备闭环
+
+- 新增 `paper_workflow.py`，只负责编排现有 `download_paper()`、`parse_paper_pdf()` 和 `index_paper_chunks()`，不得把三个模块的具体业务逻辑复制进工作流。
+- `paper_preparation_status()` 根据现有论文、解析和索引记录推导统一状态：`available`、`downloading`、`download_failed`、`awaiting_parse`、`parsing`、`parse_failed`、`awaiting_index`、`indexing`、`index_failed`、`ready` 和 `link_only`。
+- `mark_preparation_started()` 在后台任务入队前标记当前阶段，并拒绝重复运行中的请求；`prepare_paper_for_qa()` 跳过已经完成的下载或解析，只执行剩余步骤。
+- 新增 `POST /papers/{paper_id}/prepare`。只有用户点击“准备问答”才开始处理；普通搜索不会自动下载，原 `POST /download`、`POST /parse` 和 `POST /index` 继续保留。
+- 任一步失败后立即停止，错误继续由原阶段字段保存；再次点击“重试准备”会从当前数据库状态继续，不新建工作流表。
+- 搜索结果、历史页和详情页展示统一准备状态；`GET /api/papers/statuses` 返回 `preparation_status`，前端每2秒自动更新。
+- Crossref没有明确PDF直链时仍为`link_only`；Seed不可用时继续复用原索引服务的TF-IDF降级，不把降级逻辑放进编排层。
+- 新增首次完整执行、下载失败停止和从索引阶段恢复3项测试；完整自动化测试为`81 passed`，没有调用真实外部API。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为 `v0.8.3`：M1已完成`heldout_v2`一次性独立验证并因Hit@3下降5个百分点未通过主门槛；默认策略仍为固定边界，完整自动化测试为`78 passed`。
+- 当前版本为 `v0.9.0`：现有下载、解析和索引已连接成用户触发、可失败停止和断点续跑的问答准备闭环；默认检索策略仍为固定边界，完整自动化测试为`81 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。

@@ -1,6 +1,6 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.8.3`
+> 当前版本：`v0.9.0`
 >
 > 更新日期：`2026-08-03`
 >
@@ -9,6 +9,8 @@
 > 实验过程：见 [EXPERIMENTS.md](EXPERIMENTS.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在后台下载到本地。
+
+`v0.9.0` 把原有下载、PDF解析和向量索引连接成用户触发的论文问答准备工作流。用户点击一次“准备问答”后，后台按当前状态依次执行缺失步骤，失败时停在对应阶段，再次点击可从失败位置继续；普通搜索、仅下载和单步调试入口继续保留。
 
 `v0.8.2` 新增论文多粒度父子融合候选策略：固定父块和完整句子子块使用同一套缓存分别召回，再按共同父块做RRF融合。开发集在保持 `Hit@5=88.33%` 的同时，将 `Hit@3` 从 `66.67%` 提高到 `76.67%`。
 
@@ -106,9 +108,9 @@ uv run pytest
 1. 打开首页。
 2. 输入关键词或论文标题，例如 `multimodal agent`。
 3. 提交搜索后，页面先显示已经获得的论文元数据。
-4. 可下载论文会进入后台下载任务。
-5. 打开“历史记录”页面并刷新，查看状态变化。
-6. 点击论文进入详情页，查看 DOI、原始网页、PDF 地址、本地路径和错误信息。
+4. 对需要阅读的论文点击“准备问答”，系统在后台依次完成下载、解析和索引。
+5. 页面每 2 秒自动更新 `downloading`、`parsing`、`indexing` 和 `ready` 状态。
+6. 状态变为 `ready` 后进入详情页提问；也可以使用“仅下载”保留原来的单步流程。
 
 下载状态说明：
 
@@ -160,6 +162,7 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- schemas.py
 |   |-- search_service.py
 |   |-- download_service.py
+|   |-- paper_workflow.py
 |   |-- db.py
 |   |-- model_service.py
 |   |-- pdf_service.py
@@ -170,7 +173,7 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   `-- static/
 |-- tests/
 |-- benchmarks/
-|   `-- chunking_baseline.csv # 15 条人工标注检索案例
+|   `-- chunking_baseline.csv # 60 条人工标注检索案例
 |-- downloads/              # 运行时生成，不提交到 Git
 |-- AGENTS.md                # 项目背景和后续对话记忆
 |-- ORIGIN.md                # Origin 绘图说明
@@ -195,6 +198,7 @@ GET  /papers
 GET  /papers/{paper_id}
 POST /papers/{paper_id}/retry
 POST /papers/{paper_id}/download
+POST /papers/{paper_id}/prepare
 POST /papers/{paper_id}/parse
 POST /papers/{paper_id}/index
 POST /papers/{paper_id}/ask
@@ -232,6 +236,16 @@ GET  /evaluation/runs/{run_id}
 ```python
 re.sub(r'[\\/*?:"<>|]', "_", title)
 ```
+
+### `paper_workflow.py`
+
+负责把已有下载、PDF解析和向量索引服务编排成一次用户触发的准备流程，不复制各模块内部实现：
+
+- `paper_preparation_status()`：根据论文、解析和索引记录推导统一准备状态。
+- `mark_preparation_started()`：在加入后台任务前锁定当前阶段，避免用户重复提交。
+- `prepare_paper_for_qa()`：从尚未完成的步骤继续执行；下载、解析或索引任一步失败时立即停止。
+- 已下载论文跳过下载，已解析论文跳过解析，已完成索引直接返回 `ready`。
+- 没有明确 PDF 直链的 Crossref 记录保持 `link_only`，不会进入自动处理流程。
 
 ### `db.py`
 
@@ -383,8 +397,10 @@ SEED_TIMEOUT=120
 ## RAG 问答流程
 
 ```text
-已下载 PDF
-  -> 解析 PDF
+用户点击“准备问答”
+  -> paper_workflow.prepare_paper_for_qa()
+  -> 下载开放 PDF（已下载则跳过）
+  -> 解析 PDF（已解析则跳过）
   -> Seed1.6 Doubao-embedding-vision 生成稠密语义向量
   -> 本地 TF-IDF 生成关键词向量
   -> 用户提交问题
@@ -399,7 +415,7 @@ SEED_TIMEOUT=120
 
 ## 状态自动刷新与历史清理
 
-- `GET /api/papers/statuses` 返回轻量状态数据，包括下载状态、下载日期、解析状态、页数、文本块数量和错误。
+- `GET /api/papers/statuses` 返回轻量状态数据，包括下载、解析、索引、问答准备状态、下载日期、页数、文本块数量和错误。
 - `status_poll.js` 每 2 秒查询一次状态接口，只更新页面上的状态和日期。
 - 下载或解析任务结束时，详情页会自动重载一次，以显示本地路径、解析按钮或文本块。
 - `downloaded_at` 记录实际下载成功时间；旧的已下载记录使用原 `updated_at` 近似补全。
@@ -415,12 +431,15 @@ SEED_TIMEOUT=120
   -> model_service.enhance_query() 保持确定性搜索词
   -> search_service.search_all() 检索 arXiv 和 Crossref
   -> db.insert_papers() 写入 SQLite
-  -> 页面立即返回检索结果并显示下载按钮
-  -> 用户点击 POST /papers/{paper_id}/download
-  -> main.py 将该论文加入 BackgroundTasks
-  -> download_service.download_paper() 在后台下载 PDF
-  -> db.update_download_status() 更新状态
-  -> 用户在 GET /papers 查看历史和进度
+  -> 页面立即返回检索结果并显示“准备问答”和“仅下载”
+  -> 用户点击 POST /papers/{paper_id}/prepare
+  -> main.py 将准备流程加入 BackgroundTasks
+  -> paper_workflow.prepare_paper_for_qa() 判断当前断点
+  -> download_service.download_paper() 下载开放 PDF
+  -> pdf_service.parse_paper_pdf() 提取页码和文本块
+  -> rag_service.index_paper_chunks() 建立 Seed + TF-IDF 索引
+  -> GET /api/papers/statuses 每 2 秒返回统一准备状态
+  -> ready 后用户在详情页提问并获得带页码证据的回答
 ```
 
 ## 为什么使用后台任务

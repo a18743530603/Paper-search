@@ -434,6 +434,8 @@ def list_paper_statuses(limit: int = 1000) -> list[dict]:
             """
             SELECT
                 p.id,
+                p.source,
+                p.pdf_url,
                 p.status,
                 p.local_path,
                 p.error,

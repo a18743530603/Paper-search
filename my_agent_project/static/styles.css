@@ -279,19 +279,23 @@ th {
 }
 
 .status-indexed,
-.status-answered {
+.status-answered,
+.status-ready {
   background: #e6f4ec;
   color: var(--good);
 }
 
 .status-indexing,
-.status-answering {
+.status-answering,
+.status-parsing {
   background: #fff3df;
   color: var(--warn);
 }
 
 .status-index_failed,
-.status-answer_failed {
+.status-answer_failed,
+.status-download_failed,
+.status-parse_failed {
   background: #fdeaea;
   color: var(--bad);
 }
@@ -346,6 +350,27 @@ th {
 
 .question-form {
   max-width: 760px;
+}
+
+.workflow-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+  padding: 0;
+  list-style-position: inside;
+}
+
+.workflow-steps li {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.success-message {
+  color: var(--good);
+  font-weight: 700;
 }
 
 .question-actions {
@@ -696,5 +721,9 @@ dd {
 
   .metric-item {
     border-bottom: 1px solid var(--line);
+  }
+
+  .workflow-steps {
+    grid-template-columns: 1fr;
   }
 }

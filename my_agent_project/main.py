@@ -48,6 +48,13 @@ from .generation_evaluation_service import (
 )
 from .origin_service import create_origin_outputs
 from .pdf_service import parse_paper_pdf
+from .paper_workflow import (
+    PREPARATION_READY,
+    get_paper_preparation_status,
+    mark_preparation_started,
+    paper_preparation_status,
+    prepare_paper_for_qa,
+)
 from .rag_service import (
     RERANKER_DEEPSEEK_LISTWISE,
     RERANKER_NONE,
@@ -66,8 +73,18 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.8.3")
+app = FastAPI(title="Paper Hunter", version="0.9.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+
+
+def paper_view(paper):
+    item = dict(paper)
+    document = get_document(int(item["id"]))
+    item["preparation_status"] = paper_preparation_status(
+        item,
+        dict(document) if document else None,
+    )
+    return item
 
 
 @app.get("/")
@@ -109,7 +126,7 @@ def search(
         {
             "query": query,
             "enhanced_query": enhanced_query,
-            "papers": [paper for paper in papers if paper is not None],
+            "papers": [paper_view(paper) for paper in papers if paper is not None],
         },
     )
 
@@ -119,7 +136,7 @@ def papers(request: Request):
     return templates.TemplateResponse(
         request,
         "papers.html",
-        {"papers": list_papers()},
+        {"papers": [paper_view(paper) for paper in list_papers()]},
     )
 
 
@@ -131,7 +148,10 @@ def clear_history():
 
 @app.get("/api/papers/statuses")
 def paper_statuses():
-    return {"papers": list_paper_statuses()}
+    papers = list_paper_statuses()
+    for paper in papers:
+        paper["preparation_status"] = paper_preparation_status(paper, paper)
+    return {"papers": papers}
 
 
 @app.get("/papers/{paper_id}")
@@ -152,8 +172,23 @@ def paper_detail(request: Request, paper_id: int):
             "rag_queries": rag_queries,
             "deepseek_ready": is_deepseek_configured(),
             "access_notice": build_access_notice(dict(paper)),
+            "preparation_status": get_paper_preparation_status(paper_id),
         },
     )
+
+
+@app.post("/papers/{paper_id}/prepare")
+def prepare_paper(paper_id: int, background_tasks: BackgroundTasks):
+    paper = get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    try:
+        status = mark_preparation_started(paper_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if status != PREPARATION_READY:
+        background_tasks.add_task(prepare_paper_for_qa, paper_id)
+    return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/parse")
