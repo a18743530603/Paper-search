@@ -13,5 +13,27 @@
   </div>
   <a class="button secondary" href="/papers">查看历史进度</a>
 </section>
+{% if research_plan %}
+  <section class="research-plan" aria-labelledby="research-plan-title">
+    <div class="research-plan-head">
+      <div>
+        <p class="eyebrow">LangGraph Research Plan</p>
+        <h2 id="research-plan-title">{{ research_plan["goal"] }}</h2>
+      </div>
+      <span class="status status-{{ research_plan['status'] }}">{{ research_plan["status"] }}</span>
+    </div>
+    <ol>
+      {% for item in research_plan["queries"] %}
+        <li>{{ item }}</li>
+      {% endfor %}
+    </ol>
+    {% if research_plan["rationale"] %}<p>{{ research_plan["rationale"] }}</p>{% endif %}
+    {% if research_plan["error"] %}
+      <p class="alert">规划不可用，已降级为普通检索：{{ research_plan["error"] }}</p>
+    {% elif research_plan["model"] %}
+      <p class="plan-meta">规划模型：{{ research_plan["model"] }}</p>
+    {% endif %}
+  </section>
+{% endif %}
 {% include "table.html" %}
 {% endblock %}

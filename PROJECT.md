@@ -1,8 +1,8 @@
 # Paper Hunter 项目概述
 
-> 当前版本：`v0.9.0`
+> 当前版本：`v0.10.1`
 >
-> 更新日期：`2026-08-03`
+> 更新日期：`2026-08-06`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 
@@ -18,6 +18,7 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - arXiv 论文优先显示可下载状态，由用户点击按钮后下载。
 - Crossref 只有在提供明确的 `.pdf` 绝对直链时才下载，否则标记为 `link_only`。
 - 下载失败只影响当前论文，并记录为 `failed` 及具体错误原因。
+- 下载任务使用`claim_download()`执行原子状态抢占：普通下载只允许`available → downloading`，重试允许`failed → downloading`；数据库未更新记录时不创建第二个后台任务。
 - 自动清洗 Windows/Linux 文件名非法字符并处理重名。
 - 强制使用 UTF-8 标准输出，降低 Windows 中文路径和日志乱码风险。
 - 可选接入 Agent/大模型能力；没有 API Key 时仍可正常运行。
@@ -25,6 +26,18 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - 支持后台解析已下载 PDF，按页切分正文并保存文本块。
 - 建立受约束的 RAG Prompt：只有取得全文证据时才能回答论文内容；没有全文时提示合法访问方式并提供论文链接。
 - 使用 `paper_workflow.py` 将用户确认后的下载、PDF解析和向量索引串成后台准备流程，支持失败停止、断点续跑和统一状态展示。
+- 使用LangGraph编排研究检索：DeepSeek生成结构化多查询计划，图先停在人工确认分支；确认后后台搜索节点继续调用现有arXiv/Crossref服务并确定性去重。
+- 使用`research_tasks`持久化研究计划、执行状态、错误和结果论文ID；任务支持取消、失败隔离、自动刷新及应用重启后的待确认恢复。
+- 检索完成后进入第二个人工审批点：用户只能从任务候选中选择1至5篇论文，冻结后续全文准备和综合报告的输入集合，不自动下载或消耗Embedding额度。
+- 使用官方`langgraph-checkpoint-sqlite`：独立`SqliteSaver`保存图检查点，业务任务保存稳定`thread_id`；两个审批点使用动态`interrupt()`，恢复统一使用`Command(resume=...)`。
+- 使用LangChain `StructuredTool`封装论文检索，白名单注册表限制可执行能力；`research_tool_calls`记录参数、来源结果、状态、错误和耗时，支持页面与API审计。
+- 论文选择后由用户显式启动跨论文报告：标准工具复用现有准备与RAG服务，逐篇返回物理页码证据；受限论文只保留合法链接，单篇失败不影响其余论文。
+- 使用`research_reports`保存报告状态、证据、访问限制、模型和错误；只有存在全文证据时才调用DeepSeek，全部无证据时确定性拒答。
+- A4将报告确认、逐篇准备、逐篇证据检索、生成和引用检查纳入同一LangGraph线程；每篇论文形成检查点，重启或模型失败后从未完成节点继续。
+- A5-0/A5-1新增多论文Context Packer：保留原始证据，按6000估算Token预算和每篇最多2条的公平配额选择模型上下文，并持久化压缩率、论文覆盖和删除原因。
+- A5-2在公平分配前执行同论文保守去重：规范化精确重复直接合并，同页或相邻页且5-token shingle覆盖率不低于`0.85`的高重叠证据合并；跨论文内容始终保留，删除记录可审计。
+- A5-3把自由文本Prompt替换为`research-context-json-v1`不可信数据载荷，证据稳定编号并保留来源元数据；系统指令明确拒绝执行证据中的命令式文本。
+- A5-4新增`context-quality-gate-v1`，在模型调用前校验证据字段、物理页码、Token预算、计数和论文配额；失败时确定性拒答并把结果写入检查点、报告、API和页面。
 
 ## 当前 RAG 建设进度
 
@@ -53,6 +66,12 @@ H2-R 使用8篇未参与开发的论文和40道冻结问题完成外部复核：
 当前正式推荐链路为“固定边界高召回 + Seed/TF-IDF混合检索 + 可选DeepSeek列表重排”。M1多粒度融合同时检索父块与完整句子子块，在开发集提高Hit@3，并在新独立集保持Hit@5、提高覆盖率，但因独立集Hit@3下降而只保留为实验策略。项目展示重点是可复现的指标取舍和端到端质量验证，不声称存在对所有论文都最优的单一分块方式。
 
 `v0.9.0` 完成产品主链路编排：搜索结果中的“准备问答”由用户明确触发，后台按 `download → parse → index` 顺序调用原有服务；已完成步骤自动跳过，任一步失败只保留该阶段错误并停止，用户可再次提交从断点继续。该流程不新增业务数据表，统一状态由现有 `papers` 和 `paper_documents` 推导。
+
+`v0.10.0` 完成可人工干预并可原生恢复的LangGraph研究闭环：`ResearchSearchState`连接规划、计划确认、多查询/单查询、结果去重、论文选择、报告确认、逐篇准备、逐篇证据检索、报告生成和引用检查。三个审批点使用`interrupt()`，生产图由`SqliteSaver`编译，`checkpoint_thread_id`关联业务任务与图状态；同一`thread_id`通过`Command(resume=...)`从暂停或失败节点继续。业务SQLite负责任务、工具与报告审计，Checkpointer负责图执行位置。
+
+报告生成前由`context_service.pack_research_context()`执行`fair_budget_v1`：先在每篇论文内部保留高分证据并去除精确重复与相邻页高重叠文本，再跨论文按轮次分配，先提高论文覆盖再补充第二条证据。`context_stats`区分原始、去重后和最终证据，并记录`duplicate_of`审计关系。当前Token数为语言无关的保守估算；去重是确定性文本规则，不是Embedding语义去重。
+
+最终上下文通过`context-quality-gate-v1`后，才由`build_research_context_payload()`序列化为不可信JSON并交给DeepSeek。门禁状态为`passed/warning/failed`，只有存在合法证据、预算未超限且计数一致时`model_call_allowed=true`。A1-A5单Agent LangGraph闭环已经完成；MCP、长期记忆和多Agent不在本阶段范围内。
 
 ## 分块评测与参数实验
 

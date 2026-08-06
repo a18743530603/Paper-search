@@ -1,14 +1,30 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.9.0`
+> 当前版本：`v0.10.1`
 >
-> 更新日期：`2026-08-03`
+> 更新日期：`2026-08-06`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
 > 实验过程：见 [EXPERIMENTS.md](EXPERIMENTS.md)
 
-Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在后台下载到本地。
+Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+
+`v0.10.1` 为用户触发的PDF下载增加数据库原子抢占。普通下载只能用一条条件`UPDATE`把`available`改成`downloading`，失败重试只能从`failed`进入；只有实际更新一行的请求才会创建`BackgroundTasks`。因此快速双击、两个页面同时提交或“仅下载”和“准备问答”同时提交时，不会为同一篇论文重复启动下载。该规则直接使用SQLite事务和受影响行数，以后迁移MySQL仍可保留。
+
+`v0.10.0` 在原搜索表单中加入LangGraph“智能研究”模式。DeepSeek先返回2至4条结构化学术检索词，生产图使用`SqliteSaver + thread_id + interrupt() + Command(resume=...)`在计划确认处原生暂停；确认后才调用现有arXiv/Crossref工具。检索完成后图在论文选择处第二次暂停，用户只能从当前任务候选中冻结1至5篇，系统不会自动下载。检查点保存在独立SQLite文件中，应用重启后使用同一`thread_id`恢复，不重新规划或重复已完成节点。
+
+A2把检索能力封装为LangChain标准`StructuredTool`：工具注册表只开放`search_literature`，参数Schema限制查询词与结果数量，输出统一包含候选论文、来源计数、状态、错误和耗时。LangGraph保存调用摘要，后台在第二次中断后将其写入`research_tool_calls`，任务详情与状态API均可回放工具轨迹。
+
+A3把第二次人工选择后的论文接入原有RAG链路。用户点击“生成研究报告”后，后台依次调用标准论文准备工具和证据检索工具；可取得全文的论文按物理页返回Top-3证据，无法下载或需要购买的论文只记录合法访问链接和限制说明。只有至少存在一条证据时才调用DeepSeek生成跨论文报告；没有证据时由代码直接拒答，不消耗生成Token。单篇准备或检索失败只影响当前论文，其余论文继续处理。
+
+A4把A3报告阶段纳入同一个LangGraph检查点线程。论文选择完成后，图停在第三个`interrupt()`等待用户点击；恢复后按论文逐个执行准备节点和证据检索节点，每完成一篇就由`SqliteSaver`保存索引位置、证据和工具摘要。DeepSeek生成失败或应用重启后可从未完成节点继续，不重复已完成论文；报告完成后图停在“重新生成”中断点。代码还会校验报告中的`[论文标题, p. 页码]`是否来自已召回证据，该检查不调用第二个大模型。
+
+A5-0/A5-1新增确定性的多论文Context Packer。系统保留全部原始召回证据用于审计，但DeepSeek默认只接收`fair_budget_v1`选出的上下文：总预算6000估算Token、每篇至少目标1条且最多2条，先轮询覆盖不同论文，再分配第二轮证据。报告保存压缩前后证据数、字符数、估算Token、论文覆盖、最低配额是否满足及每条删除原因；该过程不增加模型调用。
+
+A5-2在预算分配前增加保守证据去重：同一篇论文中的规范化精确重复直接合并；只有同页或相邻页、文本重叠率至少`0.85`的较长证据才按高重叠重复处理，并保留检索分数更高的一条。不同论文绝不互相去重，每次删除都记录原因、重叠率和保留块引用。它是确定性的文本重叠规则，不是Embedding语义去重，也不增加外部API调用。
+
+A5-3/A5-4完成结构化上下文和质量门禁。模型不再接收自由拼接文本，而是接收`research-context-json-v1`不可信JSON；系统Prompt禁止执行问题、标题、正文、访问原因或URL中的命令。证据进入模型前还要通过`context-quality-gate-v1`字段、页码、预算和计数检查，门禁失败时由代码拒答且不调用DeepSeek。门禁状态随LangGraph检查点持久化并展示在页面和API中。
 
 `v0.9.0` 把原有下载、PDF解析和向量索引连接成用户触发的论文问答准备工作流。用户点击一次“准备问答”后，后台按当前状态依次执行缺失步骤，失败时停在对应阶段，再次点击可从失败位置继续；普通搜索、仅下载和单步调试入口继续保留。
 
@@ -45,6 +61,13 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 ## 主要功能
 
 - 通过网页输入关键词或论文标题。
+- 可选择LangGraph“智能研究”模式，将研究问题拆成多条检索词，保存任务并由用户确认后执行；DeepSeek不可用或计划无效时保存单查询降级计划。
+- 多路检索完成后由用户从候选结果中选择最多5篇论文，冻结后续解析和跨论文研究的输入范围。
+- 使用LangGraph原生SQLite Checkpointer保存图状态；两个审批点均由`interrupt()`暂停并通过`Command(resume=...)`恢复。
+- 用户确认论文集合后可显式启动跨论文报告；系统复用下载、解析、索引和RAG检索服务，输出带论文标题与物理页码的证据报告。
+- 报告准备、逐篇检索、生成和引用检查均属于同一LangGraph线程；应用重启后可从最后一个检查点继续。
+- 生成报告前使用跨论文公平配额和总Token预算整理上下文，原始证据与最终模型上下文分别保存，便于审计。
+- 全文受限论文不会被模型猜测内容，而是显示购买或机构订阅说明及合法访问链接；全部论文均无证据时不会调用DeepSeek。
 - 同时检索 arXiv 和 Crossref。
 - 保存标题、作者、摘要、发表时间、来源、出版商、DOI、网页 URL 和 PDF URL。
 - 将论文元数据和下载状态保存到 SQLite。
@@ -112,6 +135,14 @@ uv run pytest
 5. 页面每 2 秒自动更新 `downloading`、`parsing`、`indexing` 和 `ready` 状态。
 6. 状态变为 `ready` 后进入详情页提问；也可以使用“仅下载”保留原来的单步流程。
 
+智能研究模式的完整流程：
+
+1. 在首页选择“智能研究”，输入一个研究问题。
+2. 查看DeepSeek生成的2至4条检索计划，确认后才执行arXiv/Crossref检索。
+3. 从本次任务的候选论文中选择1至5篇，保存为后续报告的冻结输入。
+4. 点击“生成研究报告”，后台准备可下载全文并检索每篇论文的页码证据。
+5. 页面自动刷新报告状态；完成后显示综合结论、证据数量、未验证论文及其合法访问链接。
+
 下载状态说明：
 
 - `downloading`：已经进入后台下载任务。
@@ -163,6 +194,12 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- search_service.py
 |   |-- download_service.py
 |   |-- paper_workflow.py
+|   |-- context_service.py
+|   |-- research_agent.py
+|   |-- research_checkpoint.py
+|   |-- research_tools.py
+|   |-- research_workflow.py
+|   |-- research_report_service.py
 |   |-- db.py
 |   |-- model_service.py
 |   |-- pdf_service.py
@@ -194,6 +231,13 @@ FastAPI 应用入口，负责注册路由、接收搜索表单、调用检索服
 ```text
 GET  /
 POST /search
+GET  /research-tasks
+GET  /research-tasks/{task_id}
+POST /research-tasks/{task_id}/confirm
+POST /research-tasks/{task_id}/cancel
+POST /research-tasks/{task_id}/select
+POST /research-tasks/{task_id}/report
+GET  /api/research-tasks/{task_id}
 GET  /papers
 GET  /papers/{paper_id}
 POST /papers/{paper_id}/retry
@@ -247,9 +291,98 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 - 已下载论文跳过下载，已解析论文跳过解析，已完成索引直接返回 `ready`。
 - 没有明确 PDF 直链的 Crossref 记录保持 `link_only`，不会进入自动处理流程。
 
+### `context_service.py`
+
+负责在报告生成前构造受预算约束的多论文上下文：
+
+- `ContextConfig`：默认`max_estimated_tokens=6000`、`min_chunks_per_paper=1`、`max_chunks_per_paper=2`。
+- `estimate_text_tokens()`：中文字符按1个Token、其他非空白字符约4个折算1个Token；这是可复现估算，不冒充DeepSeek官方Tokenizer。
+- `normalize_evidence_text()`：使用NFKC、大小写折叠和空白归一化，为精确重复判断生成稳定文本。
+- `evidence_overlap_ratio()`：使用5-token shingle containment计算文本覆盖率；证据过短时不触发高重叠去重。
+- `deduplicate_paper_evidence()`：同一论文内保留高分候选；精确重复不限页距，高重叠重复只比较同页或相邻页，阈值为`0.85`。
+- `pack_research_context()`：先按论文独立去重，再按轮次跨论文选择证据，防止第一篇论文占满上下文。
+- `evidence_validation_errors()`：在去重和预算分配前拒绝缺少论文ID、块ID、标题、正物理页码或正文的证据。
+- 输出同时包含最终`context_evidence`和`context_stats`；未选证据记录`exact_duplicate`、`overlap_duplicate`、`token_budget`或`paper_quota`原因。
+- 重复审计包含`overlap_ratio`和`duplicate_of`，可以定位被删除块及其对应的保留块；不同论文永远不会互相去重。
+- `quality_gate`记录`passed/warning/failed`、五项检查、接受/拒绝数量和`model_call_allowed`；失败时不得调用模型。
+- 极小预算无法满足每篇最低配额时不偷偷突破上限，而是将`minimum_quota_satisfied`设为`false`并列出论文。
+
+### `research_agent.py`
+
+负责LangGraph研究检索编排，不复制现有搜索实现：
+
+- `ResearchSearchState`：保存研究问题、结构化计划、人工确认标记、候选/已选论文、工作流状态和错误。
+- `plan_research()`：调用DeepSeek JSON接口生成2至4条学术检索词，并校验数量、长度和重复项。
+- `route_after_plan()`：未确认时进入`await_confirmation`；确认后再根据规划状态进入多查询或单查询降级节点。
+- `plan_research_search()`：只生成计划并在检索前结束，不调用arXiv/Crossref。
+- `run_confirmed_research_search()`：复用数据库中的已确认计划继续执行，不重复调用DeepSeek。
+- `multi_query_search()` / `single_query_search()`：只通过白名单工具注册表调用`search_literature`，模型不能直接下载论文或绕过原下载策略。
+- `deduplicate_results()`：按DOI、网页URL和规范化标题合并重复结果，执行用户指定的结果上限，并把图状态推进到`awaiting_selection`。
+- `request_plan_confirmation()`与`request_paper_selection()`：只构造JSON可序列化审批载荷并调用`interrupt()`，中断前不执行非幂等副作用。
+- `request_report_confirmation()`：第三个人工审批点；选完论文不会立即下载，只有点击生成报告后才恢复图。
+- `prepare_report_paper_node()`与`retrieve_report_evidence_node()`：使用自循环节点逐篇推进，每篇完成后形成独立SQLite检查点。
+- `begin_report_generation()`、`synthesize_research_report()`与`validate_report_citations_node()`：先暴露生成状态，再调用DeepSeek，最后执行零Token的引用来源校验。
+- `begin_report_generation()`会先调用`pack_research_context()`；后续生成和引用检查只使用模型实际看到的`report_context_evidence`。
+- `request_report_regeneration()`：报告完成后继续保留可恢复中断，使重新生成仍使用同一`thread_id`。
+- `build_checkpointed_research_graph()`：编译生产图并注入SQLite Checkpointer；原直接运行入口只保留给兼容和单元测试。
+
+### `research_tools.py`
+
+负责把已有搜索、论文准备和RAG检索能力封装为标准Agent Tool，不复制底层实现：
+
+- `search_literature`：LangChain `StructuredTool`，自动暴露`query`和`max_results`参数Schema。
+- `prepare_paper_for_research`：接收论文ID，复用`prepare_paper_for_qa()`完成用户已批准论文的下载、解析和索引。
+- `retrieve_paper_evidence`：接收论文ID、研究问题和Top-K，复用`retrieve_relevant_chunks()`返回物理页码证据。
+- 工具输出包含标准化候选、`succeeded/partial/failed`、各来源结果数、错误摘要与毫秒耗时。
+- `RESEARCH_TOOL_REGISTRY`：工具白名单；未知工具名由`invoke_research_tool()`直接拒绝。
+- 工具参数由Schema约束，报告编排只能调用白名单能力；DeepSeek不直接控制下载、数据库写入或版权判断。
+
+### `research_checkpoint.py`
+
+负责LangGraph原生持久化和恢复：
+
+- `get_checkpointed_research_graph()`：以`check_same_thread=False`创建线程安全的`SqliteSaver`并延迟编译生产图。
+- `start_checkpointed_research()`：使用新的稳定`thread_id`启动图并暂停在计划确认。
+- `resume_plan_confirmation()`：通过`Command(resume=...)`恢复同一线程，继续搜索并暂停在论文选择。
+- `update_checkpoint_candidate_ids()`：把业务数据库生成的候选论文ID同步回暂停状态，供第二次恢复校验。
+- `resume_paper_selection()`：恢复第二个中断并结束当前研究检索图。
+- `stream_checkpointed_research_report()`：恢复第三个中断或未完成报告节点，并逐次返回已经持久化的完整图状态。
+- `research_checkpoint_info()`：返回检查点ID、待执行节点和工作流状态，供状态接口审计。
+
+### `research_workflow.py`
+
+负责后台执行已经人工确认的研究任务：
+
+- `execute_research_task()`读取SQLite中冻结的计划并调用`run_confirmed_research_search()`。
+- 检索成功后复用`insert_papers()`归档论文，用`replace_research_tool_calls()`幂等保存工具轨迹，并把论文ID写回研究任务。
+- 任意异常只将当前任务标记为`failed`并保存错误，不影响其他任务或普通检索。
+- `execute_research_report()`识别当前检查点位置，逐节点同步报告状态、证据、工具摘要和完成数量；没有A4检查点的旧任务继续调用A3兼容入口。
+
+### `research_report_service.py`
+
+负责把已冻结论文集合连接到原有问答准备和RAG服务：
+
+- `generate_research_report()`：按论文执行`prepare_paper_for_research → retrieve_paper_evidence`，汇总证据和访问限制，再调用DeepSeek生成报告。
+- `build_research_context_payload()`：为问题、证据和访问限制生成`research-context-json-v1`，证据使用`E1...En`编号并保留来源元数据。
+- `build_research_report_prompt()`：把载荷放入明确的不可信JSON数据区；系统Prompt只允许把字段作为研究数据读取，禁止执行正文中的命令式文本，并要求每个事实使用`[论文标题, p. 页码]`引用。
+- `build_no_evidence_report()`：全部论文均无全文证据时由代码生成明确拒答和访问说明，不调用大模型。
+- `build_context_gate_failure_report()`：存在输入证据但未通过质量门禁时生成可解释拒答，不消耗生成Token。
+- `validate_research_report_citations()`：用正则和证据集合校验引用标题、物理页码及无效引用；它只检查引用来源结构，不冒充事实语义裁判。
+- 每篇论文具有独立异常边界；一篇下载、解析、索引或检索失败不会中断其余论文。
+
 ### `db.py`
 
-负责 SQLite 的全部数据读写，包括初始化表、插入检索结果、查询历史与详情、更新下载状态、缓存 PDF 页文本与 Seed 向量，以及导出 CSV/JSON。
+负责 SQLite 的全部数据读写，包括初始化表、持久化研究任务、插入检索结果、查询历史与详情、更新下载状态、缓存 PDF 页文本与 Seed 向量，以及导出 CSV/JSON。
+
+`research_tasks`保存研究问题、结果上限、计划目标、查询列表、规划模型、规划/执行错误、`checkpoint_thread_id`、业务任务状态、候选论文ID、已选论文ID和各阶段时间。业务表用于列表与审计，LangGraph执行位置由独立Checkpointer负责。
+
+`research_tool_calls`按任务和调用序号保存工具名称、JSON输入、执行状态、结果数、来源分布、错误与耗时；同一任务恢复时整体替换，避免重复审计记录。
+
+`research_reports`按研究任务保存`preparing → retrieving → generating → completed/failed`状态、报告正文、模型、证据摘要、访问限制、工具调用摘要和阶段时间。`start_research_report()`使用事务锁防止重复提交。
+
+`details_json.evidence`保存完整原始召回，`details_json.context_evidence`保存真正发送给DeepSeek的证据，`details_json.context_stats`保存`fair_budget_v1`配置、压缩率、论文覆盖和删除审计，`details_json.context_quality`保存质量门禁结果。
+
+应用启动时会把中断的报告标记为可重试`failed`，并将遗留的`downloading/parsing/indexing`阶段恢复成可继续状态；再次点击后由LangGraph检查点决定真正需要执行的下一个节点。
 
 主要字段包括：
 
@@ -425,13 +558,30 @@ SEED_TIMEOUT=120
 ## 完整工作流程
 
 ```text
-浏览器输入关键词
+浏览器输入关键词或研究问题
   -> POST /search
   -> main.py 接收表单
-  -> model_service.enhance_query() 保持确定性搜索词
-  -> search_service.search_all() 检索 arXiv 和 Crossref
+  -> 普通检索：model_service.enhance_query() 保持确定性搜索词
+  -> 智能研究：为任务生成稳定checkpoint_thread_id
+  -> start_checkpointed_research()运行plan_research()
+  -> request_plan_confirmation()调用interrupt()保存检查点并暂停
+  -> db.create_research_task()保存thread_id与awaiting_confirmation业务状态
+  -> 用户在研究任务页确认或取消
+  -> 确认后BackgroundTasks调用Command(resume={approved: true})
+  -> 条件边选择多查询或单查询降级节点
+  -> invoke_research_tool("search_literature", arguments)
+  -> StructuredTool校验参数并复用search_service.search_all()
+  -> deduplicate_results() 按 DOI、URL 和标题合并多查询结果
+  -> request_paper_selection()第二次interrupt()，不重复已完成搜索节点
   -> db.insert_papers() 写入 SQLite
-  -> 页面立即返回检索结果并显示“准备问答”和“仅下载”
+  -> replace_research_tool_calls()保存输入、来源、状态、错误和耗时
+  -> update_checkpoint_candidate_ids()把数据库论文ID同步回检查点
+  -> 任务进入 awaiting_selection，页面自动刷新候选论文
+  -> 用户从当前任务候选中选择1至5篇
+  -> Command(resume={paper_ids: [...]})恢复第二个中断
+  -> 图内与业务层双重校验后冻结论文ID
+  -> 任务进入 papers_selected，仍不会自动下载
+  -> 用户可继续使用“准备问答”和“仅下载”
   -> 用户点击 POST /papers/{paper_id}/prepare
   -> main.py 将准备流程加入 BackgroundTasks
   -> paper_workflow.prepare_paper_for_qa() 判断当前断点
@@ -446,7 +596,7 @@ SEED_TIMEOUT=120
 
 检索和 PDF 下载都可能耗时。如果全部在 `POST /search` 中同步执行，页面会长时间等待，甚至发生请求超时。
 
-现在搜索接口只完成元数据检索和入库，然后立即返回结果。发现明确 PDF 地址时状态为 `available`，用户点击下载按钮后才通过 `BackgroundTasks` 下载。这样既改善响应速度，也避免一次搜索自动产生大量本地文件。
+普通检索仍同步完成元数据检索和入库。智能研究先保存计划并返回确认页，用户确认后才通过`BackgroundTasks`执行多路网络检索，任务页每2秒检查状态。发现明确 PDF 地址时状态为 `available`，用户点击下载按钮后才后台下载。这样既避免研究规划自动调用工具，也避免一次搜索自动产生大量本地文件。
 
 ## 为什么 Crossref 不强制下载
 

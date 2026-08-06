@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}研究任务 - Paper Hunter{% endblock %}
+{% block content %}
+<section class="section-head">
+  <div>
+    <p class="eyebrow">Research Tasks</p>
+    <h1>研究任务</h1>
+  </div>
+  <a class="button secondary" href="/">新建检索</a>
+</section>
+
+{% if tasks %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>研究问题</th>
+          <th>计划</th>
+          <th>状态</th>
+          <th>结果</th>
+          <th>已选</th>
+          <th>创建时间</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for task in tasks %}
+          <tr>
+            <td><a href="/research-tasks/{{ task['id'] }}"><strong>{{ task["question"] }}</strong></a></td>
+            <td>{{ task["plan_queries"] | length }} 路</td>
+            <td><span class="status status-{{ task['status'] }}">{{ task["status"] }}</span></td>
+            <td>{{ task["result_count"] }} 篇</td>
+            <td>{{ task["selected_count"] }} 篇</td>
+            <td>{{ task["created_at"] }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="empty-state">暂无研究任务。</p>
+{% endif %}
+{% endblock %}

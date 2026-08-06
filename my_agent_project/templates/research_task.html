@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+{% block title %}研究任务 #{{ task["id"] }} - Paper Hunter{% endblock %}
+{% block content %}
+{% set report_status = report["status"] if report else "not_started" %}
+<section class="section-head research-task-heading" data-research-task-id="{{ task['id'] }}" data-research-task-status="{{ task['status'] }}" data-research-report-status="{{ report_status }}">
+  <div>
+    <p class="eyebrow">LangGraph Research Task #{{ task["id"] }}</p>
+    <h1>{{ task["question"] }}</h1>
+  </div>
+  <span class="status status-{{ task['status'] }}">{{ task["status"] }}</span>
+</section>
+
+<section class="research-plan" aria-labelledby="research-plan-title">
+  <div class="research-plan-head">
+    <div>
+      <p class="eyebrow">Research Plan</p>
+      <h2 id="research-plan-title">{{ task["plan_goal"] }}</h2>
+    </div>
+    <span class="status status-{{ task['planner_status'] }}">{{ task["planner_status"] }}</span>
+  </div>
+  <ol>
+    {% for query in task["plan_queries"] %}<li>{{ query }}</li>{% endfor %}
+  </ol>
+  {% if task["plan_rationale"] %}<p>{{ task["plan_rationale"] }}</p>{% endif %}
+  {% if task["planner_error"] %}
+    <p class="alert">规划已降级：{{ task["planner_error"] }}</p>
+  {% elif task["plan_model"] %}
+    <p class="plan-meta">规划模型：{{ task["plan_model"] }}</p>
+  {% endif %}
+</section>
+
+{% if tool_calls %}
+  <section class="tool-trace" aria-labelledby="tool-trace-title">
+    <div class="section-head compact-heading">
+      <div>
+        <p class="eyebrow">Tool Trace</p>
+        <h2 id="tool-trace-title">工具调用轨迹</h2>
+      </div>
+      <span class="selection-limit">{{ tool_calls | length }} 次</span>
+    </div>
+    <div class="table-wrap">
+      <table class="tool-trace-table">
+        <thead>
+          <tr>
+            <th>序号</th>
+            <th>工具</th>
+            <th>输入</th>
+            <th>来源结果</th>
+            <th>状态</th>
+            <th>耗时</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for call in tool_calls %}
+            <tr>
+              <td>{{ call["call_index"] }}</td>
+              <td><code>{{ call["tool_name"] }}</code></td>
+              <td>
+                <strong>{{ call["input"].get("query", "") }}</strong>
+                <small>上限 {{ call["input"].get("max_results", 0) }} 篇</small>
+              </td>
+              <td>
+                {{ call["result_count"] }} 篇
+                {% if call["source_counts"] %}
+                  <small>
+                    {% for source, count in call["source_counts"].items() %}
+                      {{ source }} {{ count }}{% if not loop.last %} · {% endif %}
+                    {% endfor %}
+                  </small>
+                {% endif %}
+                {% if call["error"] %}<small class="tool-error">{{ call["error"] }}</small>{% endif %}
+              </td>
+              <td><span class="status status-tool-{{ call['status'] }}">{{ call["status"] }}</span></td>
+              <td>{{ call["duration_ms"] }} ms</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endif %}
+
+{% if task["status"] == "awaiting_confirmation" %}
+  {% if task["error"] %}<p class="alert">{{ task["error"] }}</p>{% endif %}
+  <div class="task-actions">
+    <form action="/research-tasks/{{ task['id'] }}/confirm" method="post">
+      <button type="submit">确认并执行</button>
+    </form>
+    <form action="/research-tasks/{{ task['id'] }}/cancel" method="post">
+      <button class="danger" type="submit">取消任务</button>
+    </form>
+  </div>
+{% elif task["status"] == "running" %}
+  <p class="task-progress">正在检索和合并候选论文，完成后页面会自动更新。</p>
+{% elif task["status"] == "failed" %}
+  <p class="alert">任务失败：{{ task["error"] }}</p>
+{% elif task["status"] == "cancelled" %}
+  {% if task["result_count"] %}
+    <p class="empty-state">任务已取消，已检索的候选论文仍保留在历史记录中。</p>
+  {% else %}
+    <p class="empty-state">任务已取消，未执行文献检索。</p>
+  {% endif %}
+{% elif task["status"] == "awaiting_selection" %}
+  <section class="section-head compact-heading">
+    <div>
+      <p class="eyebrow">Candidate Papers</p>
+      <h2>选择用于后续研究的论文</h2>
+    </div>
+    <span class="selection-limit">最多 {{ max_selected_papers }} 篇</span>
+  </section>
+  {% if papers %}
+    <form class="paper-selection-form" action="/research-tasks/{{ task['id'] }}/select" method="post">
+      <div class="table-wrap">
+        <table class="selection-table">
+          <thead>
+            <tr>
+              <th>选择</th>
+              <th>论文</th>
+              <th>来源</th>
+              <th>出版商</th>
+              <th>访问</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for paper in papers %}
+              <tr>
+                <td class="paper-select-checkbox">
+                  <input type="checkbox" name="paper_ids" value="{{ paper['id'] }}" aria-label="选择 {{ paper['title'] }}">
+                </td>
+                <td>
+                  <a class="paper-title" href="/papers/{{ paper['id'] }}">{{ paper["title"] }}</a>
+                  <small>{{ paper["authors"] or "未知作者" }}</small>
+                </td>
+                <td>{{ paper["source"] }}</td>
+                <td>{{ paper["publisher"] or "未知" }}</td>
+                <td><a href="{{ paper['page_url'] }}" target="_blank" rel="noreferrer">网页</a></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="task-actions selection-actions">
+        <button type="submit">保存论文选择</button>
+        <button class="danger" type="submit" formaction="/research-tasks/{{ task['id'] }}/cancel" formnovalidate>取消任务</button>
+      </div>
+    </form>
+  {% else %}
+    <p class="empty-state">本次任务没有返回可选择的论文。</p>
+  {% endif %}
+{% elif task["status"] == "papers_selected" %}
+  <section class="section-head compact-heading">
+    <div>
+      <p class="eyebrow">Selected Papers</p>
+      <h2>已冻结论文集合（{{ task["selected_count"] }}）</h2>
+    </div>
+  </section>
+  {% set papers = selected_papers %}
+  {% include "table.html" %}
+  <section class="research-report" aria-labelledby="research-report-title">
+    <div class="section-head compact-heading">
+      <div>
+        <p class="eyebrow">Research Report</p>
+        <h2 id="research-report-title">跨论文研究报告</h2>
+      </div>
+      {% if report %}
+        <span class="status status-report-{{ report['status'] }}" data-report-status>{{ report["status"] }}</span>
+      {% endif %}
+    </div>
+
+    {% if not report %}
+      <form action="/research-tasks/{{ task['id'] }}/report" method="post">
+        <button type="submit">生成研究报告</button>
+      </form>
+      <p class="report-note">该操作会准备所选论文全文、检索证据，并在存在证据时调用 DeepSeek。</p>
+    {% elif report["status"] in ["preparing", "retrieving", "generating"] %}
+      <p class="task-progress">报告正在后台{{ {"preparing": "准备论文", "retrieving": "检索证据", "generating": "生成内容"}[report["status"]] }}，页面会自动更新。</p>
+      {% set progress = report["details"].get("checkpoint_progress", {}) %}
+      {% if progress %}
+        <p class="report-note">
+          已准备 {{ progress.get("prepared_papers", 0) }}/{{ progress.get("selected_papers", task["selected_count"]) }} 篇；
+          已检索 {{ progress.get("retrieved_papers", 0) }}/{{ progress.get("selected_papers", task["selected_count"]) }} 篇。
+        </p>
+      {% endif %}
+    {% elif report["status"] == "failed" %}
+      <p class="alert">报告失败：{{ report["error"] }}</p>
+      <form action="/research-tasks/{{ task['id'] }}/report" method="post">
+        <button type="submit">重新生成</button>
+      </form>
+    {% elif report["status"] == "completed" %}
+      <div class="report-meta">
+        <span>模型：{{ report["model"] or "未调用模型" }}</span>
+        <span>证据：{{ report["details"].get("evidence", []) | length }} 条</span>
+        <span>访问限制：{{ report["details"].get("access_limitations", []) | length }} 篇</span>
+        {% set citation = report["details"].get("citation_validation", {}) %}
+        {% if citation %}
+          <span class="citation-check citation-{{ citation.get('status', 'warning') }}">
+            引用检查：{{ citation.get("status", "warning") }}（{{ citation.get("valid_citation_count", 0) }}/{{ citation.get("citation_count", 0) }}）
+          </span>
+        {% endif %}
+      </div>
+      {% set context_stats = report["details"].get("context_stats", {}) %}
+      {% if context_stats %}
+        <div class="context-stats" aria-label="上下文工程统计">
+          <span>上下文：{{ context_stats.get("raw_evidence_count", 0) }} → {{ context_stats.get("selected_evidence_count", 0) }} 条</span>
+          <span>去重后：{{ context_stats.get("post_dedup_evidence_count", context_stats.get("raw_evidence_count", 0)) }} 条</span>
+          <span>重复移除：精确 {{ context_stats.get("exact_duplicate_count", 0) }} / 高重叠 {{ context_stats.get("overlap_duplicate_count", 0) }}</span>
+          <span>估算Token：{{ context_stats.get("raw_estimated_tokens", 0) }} → {{ context_stats.get("selected_estimated_tokens", 0) }}</span>
+          <span>压缩：{{ context_stats.get("estimated_token_reduction_percent", 0) }}%</span>
+          <span>论文覆盖：{{ context_stats.get("covered_paper_count", 0) }}/{{ context_stats.get("paper_count", 0) }}</span>
+          {% set context_quality = report["details"].get("context_quality", {}) %}
+          {% if context_quality %}
+            <span class="context-gate context-gate-{{ context_quality.get('status', 'failed') }}">
+              上下文门禁：{{ context_quality.get("status", "failed") }}
+            </span>
+          {% endif %}
+        </div>
+      {% endif %}
+      <div class="research-report-content">{{ report["content"] }}</div>
+      {% if report["details"].get("access_limitations") %}
+        <div class="report-limitations">
+          <h3>未验证全文</h3>
+          <ul>
+            {% for item in report["details"]["access_limitations"] %}
+              <li>
+                <strong>{{ item["paper_title"] }}</strong>：{{ item["reason"] }}
+                {% if item["url"] %}<a href="{{ item['url'] }}" target="_blank" rel="noreferrer">访问论文</a>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+      <form class="report-regenerate" action="/research-tasks/{{ task['id'] }}/report" method="post">
+        <button class="secondary" type="submit">重新生成</button>
+      </form>
+    {% endif %}
+  </section>
+{% elif task["status"] == "completed" %}
+  <section class="section-head compact-heading">
+    <div>
+      <p class="eyebrow">Search Results</p>
+      <h2>检索结果（{{ task["result_count"] }}）</h2>
+    </div>
+  </section>
+  {% if papers %}
+    {% include "table.html" %}
+  {% else %}
+    <p class="empty-state">本次任务没有返回可归档的论文。</p>
+  {% endif %}
+{% endif %}
+{% endblock %}
+{% block scripts %}
+  {% if task["status"] == "running" or report_status in ["preparing", "retrieving", "generating"] %}
+    <script src="{{ url_for('static', path='/research_task_poll.js') }}" defer></script>
+  {% endif %}
+{% endblock %}

@@ -9,11 +9,24 @@
   </div>
   <form class="search-form" action="/search" method="post">
     {% if error %}<div class="alert">{{ error }}</div>{% endif %}
-    <label for="query">关键词</label>
-    <input id="query" name="query" type="text" placeholder="multimodal agent" required autofocus>
+    <fieldset class="search-mode-fieldset">
+      <legend>检索模式</legend>
+      <div class="segmented-control">
+        <label>
+          <input name="search_mode" type="radio" value="standard" {% if search_mode != "research_agent" %}checked{% endif %}>
+          <span>普通检索</span>
+        </label>
+        <label>
+          <input name="search_mode" type="radio" value="research_agent" {% if search_mode == "research_agent" %}checked{% endif %}>
+          <span>智能研究</span>
+        </label>
+      </div>
+    </fieldset>
+    <label for="query">关键词或研究问题</label>
+    <input id="query" name="query" type="text" value="{{ query or '' }}" placeholder="multimodal agent" required autofocus>
     <label for="max_results">结果数量</label>
     <input id="max_results" name="max_results" type="number" min="1" max="50" value="{{ max_results }}">
-    <button type="submit">开始搜索</button>
+    <button type="submit">开始检索</button>
   </form>
 </section>
 {% endblock %}

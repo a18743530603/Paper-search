@@ -4,6 +4,7 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
@@ -13,7 +14,10 @@ from fastapi.templating import Jinja2Templates
 from .model_service import enhance_query, is_deepseek_configured
 from .config import BASE_DIR, MAX_RESULTS, configure_utf8_stdio, ensure_runtime_dirs
 from .db import (
+    cancel_research_task,
+    claim_download,
     clear_paper_history,
+    create_research_task,
     create_rag_query,
     export_papers_csv,
     export_papers_json,
@@ -22,6 +26,8 @@ from .db import (
     get_generation_evaluation_run,
     get_or_create_document,
     get_paper,
+    get_research_task,
+    get_research_report,
     init_db,
     insert_papers,
     list_evaluation_cases,
@@ -32,8 +38,13 @@ from .db import (
     list_paper_chunks,
     list_paper_statuses,
     list_papers,
+    list_research_tasks,
+    list_research_tool_calls,
     list_rag_queries,
-    update_download_status,
+    select_research_task_papers,
+    start_research_task,
+    start_research_report,
+    validate_research_task_paper_selection,
 )
 from .download_service import can_attempt_download, download_paper
 from .evaluation_service import (
@@ -62,7 +73,27 @@ from .rag_service import (
     build_access_notice,
     index_paper_chunks,
 )
-from .schemas import INDEX_INDEXED, PARSE_PARSED, STATUS_DOWNLOADING
+from .research_agent import (
+    SEARCH_MODE_RESEARCH_AGENT,
+    SEARCH_MODE_STANDARD,
+)
+from .research_checkpoint import (
+    delete_research_checkpoint,
+    research_checkpoint_info,
+    resume_paper_selection,
+    resume_plan_confirmation,
+    start_checkpointed_research,
+)
+from .research_workflow import execute_research_report, execute_research_task
+from .schemas import (
+    INDEX_INDEXED,
+    MAX_RESEARCH_SELECTED_PAPERS,
+    PARSE_PARSED,
+    RESEARCH_TASK_AWAITING,
+    STATUS_AVAILABLE,
+    STATUS_DOWNLOADING,
+    STATUS_FAILED,
+)
 from .search_service import search_all
 
 
@@ -73,7 +104,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.9.0")
+app = FastAPI(title="Paper Hunter", version="0.10.1")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -92,7 +123,10 @@ def home(request: Request):
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"max_results": MAX_RESULTS},
+        {
+            "max_results": MAX_RESULTS,
+            "search_mode": SEARCH_MODE_STANDARD,
+        },
     )
 
 
@@ -101,6 +135,7 @@ def search(
     request: Request,
     query: str = Form(...),
     max_results: int = Form(MAX_RESULTS),
+    search_mode: str = Form(SEARCH_MODE_STANDARD),
 ):
     query = query.strip()
     if not query:
@@ -110,11 +145,35 @@ def search(
             {
                 "max_results": MAX_RESULTS,
                 "error": "请输入关键词。",
+                "query": query,
+                "search_mode": search_mode,
             },
             status_code=400,
         )
 
     max_results = max(1, min(max_results, 50))
+    if search_mode == SEARCH_MODE_RESEARCH_AGENT:
+        thread_id = f"research-{uuid4()}"
+        research_plan = start_checkpointed_research(
+            thread_id,
+            query,
+            max_results,
+        )
+        task_id = create_research_task(
+            question=query,
+            max_results=max_results,
+            plan_goal=research_plan.goal,
+            plan_queries=research_plan.queries,
+            plan_rationale=research_plan.rationale,
+            plan_model=research_plan.model,
+            planner_status=research_plan.status,
+            planner_error=research_plan.error,
+            status=RESEARCH_TASK_AWAITING,
+            checkpoint_thread_id=thread_id,
+        )
+        return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+    search_mode = SEARCH_MODE_STANDARD
     enhanced_query = enhance_query(query)
     candidates = search_all(enhanced_query, max_results)
     paper_ids = insert_papers(query, candidates)
@@ -126,9 +185,162 @@ def search(
         {
             "query": query,
             "enhanced_query": enhanced_query,
+            "search_mode": search_mode,
+            "research_plan": None,
             "papers": [paper_view(paper) for paper in papers if paper is not None],
         },
     )
+
+
+@app.get("/research-tasks")
+def research_tasks(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "research_tasks.html",
+        {"tasks": list_research_tasks()},
+    )
+
+
+@app.get("/research-tasks/{task_id}")
+def research_task_detail(request: Request, task_id: int):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    papers = [get_paper(int(paper_id)) for paper_id in task["paper_ids"]]
+    selected_papers = [
+        get_paper(int(paper_id)) for paper_id in task["selected_paper_ids"]
+    ]
+    return templates.TemplateResponse(
+        request,
+        "research_task.html",
+        {
+            "task": task,
+            "papers": [paper_view(paper) for paper in papers if paper is not None],
+            "selected_papers": [
+                paper_view(paper) for paper in selected_papers if paper is not None
+            ],
+            "tool_calls": list_research_tool_calls(task_id),
+            "report": get_research_report(task_id),
+            "max_selected_papers": MAX_RESEARCH_SELECTED_PAPERS,
+        },
+    )
+
+
+@app.post("/research-tasks/{task_id}/confirm")
+def confirm_research_task(task_id: int, background_tasks: BackgroundTasks):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    if not start_research_task(task_id):
+        raise HTTPException(status_code=409, detail="Research task cannot be confirmed")
+    background_tasks.add_task(execute_research_task, task_id)
+    return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.post("/research-tasks/{task_id}/cancel")
+def cancel_research_task_route(task_id: int):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    thread_id = task.get("checkpoint_thread_id") or ""
+    if thread_id:
+        checkpoint = research_checkpoint_info(thread_id)
+        next_nodes = set(checkpoint["next_nodes"])
+        if "request_plan_confirmation" in next_nodes:
+            resume_plan_confirmation(thread_id, approved=False)
+        elif "request_paper_selection" in next_nodes:
+            resume_paper_selection(thread_id, cancelled=True)
+        else:
+            delete_research_checkpoint(thread_id)
+    if not cancel_research_task(task_id):
+        raise HTTPException(status_code=409, detail="Research task cannot be cancelled")
+    return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.post("/research-tasks/{task_id}/select")
+def select_research_papers(
+    task_id: int,
+    paper_ids: list[int] = Form(default=[]),
+):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    try:
+        selected_ids = validate_research_task_paper_selection(
+            task,
+            paper_ids,
+            max_selected=MAX_RESEARCH_SELECTED_PAPERS,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    thread_id = task.get("checkpoint_thread_id") or ""
+    if thread_id:
+        result = resume_paper_selection(thread_id, paper_ids=selected_ids)
+        if result.workflow_status != "papers_selected":
+            raise HTTPException(status_code=409, detail="Research checkpoint did not resume")
+    selected = select_research_task_papers(
+        task_id,
+        selected_ids,
+        max_selected=MAX_RESEARCH_SELECTED_PAPERS,
+    )
+    if not selected:
+        raise HTTPException(status_code=409, detail="Research papers cannot be selected")
+    return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.post("/research-tasks/{task_id}/report")
+def create_research_report_route(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    if not start_research_report(task_id):
+        raise HTTPException(status_code=409, detail="Research report cannot be started")
+    background_tasks.add_task(execute_research_report, task_id)
+    return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.get("/api/research-tasks/{task_id}")
+def research_task_status(task_id: int):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    checkpoint = None
+    if task.get("checkpoint_thread_id"):
+        checkpoint = research_checkpoint_info(task["checkpoint_thread_id"])
+    report = get_research_report(task_id)
+    return {
+        "id": task["id"],
+        "status": task["status"],
+        "result_count": task["result_count"],
+        "selected_count": task["selected_count"],
+        "error": task["error"],
+        "updated_at": task["updated_at"],
+        "checkpoint": checkpoint,
+        "tool_calls": list_research_tool_calls(task_id),
+        "report": (
+            {
+                "status": report["status"],
+                "model": report["model"],
+                "error": report["error"],
+                "checkpoint_progress": report["details"].get(
+                    "checkpoint_progress", {}
+                ),
+                "citation_validation": report["details"].get(
+                    "citation_validation", {}
+                ),
+                "context_stats": report["details"].get("context_stats", {}),
+                "context_quality": report["details"].get(
+                    "context_quality", {}
+                ),
+                "updated_at": report["updated_at"],
+            }
+            if report is not None
+            else None
+        ),
+    }
 
 
 @app.get("/papers")
@@ -187,7 +399,11 @@ def prepare_paper(paper_id: int, background_tasks: BackgroundTasks):
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if status != PREPARATION_READY:
-        background_tasks.add_task(prepare_paper_for_qa, paper_id)
+        background_tasks.add_task(
+            prepare_paper_for_qa,
+            paper_id,
+            download_claimed=status == STATUS_DOWNLOADING,
+        )
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
@@ -248,8 +464,8 @@ def retry_download(paper_id: int, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Paper not found")
     if not can_attempt_download(paper["source"], paper["pdf_url"]):
         raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
-    update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
-    background_tasks.add_task(download_paper, paper_id)
+    if claim_download(paper_id, (STATUS_FAILED,)):
+        background_tasks.add_task(download_paper, paper_id)
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
@@ -260,10 +476,8 @@ def start_download(paper_id: int, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Paper not found")
     if not can_attempt_download(paper["source"], paper["pdf_url"]):
         raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
-    if paper["status"] == STATUS_DOWNLOADING:
-        return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
-    update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
-    background_tasks.add_task(download_paper, paper_id)
+    if claim_download(paper_id, (STATUS_AVAILABLE,)):
+        background_tasks.add_task(download_paper, paper_id)
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 

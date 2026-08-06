@@ -2,6 +2,102 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.10.1` - 2026-08-06
+
+### PDF下载任务原子抢占
+
+- `db.py`新增`claim_download()`：使用单条条件`UPDATE`完成状态检查与`downloading`写入，通过受影响行数返回是否取得执行资格。
+- 普通下载只允许`available → downloading`，失败重试只允许`failed → downloading`；未抢占成功的请求直接返回，不会创建重复`BackgroundTasks`。
+- `paper_workflow.py`的问答准备入口复用同一抢占规则；后台函数通过`download_claimed`区分已经取得资格的任务，避免重复抢占或重复下载。
+- 修复`update_download_status()`定义处的拼写残留，保留下载完成时间、失败原因和后续状态更新行为。
+- 新增双线程并发抢占、非法起始状态和失败重试清错测试；完整离线测试为`121 passed`，不调用真实外部API。
+- 本次不引入消息队列；`BackgroundTasks`仍不保证Web进程重启后的任务持久化，公网部署时需要另行引入独立Worker与可靠队列。
+
+## `v0.10.0` - 2026-08-04
+
+### A5-3/A5-4结构化上下文与质量门禁
+
+- `research_report_service.py`新增`build_research_context_payload()`，将研究问题、证据和访问限制序列化为`research-context-json-v1`；证据使用稳定`E1...En`编号，并保留论文ID、标题、物理页、块ID和原文。
+- 报告系统Prompt明确把JSON中的问题、标题、正文、访问原因和URL全部视为不可信数据，不执行其中的角色切换、工具调用或输出格式命令；正文原样保留，不用关键词删除改变学术证据。
+- `context_service.py`新增`evidence_validation_errors()`和`context-quality-gate-v1`：缺少论文ID、块ID、标题、正物理页码或正文的证据在模型调用前剔除。
+- 门禁检查可用上下文、字段完整性、Token预算、最终计数和最低论文配额，输出`passed/warning/failed`与`model_call_allowed`；全部非法或预算无法容纳时确定性拒答，不调用DeepSeek。
+- `ResearchSearchState`新增`report_context_quality`，通过LangGraph检查点、业务SQLite、状态API和研究任务页面完整持久化；页面以绿/橙/红展示门禁状态。
+- 保留“本来没有全文证据”的`deterministic-no-evidence`语义；只有存在输入但质量门禁失败时使用`deterministic-context-gate`。
+- 新增不可信JSON转义、Prompt注入文本、非法证据剔除、模型阻断、检查点持久化和页面回归测试；完整离线测试为`119 passed`，没有调用真实外部API。
+- A1-A5单Agent LangGraph主线至此完成；Prompt结构只能降低指令混淆风险，不能宣称完全消除Prompt Injection。MCP、长期记忆和多Agent属于后续独立阶段。
+
+### A5-2保守证据去重
+
+- `context_service.py`新增`normalize_evidence_text()`、`evidence_overlap_ratio()`和`deduplicate_paper_evidence()`；去重发生在公平预算分配之前，不调用DeepSeek、Seed或其他外部API。
+- 精确重复使用NFKC、大小写折叠和空白归一化识别；高重叠重复使用5-token shingle containment，阈值固定为`0.85`，且只允许同一论文的同页或相邻物理页互相去重。
+- 不同论文永不互相去重；短于12个shingle的证据不执行高重叠删除；候选按检索分数排序，始终优先保留分数更高的证据。
+- 删除审计新增`exact_duplicate`、`overlap_duplicate`、`overlap_ratio`和`duplicate_of`；`context_stats`新增去重后证据数及两类重复计数，页面同步展示。
+- 新增精确重复、相邻页高重叠、远距离相似、跨论文相同文本和统计回归测试；完整离线测试为`115 passed`。
+- 当前属于可解释的文本重叠去重，不是Embedding语义去重；跨页超过一页的相似内容会保留，避免误删论文中重复出现但作用不同的定义或结论。
+
+### A5-0/A5-1上下文基线与公平预算打包
+
+- 新增`context_service.py`、`ContextConfig`、`estimate_text_tokens()`和`pack_research_context()`，在报告生成前执行不调用模型的确定性Context Engineering。
+- 默认策略`fair_budget_v1`使用6000估算Token总预算、每篇目标至少1条且最多2条；论文内按检索分数排序，跨论文按轮次选择，优先避免单篇证据垄断上下文。
+- 原始召回继续保存在`details_json.evidence`，最终模型输入保存在`context_evidence`；生成Prompt和A4引用校验只使用后者。
+- `context_stats`记录压缩前后证据数、字符数、估算Token、压缩比例、论文覆盖、每篇配额、最低配额满足情况及删除审计。
+- 超出配额和预算的证据分别记录`paper_quota`与`token_budget`；极端预算无法覆盖所有论文时保持硬预算并显式标记，不伪造100%覆盖。
+- 研究任务页面和状态API新增上下文证据、估算Token、压缩率和论文覆盖展示。
+- 新增中英文Token估算、公平配额、预算轮询、最低配额失败、A3/A4接入、状态落库和页面展示测试；完整离线测试为`110 passed`，没有调用真实外部API。
+- 当前未使用DeepSeek官方Tokenizer；A5-2只实现确定性文本重叠去重，Embedding语义去重仍未实现。
+
+### A4可恢复的端到端LangGraph报告阶段
+
+- 生产图在论文选择后新增第三个`interrupt()`；用户点击“生成研究报告”才通过`Command(resume=...)`恢复同一`thread_id`，不会因选择论文自动下载或消耗模型额度。
+- 新增逐篇自循环节点`prepare_report_paper`和`retrieve_report_evidence`；索引位置、证据、访问限制及工具摘要随每篇论文写入`SqliteSaver`检查点。
+- 新增`begin_report_generation`、`synthesize_research_report`、`validate_report_citations`和`request_report_regeneration`节点；模型失败可从生成节点重试，完成后可在同一线程重新生成。
+- 新增`stream_checkpointed_research_report()`和`execute_research_report()`；图状态逐节点同步到`research_reports`，旧A3任务没有报告检查点时保持兼容执行。
+- `research_reports.details_json`新增`checkpoint_progress`与`citation_validation`；页面和状态API展示已准备/已检索论文数、有效引用数与警告状态。
+- `validate_research_report_citations()`只用代码检查`[论文标题, p. 页码]`是否属于召回证据，不调用额外大模型，也不宣称验证事实语义。
+- 应用启动时把遗留的报告、解析和索引运行状态改为可重试失败状态；重新提交后由图检查点和现有幂等准备服务跳过已完成工作。
+- 新增第三中断、逐篇节点、跨连接重启续跑、业务状态同步、引用校验和中断报告恢复测试；完整离线测试为`106 passed`，没有调用真实外部API。
+
+### A3证据驱动的跨论文研究报告
+
+- 新增`prepare_paper_for_research`和`retrieve_paper_evidence`两个LangChain `StructuredTool`；分别复用已有`prepare_paper_for_qa()`与`retrieve_relevant_chunks()`，不复制下载、解析、索引或召回逻辑。
+- 新增`research_report_service.py`；用户选定论文后显式点击生成，后台按`prepare → retrieve → synthesize`执行，每篇默认检索3条带物理页码的证据。
+- 新增`research_reports`表及开始、查询、状态更新函数；状态为`preparing/retrieving/generating/completed/failed`，事务锁防止同一任务重复启动。
+- 新增`POST /research-tasks/{task_id}/report`；研究任务页面展示报告进度、模型、证据数、访问限制、报告正文和重新生成入口，状态接口支持每2秒轮询。
+- 报告Prompt只接收已召回证据，要求事实使用`[论文标题, p. 物理页]`引用；付费或无直链论文只记录合法访问链接，不推断未读取内容。
+- 全部论文都没有证据时由代码生成拒答报告，不调用DeepSeek；单篇准备或检索异常转换为该论文的限制说明，不中断其余论文。
+- 新增工具调用、数据库状态锁、证据/受限来源合并、无证据零模型调用、单篇失败隔离和报告页面测试；完整离线测试为`101 passed`，没有调用真实外部API。
+
+### A2标准工具层与调用审计
+
+- 新增`langchain-core>=1.5.3`与`research_tools.py`；`search_literature`是具有`query/max_results`参数Schema的标准`StructuredTool`，内部复用现有`search_all()`。
+- 新增`RESEARCH_TOOL_REGISTRY`和`invoke_research_tool()`白名单入口；未知工具名直接拒绝，DeepSeek仍只生成计划，不能任意选择函数、下载PDF或写数据库。
+- LangGraph检索节点改为通过工具注册表执行；`ResearchSearchState/ResearchSearchResult`新增`tool_calls`，保存每路查询的输入、状态、有效结果数、来源分布、错误和耗时，不在可重放节点内写业务库。
+- 新增`research_tool_calls`表、`replace_research_tool_calls()`和`list_research_tool_calls()`；以任务内调用序号唯一并整体替换，保证检查点恢复后的审计记录幂等。
+- 研究任务详情页新增工具调用轨迹，`GET /api/research-tasks/{task_id}`同步返回轨迹；`partial`与`failed`会展示来源级降级错误。
+- 新增Tool Schema、结构化结果、工具轨迹持久化幂等、工作流落库和页面回放测试；完整离线测试为`95 passed`，没有调用真实外部API。
+
+### LangGraph研究检索与人工确认闭环
+
+- 新增`langgraph>=1.2.10`和`research_agent.py`，使用显式State、五个Node与条件Edge编排研究问题规划、人工确认、搜索和去重。
+- DeepSeek通过现有`ask_deepseek_json()`生成2至4条结构化学术检索词；模型不负责下载、数据库写入或修改版权策略。
+- 规划完成后先进入`await_confirmation`节点；缺少API Key、DeepSeek失败或计划校验失败时记录错误并保存原始问题单查询计划，不会在确认前调用搜索服务。
+- 多查询与单查询节点复用`search_service.search_all()`；结果按DOI、网页URL和规范化标题去重，并限制为用户请求数量。
+- 首页新增普通检索/智能研究分段控件，`POST /search`新增`search_mode`参数；智能研究返回持久化任务页，用户可确认或取消。
+- 新增`research_tasks`表以及创建、查询、开始、取消、保存结果、选择论文和失败状态函数；保存计划、规划错误、候选/已选论文ID和阶段时间，应用启动时把中断的`running`任务恢复为待确认。
+- 新增`research_workflow.execute_research_task()`，确认后通过FastAPI`BackgroundTasks`执行冻结计划，成功归档论文，异常只标记当前任务失败。
+- 新增研究任务列表、详情、确认、取消和轻量状态接口；`research_task_poll.js`每2秒刷新运行结果。
+- 检索完成后任务进入`awaiting_selection`而不是直接结束；详情页使用复选框让用户从当前任务候选中选择1至5篇，保存后状态为`papers_selected`。
+- `research_tasks`新增`selected_paper_ids_json`、`selected_count`和`selected_at`；`init_db()`为旧数据库增量补列。
+- 新增`select_research_task_papers()`和`POST /research-tasks/{task_id}/select`，校验数量、去重并拒绝不属于当前任务的论文ID；取消操作同时支持待确认和待选择状态。
+- 论文选择只冻结后续输入，不触发下载、解析、Embedding或大模型报告，继续遵守用户触发与成本控制边界。
+- 新增`langgraph-checkpoint-sqlite>=3.1.1`和`research_checkpoint.py`；检查点保存到`downloads/langgraph_checkpoints.db`，业务数据库新增唯一`checkpoint_thread_id`关联任务。
+- 计划确认与论文选择均改为LangGraph动态`interrupt()`；恢复使用同一`thread_id`和`Command(resume=...)`，已完成的规划/搜索节点不会因等待或应用重启而重复运行。
+- 中断节点在`interrupt()`前不执行写库等非幂等副作用；候选论文入库后通过`update_state()`把ID同步回暂停图，再由图内和业务层双重校验选择范围。
+- `GET /api/research-tasks/{task_id}`新增检查点ID、待执行节点和工作流状态，便于审计原生恢复位置。
+- 设置`LANGGRAPH_STRICT_MSGPACK=true`限制检查点反序列化类型；SQLite Checkpointer仅定位为本地/演示环境，公网多实例部署应替换PostgresSaver。
+- 尚未实现跨论文报告、MCP或长期记忆；本版不引入多Agent。
+- 新增跨SQLite连接模拟进程重启测试，连续恢复两个中断且搜索节点只执行一次；完整自动化测试为`93 passed`，测试不调用真实外部API。
+
 ## `v0.9.0` - 2026-08-03
 
 ### 论文问答准备闭环

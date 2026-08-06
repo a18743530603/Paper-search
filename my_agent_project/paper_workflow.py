@@ -1,6 +1,7 @@
 from typing import Any, Mapping
 
 from .db import (
+    claim_download,
     get_document,
     get_or_create_document,
     get_paper,
@@ -21,6 +22,7 @@ from .schemas import (
     STATUS_DOWNLOADED,
     STATUS_DOWNLOADING,
     STATUS_FAILED,
+    STATUS_AVAILABLE,
 )
 
 
@@ -101,7 +103,8 @@ def mark_preparation_started(paper_id: int) -> str:
         return status
 
     if not paper["local_path"]:
-        update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
+        if not claim_download(paper_id, (STATUS_AVAILABLE, STATUS_FAILED)):
+            raise RuntimeError("论文下载任务已由其他请求启动或状态已改变")
         return PREPARATION_DOWNLOADING
 
     get_or_create_document(paper_id)
@@ -113,7 +116,11 @@ def mark_preparation_started(paper_id: int) -> str:
     return PREPARATION_INDEXING
 
 
-def prepare_paper_for_qa(paper_id: int) -> str | None:
+def prepare_paper_for_qa(
+    paper_id: int,
+    *,
+    download_claimed: bool = False,
+) -> str | None:
     paper = get_paper(paper_id)
     if paper is None:
         return None
@@ -123,7 +130,11 @@ def prepare_paper_for_qa(paper_id: int) -> str | None:
         if not paper["local_path"]:
             if not can_attempt_download(paper["source"], paper["pdf_url"]):
                 return PREPARATION_LINK_ONLY
-            update_download_status(paper_id, STATUS_DOWNLOADING, error=None)
+            if not download_claimed and not claim_download(
+                paper_id,
+                (STATUS_AVAILABLE, STATUS_FAILED),
+            ):
+                return get_paper_preparation_status(paper_id)
             download_paper(paper_id)
             paper = get_paper(paper_id)
             if (

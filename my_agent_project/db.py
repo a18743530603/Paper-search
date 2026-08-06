@@ -10,6 +10,8 @@ from .schemas import (
     INDEX_NOT_STARTED,
     PARSE_NOT_STARTED,
     RAG_ANSWERING,
+    RESEARCH_REPORT_RUNNING,
+    STATUS_DOWNLOADING,
     PaperCandidate,
     PaperChunk,
     PaperParentChunk,
@@ -39,6 +41,66 @@ CREATE TABLE IF NOT EXISTS papers (
 
 CREATE INDEX IF NOT EXISTS idx_papers_created_at ON papers(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_papers_query ON papers(query);
+
+CREATE TABLE IF NOT EXISTS research_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question TEXT NOT NULL,
+    max_results INTEGER NOT NULL,
+    plan_goal TEXT NOT NULL,
+    plan_queries_json TEXT NOT NULL,
+    plan_rationale TEXT NOT NULL DEFAULT '',
+    plan_model TEXT NOT NULL DEFAULT '',
+    planner_status TEXT NOT NULL,
+    planner_error TEXT,
+    checkpoint_thread_id TEXT,
+    status TEXT NOT NULL,
+    paper_ids_json TEXT NOT NULL DEFAULT '[]',
+    result_count INTEGER NOT NULL DEFAULT 0,
+    selected_paper_ids_json TEXT NOT NULL DEFAULT '[]',
+    selected_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    confirmed_at TEXT,
+    selected_at TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_tasks_created_at
+ON research_tasks(created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS research_tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    call_index INTEGER NOT NULL,
+    tool_name TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    source_counts_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE,
+    UNIQUE (task_id, call_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_tool_calls_task_id
+ON research_tool_calls(task_id, call_index);
+
+CREATE TABLE IF NOT EXISTS research_reports (
+    task_id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'not_started',
+    content TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    model TEXT,
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS paper_documents (
     paper_id INTEGER PRIMARY KEY,
@@ -319,6 +381,27 @@ def init_db() -> None:
             )
         if "rerank_error" not in rag_query_columns:
             conn.execute("ALTER TABLE rag_queries ADD COLUMN rerank_error TEXT")
+        research_task_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(research_tasks)").fetchall()
+        }
+        for name, definition in (
+            ("checkpoint_thread_id", "TEXT"),
+            ("selected_paper_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("selected_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("selected_at", "TEXT"),
+        ):
+            if name not in research_task_columns:
+                conn.execute(
+                    f"ALTER TABLE research_tasks ADD COLUMN {name} {definition}"
+                )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_research_tasks_checkpoint_thread
+            ON research_tasks(checkpoint_thread_id)
+            WHERE checkpoint_thread_id IS NOT NULL
+            """
+        )
         conn.execute(
             """
             UPDATE papers
@@ -328,11 +411,48 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            UPDATE research_tasks
+            SET status = 'awaiting_confirmation',
+                error = '上一次执行被应用重启中断，请重新确认。',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'running'
+            """
+        )
+        conn.execute(
+            """
             UPDATE papers
             SET status = 'available'
             WHERE status = 'downloading'
               AND local_path IS NULL
               AND pdf_url IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE paper_documents
+            SET parse_status = 'parse_failed',
+                error = '上一次解析被应用重启中断，可以重新执行。',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE parse_status = 'parsing'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE paper_documents
+            SET index_status = 'index_failed',
+                index_error = '上一次索引被应用重启中断，可以重新执行。',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE index_status = 'indexing'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE research_reports
+            SET status = 'failed',
+                error = '上一次报告执行被应用重启中断，请点击重新生成以从检查点继续。',
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('preparing', 'retrieving', 'generating')
             """
         )
 
@@ -374,6 +494,344 @@ def list_papers(limit: int = 100) -> list[sqlite3.Row]:
                 "SELECT * FROM papers ORDER BY created_at DESC, id DESC LIMIT ?",
                 (limit,),
             )
+        )
+
+
+def _research_task_from_row(row: sqlite3.Row) -> dict:
+    task = dict(row)
+    for source, target in (
+        ("plan_queries_json", "plan_queries"),
+        ("paper_ids_json", "paper_ids"),
+        ("selected_paper_ids_json", "selected_paper_ids"),
+    ):
+        try:
+            value = json.loads(task[source] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            value = []
+        task[target] = value if isinstance(value, list) else []
+    return task
+
+
+def create_research_task(
+    *,
+    question: str,
+    max_results: int,
+    plan_goal: str,
+    plan_queries: list[str],
+    plan_rationale: str,
+    plan_model: str,
+    planner_status: str,
+    planner_error: str,
+    status: str,
+    checkpoint_thread_id: str = "",
+) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO research_tasks (
+                question, max_results, plan_goal, plan_queries_json,
+                plan_rationale, plan_model, planner_status, planner_error,
+                checkpoint_thread_id, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                question,
+                max_results,
+                plan_goal,
+                json.dumps(plan_queries, ensure_ascii=False),
+                plan_rationale,
+                plan_model,
+                planner_status,
+                planner_error or None,
+                checkpoint_thread_id or None,
+                status,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_research_task(task_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    return _research_task_from_row(row) if row is not None else None
+
+
+def list_research_tasks(limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM research_tasks
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_research_task_from_row(row) for row in rows]
+
+
+def replace_research_tool_calls(
+    task_id: int,
+    tool_calls: list[dict],
+) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM research_tool_calls WHERE task_id = ?", (task_id,))
+        for call_index, call in enumerate(tool_calls, start=1):
+            arguments = call.get("input")
+            source_counts = call.get("source_counts")
+            conn.execute(
+                """
+                INSERT INTO research_tool_calls (
+                    task_id, call_index, tool_name, input_json, status,
+                    result_count, source_counts_json, error, duration_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    call_index,
+                    str(call.get("tool_name") or ""),
+                    json.dumps(
+                        arguments if isinstance(arguments, dict) else {},
+                        ensure_ascii=False,
+                    ),
+                    str(call.get("status") or "failed"),
+                    max(0, int(call.get("result_count") or 0)),
+                    json.dumps(
+                        source_counts if isinstance(source_counts, dict) else {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    str(call.get("error") or "")[:500] or None,
+                    max(0, int(call.get("duration_ms") or 0)),
+                ),
+            )
+
+
+def list_research_tool_calls(task_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM research_tool_calls
+            WHERE task_id = ?
+            ORDER BY call_index
+            """,
+            (task_id,),
+        ).fetchall()
+    calls: list[dict] = []
+    for row in rows:
+        call = dict(row)
+        for source, target in (
+            ("input_json", "input"),
+            ("source_counts_json", "source_counts"),
+        ):
+            try:
+                value = json.loads(call[source] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                value = {}
+            call[target] = value if isinstance(value, dict) else {}
+        calls.append(call)
+    return calls
+
+
+def _research_report_from_row(row: sqlite3.Row) -> dict:
+    report = dict(row)
+    try:
+        details = json.loads(report["details_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        details = {}
+    report["details"] = details if isinstance(details, dict) else {}
+    return report
+
+
+def get_research_report(task_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM research_reports WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    return _research_report_from_row(row) if row is not None else None
+
+
+def start_research_report(task_id: int) -> bool:
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "papers_selected"
+            or int(task["selected_count"]) < 1
+        ):
+            return False
+        existing = conn.execute(
+            "SELECT status FROM research_reports WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if existing is not None and existing["status"] in RESEARCH_REPORT_RUNNING:
+            return False
+        conn.execute(
+            """
+            INSERT INTO research_reports (
+                task_id, status, content, details_json, model, error,
+                started_at, completed_at
+            )
+            VALUES (?, 'preparing', NULL, '{}', NULL, NULL, CURRENT_TIMESTAMP, NULL)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status = 'preparing', content = NULL, details_json = '{}',
+                model = NULL, error = NULL, started_at = CURRENT_TIMESTAMP,
+                completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+            """,
+            (task_id,),
+        )
+        return True
+
+
+def update_research_report(
+    task_id: int,
+    status: str,
+    *,
+    content: Optional[str] = None,
+    details: Optional[dict] = None,
+    model: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    details_json = (
+        json.dumps(details, ensure_ascii=False) if details is not None else None
+    )
+    completed = status in {"completed", "failed"}
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE research_reports
+            SET status = ?,
+                content = COALESCE(?, content),
+                details_json = COALESCE(?, details_json),
+                model = COALESCE(?, model),
+                error = ?,
+                completed_at = CASE
+                    WHEN ? THEN CURRENT_TIMESTAMP
+                    ELSE completed_at
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            (
+                status,
+                content,
+                details_json,
+                model,
+                error[:1000] if error else None,
+                int(completed),
+                task_id,
+            ),
+        )
+
+
+def start_research_task(task_id: int) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'running', error = NULL,
+                confirmed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'awaiting_confirmation'
+            """,
+            (task_id,),
+        )
+        return cursor.rowcount == 1
+
+
+def cancel_research_task(task_id: int) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ('awaiting_confirmation', 'awaiting_selection')
+            """,
+            (task_id,),
+        )
+        return cursor.rowcount == 1
+
+
+def save_research_task_results(task_id: int, paper_ids: list[int]) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'awaiting_selection', paper_ids_json = ?, result_count = ?,
+                selected_paper_ids_json = '[]', selected_count = 0,
+                selected_at = NULL, error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (json.dumps(paper_ids), len(paper_ids), task_id),
+        )
+
+
+def validate_research_task_paper_selection(
+    task: dict,
+    paper_ids: list[int],
+    *,
+    max_selected: int = 5,
+) -> list[int]:
+    selected_ids = list(dict.fromkeys(int(paper_id) for paper_id in paper_ids))
+    if not selected_ids:
+        raise ValueError("请至少选择一篇论文")
+    if len(selected_ids) > max_selected:
+        raise ValueError(f"最多选择{max_selected}篇论文")
+    candidate_ids = {int(paper_id) for paper_id in task.get("paper_ids", [])}
+    if any(paper_id not in candidate_ids for paper_id in selected_ids):
+        raise ValueError("选择中包含不属于该任务的论文")
+    return selected_ids
+
+
+def select_research_task_papers(
+    task_id: int,
+    paper_ids: list[int],
+    *,
+    max_selected: int = 5,
+) -> bool:
+    task = get_research_task(task_id)
+    if task is None or task["status"] != "awaiting_selection":
+        return False
+    selected_ids = validate_research_task_paper_selection(
+        task,
+        paper_ids,
+        max_selected=max_selected,
+    )
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'papers_selected', selected_paper_ids_json = ?,
+                selected_count = ?, selected_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'awaiting_selection'
+            """,
+            (json.dumps(selected_ids), len(selected_ids), task_id),
+        )
+        return cursor.rowcount == 1
+
+
+def fail_research_task(task_id: int, error: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (error[:1000], task_id),
         )
 
 
@@ -1353,6 +1811,24 @@ def list_generation_evaluation_results(run_id: int) -> list[dict]:
                 item[target] = fallback
         results.append(item)
     return results
+
+
+def claim_download(paper_id: int, allowed_statuses: Iterable[str]) -> bool:
+    statuses = tuple(dict.fromkeys(allowed_statuses))
+    if not statuses:
+        return False
+
+    placeholders = ", ".join("?" for _ in statuses)
+    with connect() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE papers
+            SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ({placeholders})
+            """,
+            (STATUS_DOWNLOADING, paper_id, *statuses),
+        )
+    return cursor.rowcount == 1
 
 
 def update_download_status(

@@ -6,6 +6,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -14,6 +16,7 @@ PAPERS_DIR = DOWNLOAD_DIR / "papers"
 EXPORTS_DIR = DOWNLOAD_DIR / "exports"
 ORIGIN_EXPORTS_DIR = EXPORTS_DIR / "origin"
 DATABASE_PATH = DOWNLOAD_DIR / "metadata.db"
+LANGGRAPH_CHECKPOINT_PATH = DOWNLOAD_DIR / "langgraph_checkpoints.db"
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 ENABLE_AGENT = os.getenv("ENABLE_AGENT", "false").lower() in {"1", "true", "yes", "on"}
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()

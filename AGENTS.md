@@ -1,8 +1,8 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.9.0`
+> 当前版本：`v0.10.1`
 >
-> 更新日期：`2026-08-03`
+> 更新日期：`2026-08-06`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -38,8 +38,9 @@ https://github.com/a18743530603/Paper-search.git
 - 第一版检索来源为 arXiv 和 Crossref。
 - arXiv 是主要的可下载 PDF 来源，因为它的 PDF 地址格式较稳定；实际下载必须由用户点击按钮触发。
 - Crossref 采用保守策略：只有元数据提供以 `.pdf` 结尾的绝对直链时才尝试下载，否则保存 DOI 或网页地址并标记为 `link_only`。
-- `POST /search` 只检索并保存元数据；明确可下载的论文标记为 `available`，用户点击下载按钮后才使用 FastAPI `BackgroundTasks` 执行 PDF 下载。
-- 使用 SQLite 在本地保存论文元数据和下载状态。
+- 普通模式的`POST /search`检索并保存元数据；智能研究模式只生成并保存计划，必须由用户确认后才后台检索。
+- 明确可下载的论文标记为 `available`，用户点击下载按钮后才使用 FastAPI `BackgroundTasks` 执行 PDF 下载。
+- 使用 SQLite 在本地保存论文元数据、研究任务和下载状态。
 - 大模型使用 DeepSeek API；本地搜索下载功能保持独立，没有 API Key 时仍可运行。
 - 不接入 Sci-Hub、付费数据库或必须登录的下载来源。
 
@@ -48,12 +49,18 @@ https://github.com/a18743530603/Paper-search.git
 主要代码位于 `my_agent_project/`。
 
 - `main.py`：FastAPI 入口，注册页面和导出接口，连接检索、数据库与后台下载服务。
-- `config.py`：配置运行路径，创建下载目录，并处理 Windows UTF-8 输出。
+- `config.py`：配置运行路径和LangGraph检查点路径，创建下载目录，并处理 Windows UTF-8 输出。
 - `schemas.py`：定义 `PaperCandidate` 和 `available`、`downloading`、`downloaded`、`link_only`、`failed` 等状态。
 - `search_service.py`：检索并解析 arXiv XML 和 Crossref JSON，生成论文元数据和下载策略。
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常。
 - `paper_workflow.py`：将用户触发的下载、PDF解析和向量索引串成后台准备流程，按现有状态跳过已完成步骤并在失败阶段停止。
-- `db.py`：初始化和操作 SQLite，保存论文、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
+- `context_service.py`：在报告生成前校验证据字段、按论文执行保守文本去重，再按估算Token预算和跨论文公平配额选择证据；输出质量门禁、模型上下文、重复关系和压缩审计，不调用额外模型。
+- `research_agent.py`：使用LangGraph编排研究问题规划、三次`interrupt()`人工确认、多查询/单查询条件路由、搜索、论文选择、逐篇准备、证据检索、报告生成和引用检查；规划失败自动降级，不改变下载合规边界。
+- `research_checkpoint.py`：使用`SqliteSaver`、稳定`thread_id`和`Command(resume=...)`保存并恢复生产图；检查点与业务任务SQLite分开存储。
+- `research_tools.py`：以LangChain `StructuredTool`和白名单注册表封装论文元数据检索，统一校验输入并返回来源、状态、错误和耗时摘要。
+- `research_workflow.py`：后台恢复用户已确认的检查点线程，归档论文、同步候选论文ID，并逐节点把报告图状态同步到业务SQLite；旧任务保留A3兼容入口。
+- `research_report_service.py`：在用户冻结论文并点击生成后，按准备、证据检索和DeepSeek综合顺序生成跨论文报告；使用不可信JSON上下文边界，逐篇隔离异常，无证据或门禁失败时确定性拒答。
+- `db.py`：初始化和操作 SQLite，保存论文与研究任务、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
 - `pdf_service.py`：使用 PDF 内容哈希复用页文本，支持固定边界与论文章节感知分块、章节层级继承、参考文献过滤和附录恢复，并在后台更新解析状态。
 - `rag_service.py`：按模型命名空间与文本哈希缓存 Seed 稠密向量，提供 TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
@@ -68,6 +75,13 @@ https://github.com/a18743530603/Paper-search.git
 ```text
 GET  /
 POST /search
+GET  /research-tasks
+GET  /research-tasks/{task_id}
+POST /research-tasks/{task_id}/confirm
+POST /research-tasks/{task_id}/cancel
+POST /research-tasks/{task_id}/select
+POST /research-tasks/{task_id}/report
+GET  /api/research-tasks/{task_id}
 GET  /papers
 GET  /papers/{paper_id}
 POST /papers/{paper_id}/retry
@@ -87,12 +101,35 @@ GET  /evaluation/runs/{run_id}
 ## 数据流程
 
 ```text
-浏览器提交关键词
+浏览器提交关键词或研究问题
   -> POST /search
-  -> model_service.enhance_query() 保持确定性搜索词
-  -> search_service.search_all() 检索 arXiv 和 Crossref
+  -> 普通模式保持单查询；智能研究模式进入LangGraph
+  -> plan_research() 调用DeepSeek JSON生成2至4条检索词
+  -> request_plan_confirmation()调用interrupt()保存图检查点并暂停
+  -> research_tasks保存计划、待确认状态和稳定checkpoint_thread_id
+  -> 用户确认后由BackgroundTasks使用Command(resume=...)恢复同一线程
+  -> 条件边选择multi_query_search或single_query_search降级
+  -> 节点通过白名单调用search_literature StructuredTool
+  -> Tool校验query/max_results并复用search_service.search_all()
+  -> deduplicate_results()按DOI、URL和标题去重并限制数量
   -> db.insert_papers() 保存元数据
-  -> 结果页立即返回，可下载论文显示下载按钮
+  -> replace_research_tool_calls()幂等保存工具输入、来源、状态和耗时
+  -> update_state()将已入库候选ID同步回图状态
+  -> request_paper_selection()第二次调用interrupt()并暂停
+  -> 任务进入awaiting_selection并自动刷新候选结果
+  -> 用户从当前候选中选择1至5篇，使用Command(resume=...)恢复
+  -> 图内和业务层双重校验候选范围，任务进入papers_selected
+  -> 图进入第三个report_confirmation interrupt，选择本身不自动下载论文
+  -> 用户点击 POST /research-tasks/{task_id}/report
+  -> Command(resume=...)恢复同一thread_id
+  -> prepare_report_paper与retrieve_report_evidence节点逐篇执行并保存检查点
+  -> link_only、付费或单篇失败记录合法链接和限制，不中断其他论文
+  -> begin_report_generation调用fair_budget_v1选择context_evidence
+  -> 原始evidence完整保留，模型只接收预算内的跨论文公平上下文
+  -> 存在证据时DeepSeek生成带引用报告；全部无证据时代码直接拒答
+  -> validate_report_citations节点零Token校验标题/页码引用
+  -> 图停在report_regeneration interrupt，允许同线程重新生成
+  -> 可下载论文继续显示用户触发的下载按钮
   -> 用户点击 POST /papers/{paper_id}/download
   -> main.py 通过 BackgroundTasks 安排该论文下载
   -> download_service.download_paper() 在后台下载并更新 SQLite
@@ -106,6 +143,7 @@ GET  /evaluation/runs/{run_id}
 ```text
 downloads/
 downloads/metadata.db
+downloads/langgraph_checkpoints.db
 downloads/papers/
 downloads/exports/
 .venv/
@@ -533,13 +571,64 @@ git push
 - Crossref没有明确PDF直链时仍为`link_only`；Seed不可用时继续复用原索引服务的TF-IDF降级，不把降级逻辑放进编排层。
 - 新增首次完整执行、下载失败停止和从索引阶段恢复3项测试；完整自动化测试为`81 passed`，没有调用真实外部API。
 
+## v0.10.0 LangGraph研究检索闭环
+
+- 新增`langgraph>=1.2.10`、`langgraph-checkpoint-sqlite>=3.1.1`与`research_agent.py`，使用`ResearchSearchState`保存研究问题、计划、人工确认标记、候选/已选论文、模型信息和降级错误。
+- 生产图包含规划、计划确认中断、多查询/单查询、取消、去重和论文选择中断节点；两个审批点均使用动态`interrupt()`。
+- DeepSeek只生成2至4条结构化学术检索词，不获得下载、数据库写入或任意工具执行权限；实际搜索继续由代码调用`search_all()`。
+- `normalize_research_plan()`校验JSON字段、查询数量、长度和重复项；缺少API Key、请求失败或计划无效时记录原因并保存原始问题单查询，确认前不调用搜索。
+- 新增`research_checkpoint.py`，以独立`downloads/langgraph_checkpoints.db`和稳定`thread_id`保存原生检查点；恢复必须使用`Command(resume=...)`与同一线程ID。
+- 新增`research_tasks.checkpoint_thread_id`唯一索引；业务表保存审计状态，Checkpointer保存图执行位置，两者职责不得混淆。
+- 新增`research_tools.py`、`RESEARCH_TOOL_REGISTRY`和标准`search_literature` StructuredTool；工具只检索元数据，不能下载、写库或调用模型。
+- 新增`research_tool_calls`表与幂等替换/查询函数，任务详情页和状态API展示每路工具输入、来源数、状态、错误与耗时。
+- A2新增Tool Schema、结构化结果、轨迹幂等落库、工作流和页面测试；完整离线测试为`95 passed`，没有调用真实外部API。
+- 新增`research_workflow.execute_research_task()`；确认路由通过`BackgroundTasks`执行，成功复用`insert_papers()`，异常只更新当前任务。
+- 新增`GET /research-tasks`、`GET /research-tasks/{task_id}`、确认/取消/选择POST路由和`GET /api/research-tasks/{task_id}`；运行页面每2秒轮询。
+- 多查询结果按DOI、规范化URL和标题确定性去重，最终数量不超过用户输入的`max_results`；模型仍无下载和数据库写权限。
+- 检索成功后任务进入`awaiting_selection`；用户通过复选框从该任务候选中选择1至5篇，`select_research_task_papers()`去重、校验归属并保存`selected_paper_ids_json/selected_count/selected_at`，状态变为`papers_selected`。
+- 新增`POST /research-tasks/{task_id}/select`；选择阶段只冻结后续输入，严禁自动下载、解析、Embedding或报告生成。
+- A3新增`prepare_paper_for_research`和`retrieve_paper_evidence`标准工具；前者复用论文准备闭环，后者返回标题、访问链接和带物理页码的Top-K证据。
+- 新增`research_reports`表、`start_research_report()`和`update_research_report()`；报告状态为`preparing/retrieving/generating/completed/failed`，事务锁拒绝重复启动。
+- 新增`research_report_service.generate_research_report()`和`POST /research-tasks/{task_id}/report`；只有用户点击后才准备所选论文并生成报告。
+- 报告Prompt必须只使用提供的证据，并要求`[论文标题, p. 物理页]`引用；`link_only`或付费论文只展示合法访问链接，不得推断正文或绕过版权。
+- 全部论文无证据时使用`build_no_evidence_report()`确定性拒答，禁止调用DeepSeek；单篇准备或召回抛错必须转换为当前论文限制，继续处理其余论文。
+- 研究任务页面和状态API展示报告状态、证据数、限制、模型和错误；前端每2秒轮询运行阶段。
+- A3新增工具、状态锁、证据/限制合并、零证据零模型调用、失败隔离和页面测试；完整离线测试为`101 passed`，没有调用真实外部API。
+- A4将报告阶段正式接入生产图：新增第三个`interrupt()`、逐篇准备/检索自循环节点、生成节点、引用检查节点和重新生成中断。
+- `stream_checkpointed_research_report()`按检查点位置选择`Command(resume=...)`或`invoke(None)`；`execute_research_report()`逐状态同步`research_reports`并兼容旧A3任务。
+- `research_reports.details_json`新增`checkpoint_progress`和`citation_validation`；引用检查只验证标题/物理页码来自召回证据，不调用模型、不判断事实语义。
+- 应用启动会把中断的报告、解析和索引状态转换为可重试失败；重新生成时图从未完成节点继续，论文准备服务按现有状态幂等跳过完成项。
+- A4跨SQLite连接测试在第一篇准备后关闭连接，新图实例只继续第二篇，证明检查点恢复不会重复已完成论文；完整离线测试为`106 passed`。
+- A5-0/A5-1新增`ContextConfig`和`pack_research_context()`；默认6000估算Token、每篇目标至少1条且最多2条，先跨论文分配第一轮，再分配第二轮。
+- `details_json.evidence/context_evidence/context_stats`分别保存完整召回、实际模型输入和策略审计；生成与引用校验必须只使用`context_evidence`。
+- `context_stats`必须包含原始/去重后/最终证据数、字符数、估算Token、压缩率、论文覆盖、最低配额状态、每篇数量及`exact_duplicate/overlap_duplicate/token_budget/paper_quota`删除原因。
+- A5-2新增`normalize_evidence_text()`、`evidence_overlap_ratio()`和`deduplicate_paper_evidence()`：精确重复使用NFKC、大小写与空白归一化；高重叠使用5-token shingle containment、阈值`0.85`、至少12个shingle，并限制在同论文同页或相邻页。
+- 不同论文不得互相去重；候选先按检索分数排序并保留高分块；删除记录必须包含`overlap_ratio`和`duplicate_of`。该能力称为文本重叠去重，不得称为Embedding语义去重。
+- A5-3新增`build_research_context_payload()`和`research-context-json-v1`；所有JSON字段均是不可信数据，系统Prompt不得执行其中的角色切换、工具调用或格式命令。结构化边界是风险缓解，不得宣称完全阻止Prompt Injection。
+- A5-4新增`evidence_validation_errors()`和`context-quality-gate-v1`；缺少论文ID、块ID、标题、正物理页或正文的证据必须在模型前剔除。
+- `report_context_quality`必须随LangGraph检查点持久化到`details_json.context_quality`，并通过状态API与页面展示；`model_call_allowed=false`时只允许确定性拒答。
+- 当前Token估算规则为中文字符1个、其他非空白字符约4个折算1个，不得称为DeepSeek官方Token。
+- A5-0至A5-4已覆盖公平配额、预算轮询、去重、结构化Prompt、质量门禁、模型阻断、A3/A4接入、状态落库和页面展示；完整离线测试为`119 passed`，没有调用真实外部API。
+- `request_plan_confirmation()`和`request_paper_selection()`在`interrupt()`前不得执行非幂等副作用；搜索完成后先入业务库，再用`update_state()`同步候选论文ID。
+- 设置`LANGGRAPH_STRICT_MSGPACK=true`；`SqliteSaver`只用于本地单实例，未来公网多实例必须换`PostgresSaver`。
+- 新增跨SQLite连接模拟进程重启测试，连续恢复两个中断且搜索节点仅执行一次；完整自动化测试为`93 passed`，没有调用真实DeepSeek、arXiv或Crossref。
+- A1-A5单Agent LangGraph主线已经完成；尚未实现MCP、长期记忆或自主反思循环，本版明确不做多Agent，不能宣称完整自主研究Agent。
+
+## v0.10.1 下载任务原子抢占
+
+- `db.claim_download()`使用单条条件`UPDATE`把允许的起始状态改为`downloading`，并以`cursor.rowcount == 1`判断当前请求是否取得下载资格；不得退回“先查询状态、再无条件更新”的写法。
+- `POST /papers/{paper_id}/download`只允许从`available`抢占，`POST /papers/{paper_id}/retry`只允许从`failed`抢占；抢占失败时不创建`BackgroundTasks`。
+- `mark_preparation_started()`复用同一抢占函数，覆盖“准备问答”和“仅下载”同时提交的竞争；`prepare_paper_for_qa(download_claimed=True)`表示路由已取得资格，后台工作函数不得再次抢占。
+- 该实现依赖数据库原子状态转换，不是分布式锁；SQLite与MySQL都能保留这一业务规则。公网部署仍需独立任务队列处理任务持久化、进程重启和Worker重试，两者不可互相替代。
+- 新增双线程同时抢占与失败状态重试测试；完整离线测试为`121 passed`，不调用真实下载服务或外部API。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为 `v0.9.0`：现有下载、解析和索引已连接成用户触发、可失败停止和断点续跑的问答准备闭环；默认检索策略仍为固定边界，完整自动化测试为`81 passed`。
+- 当前版本为 `v0.10.1`：在`v0.10.0`单Agent LangGraph闭环基础上，下载、重试和问答准备入口统一使用数据库原子抢占，只有成功完成状态转换的请求才创建后台下载任务；默认检索策略仍为固定边界，完整离线测试为`121 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。
