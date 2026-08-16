@@ -1059,7 +1059,7 @@ def test_execute_research_report_persists_checkpoint_progress(tmp_path, monkeypa
     monkeypatch.setattr(
         research_workflow,
         "stream_checkpointed_research_report",
-        lambda _thread_id: iter(states),
+        lambda _thread_id, **_kwargs: iter(states),
     )
 
     research_workflow.execute_research_report(task_id)

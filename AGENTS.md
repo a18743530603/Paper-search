@@ -1,12 +1,14 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.10.1`
+> 当前版本：`v0.11.4`
 >
-> 更新日期：`2026-08-06`
+> 更新日期：`2026-08-16`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
 > 完整实验步骤与待办：见 [EXPERIMENTS.md](EXPERIMENTS.md)
+>
+> 后续开发路线与实施日志：见 [ROADMAP.md](ROADMAP.md)
 
 > 发布状态：E3a/E3b、C1-C5、E3c、E4、G1-G3a 的代码、测试与实验记录已在 `v0.8.1` 统一归档发布。下文“实验完成时未单独提交”的描述仅保留当时的开发过程，不再表示这些内容禁止进入 Git。
 
@@ -54,6 +56,9 @@ https://github.com/a18743530603/Paper-search.git
 - `search_service.py`：检索并解析 arXiv XML 和 Crossref JSON，生成论文元数据和下载策略。
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常。
 - `paper_workflow.py`：将用户触发的下载、PDF解析和向量索引串成后台准备流程，按现有状态跳过已完成步骤并在失败阶段停止。
+- `agent_trace_service.py`：集中包装LangGraph节点，尽力记录成功、中断、部分成功和失败轨迹；Trace故障不得改变原节点行为。
+- `agent_metrics_service.py`：从任务、报告和Node Trace聚合带明确分子/分母/排除数的Agent运行指标；没有真实usage时不得生成Token数字。
+- `agent_evaluation_service.py`：维护11条冻结Agent场景，解析pytest JUnit XML，并把受控测试结果与运行Metrics分区生成JSON/文本报告。
 - `context_service.py`：在报告生成前校验证据字段、按论文执行保守文本去重，再按估算Token预算和跨论文公平配额选择证据；输出质量门禁、模型上下文、重复关系和压缩审计，不调用额外模型。
 - `research_agent.py`：使用LangGraph编排研究问题规划、三次`interrupt()`人工确认、多查询/单查询条件路由、搜索、论文选择、逐篇准备、证据检索、报告生成和引用检查；规划失败自动降级，不改变下载合规边界。
 - `research_checkpoint.py`：使用`SqliteSaver`、稳定`thread_id`和`Command(resume=...)`保存并恢复生产图；检查点与业务任务SQLite分开存储。
@@ -82,6 +87,8 @@ POST /research-tasks/{task_id}/cancel
 POST /research-tasks/{task_id}/select
 POST /research-tasks/{task_id}/report
 GET  /api/research-tasks/{task_id}
+GET  /api/research-tasks/{task_id}/traces
+GET  /api/agent/metrics
 GET  /papers
 GET  /papers/{paper_id}
 POST /papers/{paper_id}/retry
@@ -369,6 +376,7 @@ git push
 ## 用户偏好和维护约定
 
 - 解释应面向新手，同时保留可用于面试和简历的技术细节。
+- 学习过程中的检查题应以真实面试官会追问的“为什么这样设计、替代方案的代价、失败后会怎样、需求变化如何影响流程”为主，并根据刚学完的概念校准难度；除非用户明确要求语法练习，不要用单行变量取值、明显状态识别等低级记忆题。先完成项目化讲解，再进行简短检查，不要把整节课变成高压模拟面试。
 - 优先让项目稳定、合规、可演示，再逐步增加复杂能力。
 - 修改项目记忆时继续使用仓库根目录的 `AGENTS.md`。
 - 命令、路径、接口、字段名和代码标识符应保持原样，不要为了中文化而翻译它们。
@@ -622,13 +630,62 @@ git push
 - 该实现依赖数据库原子状态转换，不是分布式锁；SQLite与MySQL都能保留这一业务规则。公网部署仍需独立任务队列处理任务持久化、进程重启和Worker重试，两者不可互相替代。
 - 新增双线程同时抢占与失败状态重试测试；完整离线测试为`121 passed`，不调用真实下载服务或外部API。
 
+## v0.11.0 A6.1统一Agent Trace
+
+- 新增`agent_traces`表，字段包含可空`task_id`、`thread_id`、`node_name`、`status`、起止时间、`duration_ms`、`tool_calls_json`、可空模型调用/Token字段、`retry_count`和`error`。
+- 新增`create_agent_trace()`、`finish_agent_trace()`、`attach_agent_traces_to_task()`和`list_agent_traces()`；首次规划轨迹先按线程保存，业务任务创建后回填外键。
+- 新增`agent_trace_service.trace_node()`和集中`_add_traced_nodes()`注册方式；成功、Tool部分失败、`GraphInterrupt`和普通异常分别记录为`success/partial/interrupted/failed`。
+- Trace由LangGraph`configurable`中的显式开关、`thread_id`和`paper_hunter_task_id`控制；直接构图的旧测试不自动写入业务库。
+- 节点Trace是尽力记录：落库失败时继续执行原节点；节点本身失败时记录后重新抛出原异常，不改变工作流错误边界。
+- 新增`GET /api/research-tasks/{task_id}/traces`返回按执行顺序排列的结构化轨迹；本版不建设Metrics Dashboard。
+- `model_calls/input_tokens/output_tokens`暂时保持空值，不能把上下文估算Token冒充真实API usage。
+- 新增4项A6.1专项测试，覆盖任务回填、异常保持、Trace故障隔离和真实interrupt/resume重试；完整离线测试为`125 passed`，没有调用真实外部API。
+
+## v0.11.1 A6.2固定Agent场景测试
+
+- 新增`tests/agent/test_scenarios.py`，将Agent可靠性要求固定为8条独立、可重复运行的离线场景；不调用DeepSeek、Seed、arXiv或Crossref真实接口。
+- Planner调用失败时必须以原研究问题执行且只执行一次单查询fallback；用户在首个`interrupt()`拒绝计划时，搜索Tool调用次数必须为0。
+- `invoke_research_tool()`对未注册名称必须在Registry边界直接抛出错误，不能执行任何已注册工具或副作用；单个搜索源异常时工具结果应为`partial`并保留健康来源结果。
+- 单篇论文准备失败必须转成该论文的访问限制，循环继续处理其余论文；没有通过质量门禁的Evidence时必须生成确定性拒答，报告模型调用次数为0。
+- 使用同一`thread_id`和SQLite Checkpoint跨连接恢复时Planner只执行一次；重复下载和报告触发均通过数据库原子抢占保证只有一个请求取得资格。
+- A6.2场景测试`8 passed`，完整离线测试`133 passed`。本步骤验证受控场景行为，不等同于真实线上成功率，也不包含进程内`BackgroundTasks`的重启恢复。
+
+## v0.11.2 A6.3 Checkpoint恢复专项验证
+
+- 新增`tests/agent/test_checkpoint_recovery.py`，分别验证计划确认、论文选择和报告确认三个`interrupt()`暂停点的跨SQLite连接恢复。
+- 计划确认恢复后Planner调用次数保持1；用户拒绝时搜索调用保持0，Trace显示确认节点依次为`interrupted/success`。
+- 论文选择恢复后不重跑Planner、`multi_query_search`或`deduplicate_results`；恢复值只能从已冻结的候选论文ID中选择。
+- 报告确认恢复测试在第一篇论文完成后主动关闭流和连接，创建第三个图实例后从第二篇继续；两篇论文各准备和检索一次，报告模型只调用一次。
+- 专项测试同时校验关键Node Trace数量和状态，避免仅凭最终任务状态掩盖重复副作用。
+- A6.3专项测试`3 passed`，完整离线测试`136 passed`，无真实外部API调用。该结论只覆盖`SqliteSaver + thread_id + Command(resume=...)`，不覆盖`BackgroundTasks`跨进程恢复。
+
+## v0.11.3 A6.4 Agent Metrics
+
+- 新增`list_agent_metric_tasks()`和`list_agent_metric_traces()`，只读加载任务、报告和Trace快照；不新建指标数据表，不修改运行记录。
+- 新增`agent_metrics_service.build_agent_metrics()`，输出`agent-metrics-v1`，聚合Task Completion、Tool Success、Approval Compliance、Checkpoint Recovery、Fallback Success、平均任务/节点耗时以及失败和部分失败分布。
+- 每项比例保存`numerator/denominator/excluded/value_percent/definition`；等待审批、等待论文选择、未开始报告和用户取消不作为系统失败进入Task Completion分母。
+- Approval Compliance当前口径为“明确拒绝检索计划后零搜索”；Checkpoint Recovery只统计已有后续恢复尝试的中断，仍在等待用户的中断计入`excluded`。
+- `model_calls/input_tokens/output_tokens`只聚合Trace中的真实非空值；无观测时总量和平均值返回`null`，同时返回usage覆盖率。
+- 新增内部接口`GET /api/agent/metrics`；本版不增加普通用户Dashboard。pytest场景结果尚未持久化，`scenario_pass_rate`明确返回`not_persisted`，由A6.5报告单独接入。
+- 新增空数据、指标口径、真实usage、临时SQLite和API回归测试；A6.4专项测试`4 passed`，完整离线测试`140 passed`，无真实外部API调用。
+
+## v0.11.4 A6.5 Agent Evaluation Report
+
+- 新增`AgentScenario`与`AGENT_SCENARIOS`，冻结A6.2的8条固定可靠性场景和A6.3的3条Checkpoint恢复场景；测试函数名变化时清单和报告测试必须同步更新。
+- 新增`parse_junit_scenario_results()`，从pytest JUnit XML读取每条场景的`passed/failed/skipped/not_run`、耗时和错误；漏跑不能被当作通过。
+- 新增`build_agent_evaluation_report()`与`agent-evaluation-report-v1`，受控pytest结果和A6.4真实运行Metrics分别存放，报告包含版本、生成时间、总状态、样本、分子/分母和限制。
+- 新增`render_agent_evaluation_text()`与`save_agent_evaluation_report()`，原子写入带时间戳和`latest`别名的JSON/文本文件到`outputs/agent_evaluation/`。
+- 新增开发命令`scripts/run_agent_evaluation.py`；默认运行11条冻结场景并读取本地运行Metrics，`--skip-runtime-metrics`只报告离线场景。Web接口不得触发pytest。
+- `outputs/`由`.gitignore`排除，报告可能含本地运行统计，默认不进入公开Git；源码、冻结场景和测试必须提交。
+- 真实离线执行结果为`11/11 passed`，运行时样本因使用`--skip-runtime-metrics`显示N/A；新增4项报告测试，完整离线测试`144 passed`，无外部API调用。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为 `v0.10.1`：在`v0.10.0`单Agent LangGraph闭环基础上，下载、重试和问答准备入口统一使用数据库原子抢占，只有成功完成状态转换的请求才创建后台下载任务；默认检索策略仍为固定边界，完整离线测试为`121 passed`。
+- 当前版本为 `v0.11.4`：A1-A5单Agent闭环保持不变，A6已完成Trace、固定场景、Checkpoint恢复、Metrics和JSON/文本评测报告；真实离线场景`11/11 passed`，完整测试`144 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。

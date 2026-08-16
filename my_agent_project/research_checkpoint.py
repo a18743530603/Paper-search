@@ -11,6 +11,7 @@ from .research_agent import (
     build_checkpointed_research_graph,
     research_result_from_state,
 )
+from .agent_trace_service import TRACE_ENABLED_KEY, TRACE_TASK_ID_KEY
 
 
 _runtime_lock = Lock()
@@ -19,8 +20,19 @@ _checkpointer: SqliteSaver | None = None
 _research_graph = None
 
 
-def checkpoint_config(thread_id: str) -> dict[str, dict[str, str]]:
-    return {"configurable": {"thread_id": thread_id}}
+def checkpoint_config(
+    thread_id: str,
+    *,
+    task_id: int | None = None,
+    trace_enabled: bool = True,
+) -> dict[str, dict[str, Any]]:
+    configurable: dict[str, Any] = {
+        "thread_id": thread_id,
+        TRACE_ENABLED_KEY: trace_enabled,
+    }
+    if task_id is not None:
+        configurable[TRACE_TASK_ID_KEY] = task_id
+    return {"configurable": configurable}
 
 
 def get_checkpointed_research_graph():
@@ -69,22 +81,31 @@ def resume_plan_confirmation(
     thread_id: str,
     *,
     approved: bool,
+    task_id: int | None = None,
 ) -> ResearchSearchResult:
     graph = get_checkpointed_research_graph()
     graph.invoke(
         Command(resume={"approved": approved}),
-        config=checkpoint_config(thread_id),
+        config=checkpoint_config(thread_id, task_id=task_id),
     )
     return _checkpoint_result(thread_id)
 
 
-def load_checkpointed_research(thread_id: str) -> ResearchSearchResult:
+def load_checkpointed_research(
+    thread_id: str,
+    *,
+    task_id: int | None = None,
+) -> ResearchSearchResult:
     return _checkpoint_result(thread_id)
 
 
-def continue_checkpointed_research(thread_id: str) -> ResearchSearchResult:
+def continue_checkpointed_research(
+    thread_id: str,
+    *,
+    task_id: int | None = None,
+) -> ResearchSearchResult:
     graph = get_checkpointed_research_graph()
-    graph.invoke(None, config=checkpoint_config(thread_id))
+    graph.invoke(None, config=checkpoint_config(thread_id, task_id=task_id))
     return _checkpoint_result(thread_id)
 
 
@@ -101,6 +122,7 @@ def resume_paper_selection(
     *,
     paper_ids: list[int] | None = None,
     cancelled: bool = False,
+    task_id: int | None = None,
 ) -> ResearchSearchResult:
     graph = get_checkpointed_research_graph()
     graph.invoke(
@@ -110,14 +132,18 @@ def resume_paper_selection(
                 "cancelled": cancelled,
             }
         ),
-        config=checkpoint_config(thread_id),
+        config=checkpoint_config(thread_id, task_id=task_id),
     )
     return _checkpoint_result(thread_id)
 
 
-def stream_checkpointed_research_report(thread_id: str):
+def stream_checkpointed_research_report(
+    thread_id: str,
+    *,
+    task_id: int | None = None,
+):
     graph = get_checkpointed_research_graph()
-    config = checkpoint_config(thread_id)
+    config = checkpoint_config(thread_id, task_id=task_id)
     snapshot = graph.get_state(config)
     next_nodes = set(snapshot.next)
     graph_input = (

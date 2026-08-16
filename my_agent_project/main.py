@@ -12,8 +12,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .model_service import enhance_query, is_deepseek_configured
+from .agent_metrics_service import build_agent_metrics
 from .config import BASE_DIR, MAX_RESULTS, configure_utf8_stdio, ensure_runtime_dirs
 from .db import (
+    attach_agent_traces_to_task,
     cancel_research_task,
     claim_download,
     clear_paper_history,
@@ -33,6 +35,7 @@ from .db import (
     list_evaluation_cases,
     list_evaluation_results,
     list_evaluation_runs,
+    list_agent_traces,
     list_generation_evaluation_results,
     list_generation_evaluation_runs,
     list_paper_chunks,
@@ -104,7 +107,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.10.1")
+app = FastAPI(title="Paper Hunter", version="0.11.4")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -171,6 +174,7 @@ def search(
             status=RESEARCH_TASK_AWAITING,
             checkpoint_thread_id=thread_id,
         )
+        attach_agent_traces_to_task(thread_id, task_id)
         return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
 
     search_mode = SEARCH_MODE_STANDARD
@@ -247,9 +251,9 @@ def cancel_research_task_route(task_id: int):
         checkpoint = research_checkpoint_info(thread_id)
         next_nodes = set(checkpoint["next_nodes"])
         if "request_plan_confirmation" in next_nodes:
-            resume_plan_confirmation(thread_id, approved=False)
+            resume_plan_confirmation(thread_id, approved=False, task_id=task_id)
         elif "request_paper_selection" in next_nodes:
-            resume_paper_selection(thread_id, cancelled=True)
+            resume_paper_selection(thread_id, cancelled=True, task_id=task_id)
         else:
             delete_research_checkpoint(thread_id)
     if not cancel_research_task(task_id):
@@ -275,7 +279,11 @@ def select_research_papers(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     thread_id = task.get("checkpoint_thread_id") or ""
     if thread_id:
-        result = resume_paper_selection(thread_id, paper_ids=selected_ids)
+        result = resume_paper_selection(
+            thread_id,
+            paper_ids=selected_ids,
+            task_id=task_id,
+        )
         if result.workflow_status != "papers_selected":
             raise HTTPException(status_code=409, detail="Research checkpoint did not resume")
     selected = select_research_task_papers(
@@ -341,6 +349,23 @@ def research_task_status(task_id: int):
             else None
         ),
     }
+
+
+@app.get("/api/research-tasks/{task_id}/traces")
+def research_task_traces(task_id: int):
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    return {
+        "task_id": task_id,
+        "thread_id": task.get("checkpoint_thread_id") or "",
+        "traces": list_agent_traces(task_id=task_id),
+    }
+
+
+@app.get("/api/agent/metrics")
+def agent_metrics():
+    return build_agent_metrics()
 
 
 @app.get("/papers")

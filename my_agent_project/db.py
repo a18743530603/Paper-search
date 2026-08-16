@@ -88,6 +88,31 @@ CREATE TABLE IF NOT EXISTS research_tool_calls (
 CREATE INDEX IF NOT EXISTS idx_research_tool_calls_task_id
 ON research_tool_calls(task_id, call_index);
 
+CREATE TABLE IF NOT EXISTS agent_traces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    thread_id TEXT NOT NULL,
+    node_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT,
+    duration_ms INTEGER,
+    tool_calls_json TEXT NOT NULL DEFAULT '[]',
+    model_calls INTEGER,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_traces_task_id
+ON agent_traces(task_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_agent_traces_thread_node
+ON agent_traces(thread_id, node_name, id);
+
 CREATE TABLE IF NOT EXISTS research_reports (
     task_id INTEGER PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'not_started',
@@ -635,6 +660,149 @@ def list_research_tool_calls(task_id: int) -> list[dict]:
             call[target] = value if isinstance(value, dict) else {}
         calls.append(call)
     return calls
+
+
+def create_agent_trace(
+    *,
+    task_id: Optional[int],
+    thread_id: str,
+    node_name: str,
+    start_time: str,
+) -> int:
+    thread_id = thread_id.strip()
+    node_name = node_name.strip()
+    if not thread_id or not node_name:
+        raise ValueError("Agent Trace requires thread_id and node_name")
+
+    with connect() as conn:
+        retry_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_traces
+                WHERE thread_id = ? AND node_name = ?
+                """,
+                (thread_id, node_name),
+            ).fetchone()[0]
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO agent_traces (
+                task_id, thread_id, node_name, status, start_time, retry_count
+            )
+            VALUES (?, ?, ?, 'running', ?, ?)
+            """,
+            (task_id, thread_id, node_name, start_time, retry_count),
+        )
+        return int(cursor.lastrowid)
+
+
+def finish_agent_trace(
+    trace_id: int,
+    *,
+    status: str,
+    end_time: str,
+    duration_ms: int,
+    tool_calls: Optional[list[dict]] = None,
+    model_calls: Optional[int] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE agent_traces
+            SET status = ?, end_time = ?, duration_ms = ?, tool_calls_json = ?,
+                model_calls = ?, input_tokens = ?, output_tokens = ?, error = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (
+                status,
+                end_time,
+                max(0, int(duration_ms)),
+                json.dumps(tool_calls or [], ensure_ascii=False),
+                model_calls,
+                input_tokens,
+                output_tokens,
+                str(error or "")[:1000] or None,
+                trace_id,
+            ),
+        )
+
+
+def attach_agent_traces_to_task(thread_id: str, task_id: int) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE agent_traces
+            SET task_id = ?
+            WHERE thread_id = ? AND task_id IS NULL
+            """,
+            (task_id, thread_id),
+        )
+        return max(0, int(cursor.rowcount))
+
+
+def list_agent_traces(
+    *,
+    task_id: Optional[int] = None,
+    thread_id: str = "",
+) -> list[dict]:
+    if task_id is None and not thread_id:
+        return []
+    if task_id is not None:
+        where_clause = "task_id = ?"
+        parameters: tuple[object, ...] = (task_id,)
+    else:
+        where_clause = "thread_id = ?"
+        parameters = (thread_id,)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM agent_traces
+            WHERE {where_clause}
+            ORDER BY id
+            """,
+            parameters,
+        ).fetchall()
+    return [_agent_trace_from_row(row) for row in rows]
+
+
+def _agent_trace_from_row(row: sqlite3.Row) -> dict:
+    trace = dict(row)
+    try:
+        tool_calls = json.loads(trace["tool_calls_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        tool_calls = []
+    trace["tool_calls"] = tool_calls if isinstance(tool_calls, list) else []
+    return trace
+
+
+def list_agent_metric_traces() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_traces ORDER BY id"
+        ).fetchall()
+    return [_agent_trace_from_row(row) for row in rows]
+
+
+def list_agent_metric_tasks() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.id, t.checkpoint_thread_id, t.planner_status,
+                   t.status AS task_status, t.created_at, t.confirmed_at,
+                   t.completed_at AS task_completed_at,
+                   r.status AS report_status,
+                   r.started_at AS report_started_at,
+                   r.completed_at AS report_completed_at
+            FROM research_tasks AS t
+            LEFT JOIN research_reports AS r ON r.task_id = t.id
+            ORDER BY t.id
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _research_report_from_row(row: sqlite3.Row) -> dict:

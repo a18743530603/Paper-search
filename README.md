@@ -1,14 +1,24 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.10.1`
+> 当前版本：`v0.11.4`
 >
-> 更新日期：`2026-08-06`
+> 更新日期：`2026-08-16`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
 > 实验过程：见 [EXPERIMENTS.md](EXPERIMENTS.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+
+`v0.11.4` 完成A6.5 Agent Evaluation Report与整个A6阶段。新增11条冻结场景清单、JUnit解析、`agent-evaluation-report-v1` JSON结构、可读文本渲染和原子文件写入；开发命令会运行A6.2/A6.3场景并把受控测试结果与A6.4运行指标分区展示。报告保存到Git忽略的`outputs/agent_evaluation/`，源码和测试进入仓库，生成产物默认不提交。本次使用`--skip-runtime-metrics`避免读取本地运行库，真实结果为`11/11 passed`；完整离线测试`144 passed`。
+
+`v0.11.3` 完成A6.4 Agent Metrics。新增`agent_metrics_service.py`，从真实`research_tasks`、`research_reports`和`agent_traces`聚合任务完成率、Tool成功率、审批遵守率、Checkpoint恢复率、fallback成功率、任务/节点耗时及失败分布；每个比例都返回分子、分母、排除数和定义。等待用户操作的任务不会被算作系统失败，没有真实usage时Token与模型调用统计返回`null`。`GET /api/agent/metrics`提供内部JSON结果，本版不建设普通用户Dashboard。专项测试`4 passed`，完整离线测试`140 passed`。
+
+`v0.11.2` 完成A6.3 Checkpoint恢复专项验证。`tests/agent/test_checkpoint_recovery.py`分别从计划确认、论文选择和报告确认三个`interrupt()`暂停点关闭旧SQLite连接并创建新图恢复；调用计数与Trace共同证明Planner、搜索、已处理论文和报告模型不会因恢复而重复执行。报告测试还会在第一篇论文准备完成后人为中断，再从第二篇继续。专项测试`3 passed`，完整离线测试`136 passed`。这只证明LangGraph业务状态恢复，不代表进程内`BackgroundTasks`能在服务重启后自动续跑。
+
+`v0.11.1` 完成A6.2固定Agent场景测试。`tests/agent/test_scenarios.py`把8条关键可靠性契约集中成独立离线测试：Planner失败降级、人工拒绝后零Tool调用、非法Tool无副作用、单搜索源失败降级、单篇论文失败隔离、无合法证据零模型调用、原`thread_id`恢复不重跑Planner，以及重复下载/报告触发只允许一个请求取得执行资格。场景组`8 passed`，完整离线测试`133 passed`，全部使用mock和临时SQLite，不调用真实外部API。
+
+`v0.11.0` 完成A6.1统一Agent Trace。两个LangGraph的节点都通过同一个`trace_node()`包装器记录`task_id/thread_id/node/status/起止时间/耗时/Tool摘要/重试次数/错误`，不在每个节点复制日志代码。首次规划发生在业务任务创建前，轨迹先按`thread_id`保存并在任务创建后回填；`interrupt()`记为`interrupted`，恢复后的同名节点形成新尝试。Trace失败采用尽力记录，不改变原节点结果或异常。模型调用次数和Token字段只保留数据库位置，在API尚未可靠返回并持久化usage前保持空值。
 
 `v0.10.1` 为用户触发的PDF下载增加数据库原子抢占。普通下载只能用一条条件`UPDATE`把`available`改成`downloading`，失败重试只能从`failed`进入；只有实际更新一行的请求才会创建`BackgroundTasks`。因此快速双击、两个页面同时提交或“仅下载”和“准备问答”同时提交时，不会为同一篇论文重复启动下载。该规则直接使用SQLite事务和受影响行数，以后迁移MySQL仍可保留。
 
@@ -126,6 +136,22 @@ uv run uvicorn my_agent_project.main:app --host 127.0.0.1 --port 8002
 uv run pytest
 ```
 
+### 4. 生成Agent评测报告
+
+运行冻结的11条可靠性场景，并组合当前本地运行Trace指标：
+
+```powershell
+uv run python scripts/run_agent_evaluation.py
+```
+
+只生成受控场景报告、不读取本地运行SQLite：
+
+```powershell
+uv run python scripts/run_agent_evaluation.py --skip-runtime-metrics
+```
+
+JSON与文本报告保存到`outputs/agent_evaluation/`。该目录由`.gitignore`排除；报告可能包含本地运行统计，不应默认提交公开仓库。
+
 ## 使用方法
 
 1. 打开首页。
@@ -195,6 +221,9 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- download_service.py
 |   |-- paper_workflow.py
 |   |-- context_service.py
+|   |-- agent_trace_service.py
+|   |-- agent_metrics_service.py
+|   |-- agent_evaluation_service.py
 |   |-- research_agent.py
 |   |-- research_checkpoint.py
 |   |-- research_tools.py
@@ -208,11 +237,14 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- origin_service.py
 |   |-- templates/
 |   `-- static/
+|-- scripts/
+|   `-- run_agent_evaluation.py
 |-- tests/
 |-- benchmarks/
 |   `-- chunking_baseline.csv # 60 条人工标注检索案例
 |-- downloads/              # 运行时生成，不提交到 Git
 |-- AGENTS.md                # 项目背景和后续对话记忆
+|-- ROADMAP.md               # 后续路线与逐步实施日志
 |-- ORIGIN.md                # Origin 绘图说明
 |-- PROJECT.md               # 项目概述和简历描述
 |-- pyproject.toml           # 依赖与测试配置
@@ -238,6 +270,8 @@ POST /research-tasks/{task_id}/cancel
 POST /research-tasks/{task_id}/select
 POST /research-tasks/{task_id}/report
 GET  /api/research-tasks/{task_id}
+GET  /api/research-tasks/{task_id}/traces
+GET  /api/agent/metrics
 GET  /papers
 GET  /papers/{paper_id}
 POST /papers/{paper_id}/retry
@@ -306,6 +340,39 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 - 重复审计包含`overlap_ratio`和`duplicate_of`，可以定位被删除块及其对应的保留块；不同论文永远不会互相去重。
 - `quality_gate`记录`passed/warning/failed`、五项检查、接受/拒绝数量和`model_call_allowed`；失败时不得调用模型。
 - 极小预算无法满足每篇最低配额时不偷偷突破上限，而是将`minimum_quota_satisfied`设为`false`并列出论文。
+
+### `agent_trace_service.py`
+
+负责A6.1统一节点可观测性，不修改节点原有业务逻辑：
+
+- `trace_node()`：集中包装LangGraph节点，记录`success/partial/interrupted/failed`状态、耗时、Tool摘要和异常。
+- Trace只有在生产`configurable`显式开启时落库；普通直接构图和旧单元测试不会写入运行数据库。
+- 第一次`interrupt()`形成中断轨迹，使用同一`thread_id`恢复后形成新尝试并递增`retry_count`。
+- Trace写入失败时继续执行原节点；节点异常记录后仍抛出原异常。
+- `model_calls/input_tokens/output_tokens`等待真实API usage贯通，当前保持空值。
+
+### `agent_metrics_service.py`
+
+负责A6.4内部运行指标聚合，不调用额外模型，也不修改业务数据：
+
+- `build_agent_metrics()`读取任务、报告和Node Trace，返回`agent-metrics-v1`结构化结果。
+- 所有比例同时返回`numerator/denominator/excluded/value_percent/definition`，分母为0时百分比为`null`。
+- Task Completion只比较报告完成与系统失败；等待审批、等待选择、未生成报告和用户取消不进入分母。
+- Approval Compliance只检查明确拒绝计划的线程是否保持零搜索；Checkpoint Recovery只统计确实发起后续尝试的中断。
+- 节点耗时按Node分别输出平均值和样本数；`failed`与`partial`分开统计，避免把降级混同为崩溃。
+- 模型调用和Token只聚合Trace中真实非空usage；当前未贯通usage时返回`null`并报告观测覆盖率。
+- pytest场景结果没有写入运行数据库，因此`scenario_pass_rate`暂为`not_persisted`，由A6.5报告层单独提供。
+
+### `agent_evaluation_service.py`
+
+负责A6.5评测报告建模、渲染与保存，不在FastAPI请求中运行pytest：
+
+- `AGENT_SCENARIOS`冻结A6.2的8条可靠性场景和A6.3的3条Checkpoint恢复场景。
+- `parse_junit_scenario_results()`解析pytest JUnit XML，区分`passed/failed/skipped/not_run`并保留失败原因和耗时。
+- `build_agent_evaluation_report()`生成`agent-evaluation-report-v1`，受控场景与真实运行指标分别保存。
+- `render_agent_evaluation_text()`输出包含样本数、分子/分母、失败场景、延迟和限制说明的文本报告。
+- `save_agent_evaluation_report()`原子写入带时间戳及`latest`版本的JSON和文本文件。
+- `scripts/run_agent_evaluation.py`是开发命令入口；默认读取运行Metrics，`--skip-runtime-metrics`可只执行离线场景。
 
 ### `research_agent.py`
 

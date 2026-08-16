@@ -2,6 +2,65 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.11.4` - 2026-08-16
+
+### A6.5 Agent Evaluation Report
+
+- 新增`AgentScenario`与11条冻结场景清单，覆盖A6.2固定可靠性行为和A6.3 Checkpoint恢复；`scenario_test_nodeids()`只运行清单中的测试。
+- 新增pytest JUnit XML解析，逐场景保存状态、耗时与错误；`failed/skipped/not_run`均不能冒充通过。
+- 新增`agent-evaluation-report-v1` JSON和可读文本报告，受控pytest结果与A6.4运行Metrics分区展示，并保留版本、生成时间、样本、指标口径和限制。
+- 新增原子文件保存，向`outputs/agent_evaluation/`写入带时间戳和`latest`的JSON/文本文件；`outputs/`继续由Git忽略。
+- 新增`scripts/run_agent_evaluation.py`开发入口；默认组合本地运行Metrics，`--skip-runtime-metrics`可避免读取运行SQLite，FastAPI接口不执行pytest。
+- 修复Windows评测命令打印中文路径时的输出编码，复用`configure_utf8_stdio()`。
+- 本次使用跳过运行Metrics模式真实执行冻结场景，结果`11/11 passed`；运行样本为0时报告明确显示N/A。
+- 新增4项报告清单、JUnit解析、结构隔离和文件保存测试；完整离线测试`144 passed`，没有调用外部API。A6.1至A6.5至此完成。
+
+## `v0.11.3` - 2026-08-16
+
+### A6.4 Agent Metrics
+
+- 新增`list_agent_metric_tasks()`与`list_agent_metric_traces()`只读快照函数，以及`agent_metrics_service.build_agent_metrics()`指标聚合服务。
+- 新增Task Completion、Tool Success、Approval Compliance、Checkpoint Recovery和Fallback Success；所有比例返回分子、分母、排除数、百分比和定义。
+- 等待审批、等待选择、未生成报告和用户取消不作为系统失败；尚未发起恢复的`interrupt()`不进入恢复率分母。
+- 新增任务与节点平均耗时、按节点失败/部分失败分布，以及Tool部分成功计数。
+- 模型调用与Token只聚合Trace中真实保存的usage；无观测时返回`null`与覆盖率，不使用上下文估算值。
+- 新增内部JSON接口`GET /api/agent/metrics`；pytest场景结果未写入运行数据库，Scenario Pass Rate明确标为`not_persisted`，本版不建设Dashboard。
+- 新增4项Metrics专项测试；完整离线测试`140 passed`，没有调用真实外部API。
+
+## `v0.11.2` - 2026-08-16
+
+### A6.3 Checkpoint恢复专项验证
+
+- 新增`tests/agent/test_checkpoint_recovery.py`，分别从计划确认、论文选择和报告确认三个`interrupt()`暂停点关闭旧SQLite连接并创建新图恢复。
+- 计划确认恢复验证Planner只调用一次，拒绝后搜索Tool调用为0；论文选择恢复验证Planner、搜索与去重节点均不重放。
+- 报告恢复测试在第一篇论文准备完成后主动中断，再由第三个图实例从第二篇继续；两篇论文各准备、检索一次，报告模型只调用一次。
+- 调用计数与`agent_traces`共同验证恢复正确，避免只检查最终状态而漏掉重复副作用。
+- 本版没有修改生产业务逻辑，也没有调用真实外部API；A6.3专项测试`3 passed`，完整离线测试`136 passed`。
+- 验证边界仅为`SqliteSaver + thread_id + Command(resume=...)`；进程内`BackgroundTasks`的服务重启恢复仍由B1可靠Worker/Queue解决。
+
+## `v0.11.1` - 2026-08-16
+
+### A6.2固定Agent场景测试
+
+- 新增`tests/agent/test_scenarios.py`，把Planner失败、人工拒绝、非法Tool、搜索源失败、单篇论文失败、无合法Evidence、Checkpoint恢复和重复触发固定为8条独立场景。
+- Planner失败场景验证原问题单查询fallback；人工拒绝场景验证搜索Tool零调用；非法Tool场景验证Registry在执行前拦截且无副作用。
+- 来源失败场景验证健康搜索源继续返回并标记`partial`；单篇论文失败场景验证其余论文继续处理；Evidence门禁场景验证无证据时不调用报告模型。
+- Checkpoint场景跨SQLite连接使用原`thread_id`恢复并断言Planner不重跑；重复触发场景并发验证下载和报告均只有一个请求取得数据库执行资格。
+- 本版没有修改生产业务逻辑，也没有调用真实外部API；A6.2场景测试`8 passed`，完整离线测试`133 passed`。
+- A6.3仍需专项验证三个`interrupt()`位置的恢复、已完成节点不重放和Trace一致性；`BackgroundTasks`跨进程恢复仍属于B1。
+
+## `v0.11.0` - 2026-08-16
+
+### A6.1统一Agent Trace
+
+- 新增`agent_traces`表与创建、结束、任务回填和查询函数，保存节点状态、起止时间、耗时、Tool摘要、重试次数和错误。
+- 新增`agent_trace_service.py`；`trace_node()`统一包装两个LangGraph中的所有节点，避免在业务节点中重复写日志代码。
+- 首次规划在业务任务创建前按`thread_id`记录，创建`research_tasks`后通过`attach_agent_traces_to_task()`回填`task_id`；后续恢复在LangGraph配置中显式传递任务ID。
+- `GraphInterrupt`记录为`interrupted`并继续交给LangGraph处理；恢复后同名节点新增一次尝试并递增`retry_count`。普通异常记录为`failed`后原样抛出，Trace存储异常不会中断业务节点。
+- Tool返回包含失败或降级时节点可记录`partial`及错误摘要；`model_calls/input_tokens/output_tokens`字段暂不填充，等待模型API真实usage贯通。
+- 新增`GET /api/research-tasks/{task_id}/traces`结构化查询接口；本版不实现Metrics和Dashboard。
+- 新增4项Trace专项测试并修正一个旧mock对新增`task_id`关键字的兼容性；完整离线测试为`125 passed`，没有调用真实外部API。
+
 ## `v0.10.1` - 2026-08-06
 
 ### PDF下载任务原子抢占

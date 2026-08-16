@@ -1,8 +1,8 @@
 # Paper Hunter 项目概述
 
-> 当前版本：`v0.10.1`
+> 当前版本：`v0.11.4`
 >
-> 更新日期：`2026-08-06`
+> 更新日期：`2026-08-16`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 
@@ -38,6 +38,11 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - A5-2在公平分配前执行同论文保守去重：规范化精确重复直接合并，同页或相邻页且5-token shingle覆盖率不低于`0.85`的高重叠证据合并；跨论文内容始终保留，删除记录可审计。
 - A5-3把自由文本Prompt替换为`research-context-json-v1`不可信数据载荷，证据稳定编号并保留来源元数据；系统指令明确拒绝执行证据中的命令式文本。
 - A5-4新增`context-quality-gate-v1`，在模型调用前校验证据字段、物理页码、Token预算、计数和论文配额；失败时确定性拒答并把结果写入检查点、报告、API和页面。
+- A6.1新增统一Agent节点轨迹：`agent_trace_service.trace_node()`集中包装LangGraph节点，`agent_traces`保存线程、任务、节点、状态、耗时、Tool摘要、重试次数和错误；`GET /api/research-tasks/{task_id}/traces`提供结构化查询。
+- A6.2把8条Agent可靠性契约集中到`tests/agent/test_scenarios.py`：覆盖Planner降级、人工拒绝、Tool白名单、来源降级、单篇失败、Evidence门禁、Checkpoint恢复和重复触发幂等；完整离线测试为`133 passed`。
+- A6.3新增三个Checkpoint恢复专项测试：跨SQLite连接恢复计划确认、论文选择和报告确认，断言Planner、搜索、已完成论文节点及报告模型不重复执行；完整离线测试为`136 passed`。
+- A6.4新增`agent_metrics_service.py`和`GET /api/agent/metrics`，聚合任务、Tool、审批、恢复、fallback、耗时和失败分布；比例保留分子/分母/排除数，无真实usage时Token字段为`null`，完整离线测试为`140 passed`。
+- A6.5新增`agent_evaluation_service.py`与`scripts/run_agent_evaluation.py`，运行11条冻结场景并生成分离展示pytest结果和运行Metrics的JSON/文本报告；实测`11/11 passed`，完整离线测试`144 passed`。
 
 ## 当前 RAG 建设进度
 

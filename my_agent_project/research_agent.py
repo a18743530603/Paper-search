@@ -4,6 +4,7 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from .agent_trace_service import trace_node
 from .context_service import pack_research_context
 from .model_service import (
     ModelConfigurationError,
@@ -471,13 +472,23 @@ def validate_report_citations_node(state: ResearchSearchState) -> dict[str, Any]
     }
 
 
+def _add_traced_nodes(builder, nodes: dict[str, Any]) -> None:
+    for node_name, node in nodes.items():
+        builder.add_node(node_name, trace_node(node_name, node))
+
+
 def build_research_search_graph():
     builder = StateGraph(ResearchSearchState)
-    builder.add_node("plan_research", plan_research)
-    builder.add_node("await_confirmation", await_confirmation)
-    builder.add_node("multi_query_search", multi_query_search)
-    builder.add_node("single_query_search", single_query_search)
-    builder.add_node("deduplicate_results", deduplicate_results)
+    _add_traced_nodes(
+        builder,
+        {
+            "plan_research": plan_research,
+            "await_confirmation": await_confirmation,
+            "multi_query_search": multi_query_search,
+            "single_query_search": single_query_search,
+            "deduplicate_results": deduplicate_results,
+        },
+    )
     builder.add_edge(START, "plan_research")
     builder.add_conditional_edges(
         "plan_research",
@@ -500,21 +511,26 @@ RESEARCH_SEARCH_GRAPH = build_research_search_graph()
 
 def build_checkpointed_research_graph(checkpointer):
     builder = StateGraph(ResearchSearchState)
-    builder.add_node("plan_research", plan_research)
-    builder.add_node("request_plan_confirmation", request_plan_confirmation)
-    builder.add_node("multi_query_search", multi_query_search)
-    builder.add_node("single_query_search", single_query_search)
-    builder.add_node("cancel_research", cancel_research)
-    builder.add_node("deduplicate_results", deduplicate_results)
-    builder.add_node("request_paper_selection", request_paper_selection)
-    builder.add_node("request_report_confirmation", request_report_confirmation)
-    builder.add_node("prepare_report_paper", prepare_report_paper_node)
-    builder.add_node("retrieve_report_evidence", retrieve_report_evidence_node)
-    builder.add_node("begin_report_generation", begin_report_generation)
-    builder.add_node("synthesize_research_report", synthesize_research_report)
-    builder.add_node("validate_report_citations", validate_report_citations_node)
-    builder.add_node("request_report_regeneration", request_report_regeneration)
-    builder.add_node("cancel_report", cancel_report)
+    _add_traced_nodes(
+        builder,
+        {
+            "plan_research": plan_research,
+            "request_plan_confirmation": request_plan_confirmation,
+            "multi_query_search": multi_query_search,
+            "single_query_search": single_query_search,
+            "cancel_research": cancel_research,
+            "deduplicate_results": deduplicate_results,
+            "request_paper_selection": request_paper_selection,
+            "request_report_confirmation": request_report_confirmation,
+            "prepare_report_paper": prepare_report_paper_node,
+            "retrieve_report_evidence": retrieve_report_evidence_node,
+            "begin_report_generation": begin_report_generation,
+            "synthesize_research_report": synthesize_research_report,
+            "validate_report_citations": validate_report_citations_node,
+            "request_report_regeneration": request_report_regeneration,
+            "cancel_report": cancel_report,
+        },
+    )
     builder.add_edge(START, "plan_research")
     builder.add_edge("plan_research", "request_plan_confirmation")
     builder.add_conditional_edges(

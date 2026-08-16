@@ -48,11 +48,15 @@ def execute_research_task(task_id: int) -> None:
             checkpoint = research_checkpoint_info(thread_id)
             next_nodes = set(checkpoint["next_nodes"])
             if "request_plan_confirmation" in next_nodes:
-                result = resume_plan_confirmation(thread_id, approved=True)
+                result = resume_plan_confirmation(
+                    thread_id,
+                    approved=True,
+                    task_id=task_id,
+                )
             elif "request_paper_selection" in next_nodes:
-                result = load_checkpointed_research(thread_id)
+                result = load_checkpointed_research(thread_id, task_id=task_id)
             else:
-                result = continue_checkpointed_research(thread_id)
+                result = continue_checkpointed_research(thread_id, task_id=task_id)
         else:
             result = run_confirmed_research_search(
                 task["question"],
@@ -132,7 +136,10 @@ def execute_research_report(task_id: int) -> None:
         if not set(checkpoint["next_nodes"]) & REPORT_CHECKPOINT_NODES:
             generate_research_report(task_id)
             return
-        for state in stream_checkpointed_research_report(thread_id):
+        for state in stream_checkpointed_research_report(
+            thread_id,
+            task_id=task_id,
+        ):
             _persist_report_graph_state(task_id, state)
     except Exception as exc:
         update_research_report(
