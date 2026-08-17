@@ -2,6 +2,53 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.12.3` - 2026-08-16
+
+### A7.4 stdio MCP Client冒烟验证
+
+- 新增`scripts/smoke_mcp_client.py`，通过当前Python解释器启动独立MCP Server子进程，使用stdio完成真实协议握手。
+- Client只执行初始化和Tool发现，不读取论文记录、不调用arXiv/Crossref、Seed或DeepSeek，也不触发业务副作用。
+- 严格校验Server名称和三个Tool清单；超时、进程错误或清单漂移都会使命令返回非零退出码。
+- 成功输出稳定JSON，包含Server名、SDK Server版本、MCP协议版本、传输类型和Tool列表。
+- 精确过滤SDK已知且无关的Pydantic `lifespan`警告，将Server普通请求日志调整到WARNING，保持标准输出可机器读取。
+- 真实运行结果：`paper-hunter`、Server版本`1.29.0`、协议`2025-11-25`、stdio、3个Tool全部发现。
+- 新增1项真实子进程测试；MCP专项`13 passed`、完整离线测试`157 passed`。A7最小MCP Server阶段完成。
+
+## `v0.12.2` - 2026-08-16
+
+### A7.3 MCP论文证据检索Tool
+
+- 新增`retrieve_public_paper_evidence()`，通过现有白名单Registry调用`retrieve_paper_evidence` StructuredTool，不复制RAG检索逻辑。
+- MCP新增`retrieve_paper_evidence(paper_id, question, top_k=3)`，返回论文标题、访问链接、带物理页码的证据、检索评分和结构化错误。
+- 保持正整数论文ID、非空问题及Top-K 1至6校验；无证据返回`failed`，不自动启动论文准备。
+- 未向MCP注册`prepare_paper_for_research`，所以MCP Host不能借证据检索触发下载、PDF解析或索引。
+- Tool对论文业务状态只读；Seed可用且查询未缓存时，底层可能调用Embedding API并更新内部向量缓存，文档和`openWorldHint`已如实标注。
+- 新增3项适配、无自动准备和协议级调用测试；MCP专项`12 passed`，完整离线测试`156 passed`，外部能力全部mock。
+- A7尚余独立stdio MCP Client冒烟命令与子进程传输验证。
+
+## `v0.12.1` - 2026-08-16
+
+### A7.2 MCP文献检索Tool
+
+- 新增`search_public_literature()`，通过现有`RESEARCH_TOOL_REGISTRY`调用`search_literature` StructuredTool，不复制检索、校验或降级逻辑。
+- MCP Server新增`search_literature(query, max_results=10)`，返回候选论文、来源计数、`succeeded/partial/failed`状态、错误和耗时。
+- 继续复用空查询、240字符上限和1至50条结果范围校验；非法请求不会到达arXiv/Crossref。
+- Tool只读且无数据库副作用，但设置`openWorldHint=True`准确表示实际调用会访问外部搜索源；不下载PDF、不调用DeepSeek或Seed。
+- 新增3项委托、校验和协议调用测试；MCP专项`9 passed`、完整离线测试`153 passed`，全部外部检索使用mock。
+- A7尚余`retrieve_paper_evidence`和最终stdio客户端冒烟验证，当前不能宣称完整MCP工具集已经完成。
+
+## `v0.12.0` - 2026-08-16
+
+### A7.1最小MCP只读接入
+
+- 新增官方MCP Python SDK依赖并锁定`mcp>=1.27,<2`，由`uv.lock`固定当前解析版本。
+- 新增`my_agent_project/mcp_server.py`，保持`Service Layer -> FastAPI/MCP Server`并列架构；MCP通过stdio独立运行，不复制数据库逻辑。
+- 新增`build_public_paper_metadata()`和`get_paper_metadata(paper_id)` Tool，复用`db.get_paper()`与`paper_access_url()`返回结构化公开元数据。
+- Tool只读、幂等且无开放世界副作用；明确过滤`local_path`，不下载PDF、不修改数据库、不调用DeepSeek、Seed、arXiv或Crossref。
+- 新增6项测试，覆盖公开字段、路径过滤、参数校验、不存在记录，以及MCP Client的初始化、Tool发现、结构化调用和标准Tool错误。
+- 专项测试`6 passed`，完整离线测试`150 passed`；MCP SDK当前产生1条不影响运行的Pydantic前向引用警告。
+- A7尚未完成：`search_literature`和`retrieve_paper_evidence`将在后续小步骤接入并单独验证。
+
 ## `v0.11.4` - 2026-08-16
 
 ### A6.5 Agent Evaluation Report

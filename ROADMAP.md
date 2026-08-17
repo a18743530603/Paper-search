@@ -1,10 +1,10 @@
 # Paper Hunter 后续开发路线与实施日志
 
-> 当前项目版本：`v0.11.4`
+> 当前项目版本：`v0.12.3`
 >
 > 日志建立日期：`2026-08-16`
 >
-> 当前阶段：`A7 最小MCP Server（下一步）`
+> 当前阶段：`B1 可靠Worker/Queue（下一步）`
 
 本文件用于在后续 Codex 对话之间同步开发路线和实际进度。它记录“接下来为什么做、做到哪里、验证结果和下一步”，功能细节仍写入 `README.md`、`PROJECT.md`、`CHANGELOG.md` 和 `AGENTS.md`，实验数据仍写入 `EXPERIMENTS.md`。
 
@@ -188,7 +188,7 @@ A6证明的是当前单Agent工作流在受控故障、审批、幂等和Checkpo
 
 ## A7：最小 MCP Server
 
-**状态：未开始**
+**状态：已完成（v0.12.3）**
 
 保持以下架构：
 
@@ -205,6 +205,41 @@ Service Layer
 - `get_paper_metadata`
 
 MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒烟测试，验证客户端调用经过 MCP Tool 到达现有 Service 并返回结构化结果。
+
+### A7.1实现结果
+
+- 使用官方MCP Python SDK 1.x新增独立stdio Server，不修改FastAPI页面或路由。
+- 首个`get_paper_metadata` Tool复用`db.get_paper()`和`paper_access_url()`；只返回公开字段，过滤本地文件路径。
+- Tool声明只读、非破坏、幂等和封闭世界安全注解；无下载、写库、外部API或模型调用。
+- 官方内存Client完成协议初始化、`list_tools`、`call_tool`结构化调用和标准错误验证，专项`6 passed`，完整离线测试`150 passed`。
+
+### A7.2实现结果
+
+- 新增`search_literature` MCP Tool，通过白名单Registry复用现有LangChain StructuredTool。
+- 输入校验、arXiv/Crossref双来源检索、来源统计和部分失败语义保持不变；MCP层不写数据库或下载文件。
+- 协议级Client验证结构化候选与`partial`状态；非法空查询在访问外部服务前被现有校验拒绝。
+- MCP专项`9 passed`，完整离线测试`153 passed`，外部检索全部使用mock。
+
+### A7.3实现结果
+
+- 新增`retrieve_paper_evidence` MCP Tool，通过Registry复用现有页码证据检索。
+- 只面向已索引论文；无证据返回结构化失败，不自动下载、解析或索引，也不暴露论文准备Tool。
+- 对论文业务状态只读；Seed查询向量可能访问外部Embedding服务并更新内部缓存，使用`openWorldHint=True`准确描述。
+- MCP专项`12 passed`，完整离线测试`156 passed`，测试没有读取真实PDF或调用外部API。
+
+### A7.4实现结果
+
+- 新增独立stdio Client冒烟命令，以真实Python子进程启动MCP Server。
+- 只执行协议初始化与Tool发现，严格验证Server名称和三个Tool，不调用业务数据或外部API。
+- 真实结果为Server `paper-hunter`、版本`1.29.0`、协议`2025-11-25`、stdio与3个Tool；输出为稳定JSON。
+- 新增真实子进程测试；MCP专项`13 passed`，完整离线测试`157 passed`。
+
+### A7阶段完成结论
+
+- FastAPI与MCP Server并列复用同一Service Layer，没有维护第二套业务实现。
+- MCP只暴露元数据查询、公开文献检索和已索引证据检索；下载、解析、索引和报告生成不对MCP开放。
+- 内存Client覆盖结构化调用和错误语义，stdio Client覆盖真实进程边界和协议握手。
+- A7不解决后台任务跨进程可靠性；下一步进入B1 Worker/Queue。
 
 ## B1：可靠 Worker / Queue
 
@@ -285,3 +320,39 @@ MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒�
 - 生成产物位于`outputs/agent_evaluation/`并由Git忽略，防止本地运行信息进入公开仓库。
 - 结论：Paper Hunter已经具备Agent Trace、可靠性场景、Checkpoint专项恢复、Metrics和可复现评测报告闭环。
 - 下一步：在上传A6版本前检查Git差异和敏感文件；随后进入A7最小MCP Server，复用现有Service Layer暴露2至3个受控工具。
+
+### 2026-08-16：完成A7.1最小MCP只读接入
+
+- 发布版本：`v0.12.0`。
+- 新增官方MCP Python SDK 1.x、独立`mcp_server.py`与`get_paper_metadata`只读Tool。
+- Tool复用现有数据库和访问链接服务，返回结构化公开元数据并过滤`local_path`；没有新增数据表、FastAPI路由或外部API调用。
+- 使用官方内存传输运行真实MCP Client，验证初始化、Tool发现、调用和标准Tool错误；专项`6 passed`，完整离线测试`150 passed`。
+- 结论：FastAPI和MCP已形成共享Service Layer的双入口雏形，但A7目前只有一个只读能力，不能宣称完整工具集。
+- 下一步：A7.2接入`search_literature`，保持现有输入限制与arXiv/Crossref单源失败降级语义。
+
+### 2026-08-16：完成A7.2 MCP文献检索Tool
+
+- 发布版本：`v0.12.1`。
+- 新增`search_public_literature()`和同名MCP Tool，通过白名单Registry复用现有StructuredTool，不复制搜索业务。
+- Tool返回候选、来源统计、状态、错误和耗时；单来源失败继续返回`partial`及健康来源结果。
+- MCP适配不写库、不下载、不调用模型；真实运行需要访问arXiv/Crossref，测试全部使用mock。
+- MCP专项`9 passed`，完整离线测试`153 passed`。
+- 下一步：A7.3接入只读证据检索Tool，并补最终stdio客户端冒烟验证。
+
+### 2026-08-16：完成A7.3 MCP论文证据检索Tool
+
+- 发布版本：`v0.12.2`。
+- 新增证据检索MCP适配和Tool，返回已索引论文的物理页码证据及评分。
+- 无证据或未准备论文不触发`prepare_paper_for_research`；MCP工具集合中不存在下载、解析或索引入口。
+- 如Seed已配置，检索可能调用Embedding并写查询缓存；该技术副作用已明确记录，论文业务状态保持只读。
+- MCP专项`12 passed`，完整离线测试`156 passed`。
+- 下一步：A7.4增加独立stdio客户端冒烟命令并完成A7阶段。
+
+### 2026-08-16：完成A7.4与整个A7阶段
+
+- 发布版本：`v0.12.3`。
+- 新增stdio Client冒烟脚本和真实子进程测试，只握手和列出Tool，不调用业务能力。
+- 真实运行发现Server `paper-hunter`、协议`2025-11-25`及三个预期Tool，JSON输出干净可机器读取。
+- MCP专项`13 passed`，完整离线测试`157 passed`。
+- 结论：最小MCP Server已具备共享Service Layer、受控Tool、协议测试和真实传输验证，A7完成。
+- 下一步：B1先设计持久任务模型与Worker边界，再替换关键`BackgroundTasks`，不能直接堆Redis/Celery名称。

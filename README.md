@@ -1,6 +1,6 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.11.4`
+> 当前版本：`v0.12.3`
 >
 > 更新日期：`2026-08-16`
 >
@@ -9,6 +9,14 @@
 > 实验过程：见 [EXPERIMENTS.md](EXPERIMENTS.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+
+`v0.12.3` 完成A7.4真实stdio MCP Client冒烟验证，并结束整个A7阶段。新增`scripts/smoke_mcp_client.py`，使用当前Python解释器启动独立`my_agent_project.mcp_server`子进程，通过stdin/stdout完成协议初始化和Tool发现，不调用业务Tool。真实运行确认Server为`paper-hunter`、协议版本`2025-11-25`，并准确发现三个Tool；MCP专项`13 passed`、完整离线测试`157 passed`。
+
+`v0.12.2` 完成A7.3 MCP论文证据检索Tool。新增`retrieve_paper_evidence(paper_id, question, top_k=3)`，通过现有Tool Registry读取已索引文本块并返回论文标题、合法访问链接、物理页码和评分。它不会自动下载、解析或索引论文；无证据时返回结构化失败。若Seed已配置，查询向量可能调用Embedding API并写入内部向量缓存，但不会修改论文正文或处理状态。MCP专项`12 passed`、完整离线测试`156 passed`。
+
+`v0.12.1` 完成A7.2 MCP文献检索Tool。新增`search_literature(query, max_results=10)`，MCP层通过现有白名单Registry调用LangChain StructuredTool，复用关键词清洗、输入上限、arXiv/Crossref检索、来源统计及`partial/failed`降级，不复制搜索逻辑。该Tool只返回元数据，不写数据库、不下载PDF；实际调用会访问外部搜索源，离线测试使用mock。MCP专项`9 passed`、完整离线测试`153 passed`。
+
+`v0.12.0` 完成A7.1最小MCP只读接入。新增独立`mcp_server.py`，通过官方MCP Python SDK暴露`get_paper_metadata` Tool；它复用`db.get_paper()`与现有访问链接规则，只返回公开论文元数据和状态，明确过滤本地文件路径。协议级内存Client测试真实执行`initialize -> list_tools -> call_tool`并验证标准Tool错误，专项测试`6 passed`、完整离线测试`150 passed`。本版没有开放下载、写库、外部检索或模型调用，A7.2再接`search_literature`。
 
 `v0.11.4` 完成A6.5 Agent Evaluation Report与整个A6阶段。新增11条冻结场景清单、JUnit解析、`agent-evaluation-report-v1` JSON结构、可读文本渲染和原子文件写入；开发命令会运行A6.2/A6.3场景并把受控测试结果与A6.4运行指标分区展示。报告保存到Git忽略的`outputs/agent_evaluation/`，源码和测试进入仓库，生成产物默认不提交。本次使用`--skip-runtime-metrics`避免读取本地运行库，真实结果为`11/11 passed`；完整离线测试`144 passed`。
 
@@ -177,6 +185,30 @@ JSON与文本报告保存到`outputs/agent_evaluation/`。该目录由`.gitignor
 - `link_only`：没有明确可下载的 PDF，只保存网页或 DOI 地址。
 - `failed`：下载失败，数据库中会记录错误原因。
 
+### MCP只读服务
+
+本地MCP Host可通过标准输入输出启动A7.1服务：
+
+```powershell
+uv run python -m my_agent_project.mcp_server
+```
+
+当前注册两个Tool：
+
+- `get_paper_metadata(paper_id)`：读取Paper Hunter数据库中的既有论文记录，返回标题、作者、摘要、来源、出版商、DOI、公开访问链接和处理状态；不会返回`local_path`。
+- `search_literature(query, max_results=10)`：调用现有arXiv/Crossref元数据检索工具，返回候选论文、来源计数、状态、错误和耗时；不写数据库、不下载PDF，但实际调用需要网络。
+- `retrieve_paper_evidence(paper_id, question, top_k=3)`：从已索引论文读取带物理页码的Top-K证据；不会自动准备论文，无证据时明确失败。Seed可用时可能调用Embedding并更新查询向量缓存。
+
+该命令启动后会等待MCP客户端通信，不会像普通脚本一样打印页面地址。
+
+验证独立stdio连接和Tool清单：
+
+```powershell
+uv run python scripts/smoke_mcp_client.py
+```
+
+该冒烟命令只初始化协议并列出Tool，不查询数据库记录、不访问论文搜索源，也不调用Embedding或大模型；成功时输出JSON，失败时返回非零退出码。
+
 ## 分块评测使用方法
 
 评测页面用于检验“用户提问后，系统能否把包含正确答案的论文文本块排到前面”。它只评测分块、Embedding 和召回排序，不调用 DeepSeek 生成答案，因此不会把大模型回答能力混入检索指标。
@@ -224,6 +256,7 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- agent_trace_service.py
 |   |-- agent_metrics_service.py
 |   |-- agent_evaluation_service.py
+|   |-- mcp_server.py
 |   |-- research_agent.py
 |   |-- research_checkpoint.py
 |   |-- research_tools.py
@@ -238,7 +271,8 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- templates/
 |   `-- static/
 |-- scripts/
-|   `-- run_agent_evaluation.py
+|   |-- run_agent_evaluation.py
+|   `-- smoke_mcp_client.py
 |-- tests/
 |-- benchmarks/
 |   `-- chunking_baseline.csv # 60 条人工标注检索案例

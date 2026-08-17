@@ -1,6 +1,6 @@
 # Paper Hunter 项目概述
 
-> 当前版本：`v0.11.4`
+> 当前版本：`v0.12.3`
 >
 > 更新日期：`2026-08-16`
 >
@@ -43,6 +43,10 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - A6.3新增三个Checkpoint恢复专项测试：跨SQLite连接恢复计划确认、论文选择和报告确认，断言Planner、搜索、已完成论文节点及报告模型不重复执行；完整离线测试为`136 passed`。
 - A6.4新增`agent_metrics_service.py`和`GET /api/agent/metrics`，聚合任务、Tool、审批、恢复、fallback、耗时和失败分布；比例保留分子/分母/排除数，无真实usage时Token字段为`null`，完整离线测试为`140 passed`。
 - A6.5新增`agent_evaluation_service.py`与`scripts/run_agent_evaluation.py`，运行11条冻结场景并生成分离展示pytest结果和运行Metrics的JSON/文本报告；实测`11/11 passed`，完整离线测试`144 passed`。
+- A7.1新增独立MCP适配层：官方MCP Python SDK通过`get_paper_metadata`暴露只读论文元数据，复用现有数据库和链接服务，过滤`local_path`；协议级Client冒烟测试验证Tool发现、结构化调用和标准错误，完整离线测试`150 passed`。
+- A7.2新增`search_literature` MCP Tool，通过白名单Registry复用现有LangChain StructuredTool的输入校验、双来源检索和部分失败降级；MCP层不写库、不下载，完整离线测试`153 passed`。
+- A7.3新增`retrieve_paper_evidence` MCP Tool，只检索已索引论文的页码证据，不暴露论文准备Tool，也不因无证据自动下载、解析或索引；完整离线测试`156 passed`。
+- A7.4新增独立stdio Client冒烟脚本，以真实子进程验证协议握手和三个Tool发现；不调用业务Tool或外部API。MCP专项`13 passed`，完整离线测试`157 passed`，A7阶段完成。
 
 ## 当前 RAG 建设进度
 
@@ -76,7 +80,7 @@ H2-R 使用8篇未参与开发的论文和40道冻结问题完成外部复核：
 
 报告生成前由`context_service.pack_research_context()`执行`fair_budget_v1`：先在每篇论文内部保留高分证据并去除精确重复与相邻页高重叠文本，再跨论文按轮次分配，先提高论文覆盖再补充第二条证据。`context_stats`区分原始、去重后和最终证据，并记录`duplicate_of`审计关系。当前Token数为语言无关的保守估算；去重是确定性文本规则，不是Embedding语义去重。
 
-最终上下文通过`context-quality-gate-v1`后，才由`build_research_context_payload()`序列化为不可信JSON并交给DeepSeek。门禁状态为`passed/warning/failed`，只有存在合法证据、预算未超限且计数一致时`model_call_allowed=true`。A1-A5单Agent LangGraph闭环已经完成；MCP、长期记忆和多Agent不在本阶段范围内。
+最终上下文通过`context-quality-gate-v1`后，才由`build_research_context_payload()`序列化为不可信JSON并交给DeepSeek。门禁状态为`passed/warning/failed`，只有存在合法证据、预算未超限且计数一致时`model_call_allowed=true`。A1-A6单Agent闭环与可靠性评测已经完成；A7.1已接入首个只读MCP Tool，长期记忆和多Agent不在当前范围内。
 
 ## 分块评测与参数实验
 

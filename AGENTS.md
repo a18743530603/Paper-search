@@ -1,6 +1,6 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.11.4`
+> 当前版本：`v0.12.3`
 >
 > 更新日期：`2026-08-16`
 >
@@ -59,6 +59,8 @@ https://github.com/a18743530603/Paper-search.git
 - `agent_trace_service.py`：集中包装LangGraph节点，尽力记录成功、中断、部分成功和失败轨迹；Trace故障不得改变原节点行为。
 - `agent_metrics_service.py`：从任务、报告和Node Trace聚合带明确分子/分母/排除数的Agent运行指标；没有真实usage时不得生成Token数字。
 - `agent_evaluation_service.py`：维护11条冻结Agent场景，解析pytest JUnit XML，并把受控测试结果与运行Metrics分区生成JSON/文本报告。
+- `mcp_server.py`：使用官方MCP Python SDK建立独立stdio服务；当前暴露元数据查询、外部文献检索和已索引证据检索三个受控Tool，全部复用现有Service/Tool Registry，未暴露论文准备能力。
+- `scripts/smoke_mcp_client.py`：用当前Python解释器启动独立MCP Server子进程，只执行stdio协议初始化与Tool发现并输出JSON；不调用业务Tool或外部API。
 - `context_service.py`：在报告生成前校验证据字段、按论文执行保守文本去重，再按估算Token预算和跨论文公平配额选择证据；输出质量门禁、模型上下文、重复关系和压缩审计，不调用额外模型。
 - `research_agent.py`：使用LangGraph编排研究问题规划、三次`interrupt()`人工确认、多查询/单查询条件路由、搜索、论文选择、逐篇准备、证据检索、报告生成和引用检查；规划失败自动降级，不改变下载合规边界。
 - `research_checkpoint.py`：使用`SqliteSaver`、稳定`thread_id`和`Command(resume=...)`保存并恢复生产图；检查点与业务任务SQLite分开存储。
@@ -679,13 +681,50 @@ git push
 - `outputs/`由`.gitignore`排除，报告可能含本地运行统计，默认不进入公开Git；源码、冻结场景和测试必须提交。
 - 真实离线执行结果为`11/11 passed`，运行时样本因使用`--skip-runtime-metrics`显示N/A；新增4项报告测试，完整离线测试`144 passed`，无外部API调用。
 
+## v0.12.0 A7.1 最小MCP只读接入
+
+- 新增`mcp>=1.27,<2`并锁定MCP Python SDK 1.x，避免2.x主版本升级造成未验证的接口变化。
+- 新增`mcp_server.create_mcp_server()`，以stdio方式提供独立MCP Server；FastAPI与MCP继续并列复用Service Layer，不互相调用。
+- 新增`build_public_paper_metadata()`和`get_paper_metadata(paper_id)` Tool，返回论文公开元数据、访问链接和状态，不返回`local_path`，不下载、不写库、不调用外部API。
+- Tool声明`readOnlyHint/idempotentHint`等安全注解；非法ID和不存在记录返回明确错误。
+- `tests/agent/test_mcp_server.py`使用官方内存传输建立真实Client Session，完成初始化、Tool发现、结构化调用和标准Tool错误验证；专项`6 passed`，完整离线测试`150 passed`。
+- A7尚未全部完成；下一步A7.2复用现有`search_literature`，并保持搜索来源降级和输入上限不变。
+
+## v0.12.1 A7.2 MCP文献检索Tool
+
+- 新增`search_public_literature()`适配函数，通过`invoke_research_tool(LITERATURE_SEARCH_TOOL_NAME, ...)`调用现有白名单Tool，不直接复制或绕过搜索规则。
+- MCP注册`search_literature(query, max_results=10)`，复用空查询、240字符和1至50条数量校验，以及arXiv/Crossref来源计数和`partial/failed`状态。
+- Tool声明只读、非破坏、幂等和`openWorldHint=True`；实际运行会访问公开搜索源，但不写论文数据库、不下载PDF、不调用DeepSeek或Seed。
+- 新增委托参数、既有校验零外部调用及协议级Client检索测试；单来源失败的`partial`结果和健康候选可完整返回。
+- MCP专项测试`9 passed`，完整离线测试`153 passed`；全部外部检索使用mock，未调用真实API。
+- 下一步A7.3评估并接入`retrieve_paper_evidence`，必须保持“只读取已索引证据、不自动准备或下载论文”的边界。
+
+## v0.12.2 A7.3 MCP论文证据检索Tool
+
+- 新增`retrieve_public_paper_evidence()`，固定通过`invoke_research_tool(RETRIEVE_EVIDENCE_TOOL_NAME, ...)`调用现有证据Tool。
+- MCP注册`retrieve_paper_evidence(paper_id, question, top_k=3)`，复用正整数ID、非空问题和Top-K 1至6校验，返回标题、访问链接、页码证据、评分和错误。
+- MCP未暴露`prepare_paper_for_research`；论文未索引或无匹配证据时只返回`failed`，不得自动下载、解析或建立索引。
+- 该Tool对论文业务数据只读；若Seed已配置且查询向量未缓存，底层检索可调用Embedding API并写入内部`embedding_cache`，因此使用`openWorldHint=True`。
+- 新增委托边界、非法问题零检索和协议级Client证据测试；MCP专项`12 passed`，完整离线测试`156 passed`，未读取真实PDF或调用外部API。
+- 下一步A7.4增加独立stdio MCP Client冒烟命令，验证子进程传输和三个Tool发现；完成后结束A7并进入B1。
+
+## v0.12.3 A7.4 stdio MCP Client冒烟验证
+
+- 新增`scripts/smoke_mcp_client.py`，以`sys.executable -m my_agent_project.mcp_server`启动真实子进程，工作目录固定为仓库根目录。
+- Client使用10秒读取超时和UTF-8编码，执行`initialize()`与`list_tools()`；不调用元数据、外部搜索或证据Tool。
+- 严格校验Server名称和三个Tool的名称及顺序；不匹配、超时或子进程错误均返回非零退出码。
+- 精确过滤MCP SDK当前无关的`lifespan`前向引用警告，并将Server普通请求日志调整为WARNING；不隐藏业务异常。
+- 真实运行通过：Server `paper-hunter`、SDK Server版本`1.29.0`、MCP协议`2025-11-25`、stdio传输、三个Tool全部发现。
+- 新增真实子进程测试；MCP专项`13 passed`，完整离线测试`157 passed`，无外部API或业务数据调用。
+- A7阶段完成。下一步B1解决进程内`BackgroundTasks`无法跨服务重启可靠恢复的问题。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为 `v0.11.4`：A1-A5单Agent闭环保持不变，A6已完成Trace、固定场景、Checkpoint恢复、Metrics和JSON/文本评测报告；真实离线场景`11/11 passed`，完整测试`144 passed`。
+- 当前版本为 `v0.12.3`：A1-A6保持不变；A7已完成三个受控MCP Tool、内存协议测试与真实stdio子进程验证，不开放下载/解析/索引或报告模型调用；完整测试`157 passed`。
 - `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。
