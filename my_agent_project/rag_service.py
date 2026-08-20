@@ -748,13 +748,19 @@ def build_rag_prompt(
 """
 
 
-def answer_rag_query(query_id: int) -> None:
+def answer_rag_query(query_id: int, *, raise_on_error: bool = False) -> None:
     query = get_rag_query(query_id)
     if query is None:
+        if raise_on_error:
+            raise LookupError("问答记录不存在")
+        return
+    if query["status"] == RAG_ANSWERED:
         return
     paper = get_paper(query["paper_id"])
     if paper is None:
         update_rag_query(query_id, RAG_FAILED, error="论文记录不存在")
+        if raise_on_error:
+            raise RuntimeError("论文记录不存在")
         return
 
     rerank_error: str | None = None
@@ -798,3 +804,5 @@ def answer_rag_query(query_id: int) -> None:
             error=str(exc)[:500],
             rerank_error=rerank_error,
         )
+        if raise_on_error:
+            raise

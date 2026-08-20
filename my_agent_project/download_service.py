@@ -45,7 +45,7 @@ def can_attempt_download(source: str, pdf_url: str | None) -> bool:
     return parsed.path.lower().endswith(".pdf")
 
 
-def download_paper(paper_id: int) -> None:
+def download_paper(paper_id: int, *, raise_on_error: bool = False) -> None:
     paper = get_paper(paper_id)
     if paper is None:
         return
@@ -79,4 +79,5 @@ def download_paper(paper_id: int) -> None:
         update_download_status(paper_id, STATUS_DOWNLOADED, local_path=str(path), error=None)
     except Exception as exc:
         update_download_status(paper_id, STATUS_FAILED, error=str(exc)[:500])
-
+        if raise_on_error:
+            raise

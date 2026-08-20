@@ -92,6 +92,14 @@
   </div>
 {% elif task["status"] == "running" %}
   <p class="task-progress">正在检索和合并候选论文，完成后页面会自动更新。</p>
+  {% if task["search_job_status"] %}
+    <p class="plan-meta">
+      队列状态：{{ task["search_job_status"] }}
+      {% if task["search_job_attempts"] %}
+        · 第 {{ task["search_job_attempts"] }} / {{ task["search_job_max_attempts"] }} 次尝试
+      {% endif %}
+    </p>
+  {% endif %}
 {% elif task["status"] == "failed" %}
   <p class="alert">任务失败：{{ task["error"] }}</p>
 {% elif task["status"] == "cancelled" %}
@@ -174,6 +182,15 @@
       <p class="report-note">该操作会准备所选论文全文、检索证据，并在存在证据时调用 DeepSeek。</p>
     {% elif report["status"] in ["preparing", "retrieving", "generating"] %}
       <p class="task-progress">报告正在后台{{ {"preparing": "准备论文", "retrieving": "检索证据", "generating": "生成内容"}[report["status"]] }}，页面会自动更新。</p>
+      {% if report["job_status"] %}
+        <p class="report-note">
+          队列状态：{{ report["job_status"] }}
+          {% if report["job_attempts"] %}
+            · 第 {{ report["job_attempts"] }} / {{ report["job_max_attempts"] }} 次尝试
+          {% endif %}
+        </p>
+      {% endif %}
+      {% if report["error"] %}<p class="alert">{{ report["error"] }}</p>{% endif %}
       {% set progress = report["details"].get("checkpoint_progress", {}) %}
       {% if progress %}
         <p class="report-note">

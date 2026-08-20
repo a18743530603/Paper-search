@@ -2,6 +2,98 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## 文档整理 - 2026-08-20
+
+- 项目代码版本保持`v0.13.1`，本次没有修改业务逻辑、数据库结构或依赖。
+- 新增`PROJECT_OVERVIEW.md`，集中说明用户能力、分层架构、技术栈、普通检索、单篇RAG、智能研究Agent、可靠Worker、数据持久化、降本设计、可复现结果和当前生产化边界。
+- `README.md`、`PROJECT.md`和`AGENTS.md`增加全景文档入口，方便新对话、新手和面试复习快速建立整体认识。
+
+## `v0.13.1` - 2026-08-18
+
+### B1.7 研究报告持久任务
+
+- 新增`enqueue_research_report_job()`，在`BEGIN IMMEDIATE`事务中同时创建或重置`research_reports`业务状态并写入`research_report`任务，避免报告停在`preparing`却没有执行任务。
+- `POST /research-tasks/{task_id}/report`移除FastAPI `BackgroundTasks`；初次生成、失败后的重新生成和完成后的显式再生成统一进入持久Worker。
+- 同一研究任务的活动重复或并发请求复用原队列任务；旧任务成功后允许用户明确启动新一轮报告。
+- Worker复用`execute_research_report()`与LangGraph检查点，原逐篇准备、证据检索、上下文质量门禁、DeepSeek生成和引用检查逻辑不变。
+- 报告失败时任务进入指数退避重试并恢复`preparing`；达到尝试上限或租约最终过期时同步`failed`及错误。
+- 报告已经`completed`但队列尚未确认成功时，恢复后的处理器直接完成，不重新调用DeepSeek或重复消耗Token。
+- `init_db()`只恢复没有活动`research_report`任务的旧运行中孤儿；报告查询、状态API和页面增加最近队列状态、当前尝试次数及最大次数。
+- 新增6项离线测试，覆盖原子持久入队、串行和并发去重、工作流委托及再生成、失败后重试成功、最终租约失败和完成后幂等恢复；队列专项`42 passed`，完整离线测试`199 passed`，外部服务全部mock。
+- B1可靠Worker阶段完成：面向用户的论文处理、单篇RAG回答、智能研究搜索和跨论文报告均已迁移；当前语义为SQLite单机至少一次执行，不宣称分布式或严格恰好一次。
+
+## `v0.13.0` - 2026-08-17
+
+### B1.1 SQLite持久下载队列
+
+- 新增`background_jobs`表，保存任务类型、JSON载荷、去重键、状态、优先级、尝试次数、可执行时间、Worker租约、错误和完整时间戳。
+- 新增`enqueue_download_job()`，在`BEGIN IMMEDIATE`事务中完成论文状态条件更新和任务入队；同一论文只允许一个`queued/running/retry_wait`活动下载任务。
+- 新增任务领取、成功、失败和过期租约恢复数据库操作；Worker用租约原子抢占，失败按指数退避且默认最多尝试3次。
+- 新增`task_queue_service.py`作为任务处理器注册与状态协调层，复用`download_service.download_paper()`，不复制下载实现。
+- 新增独立`python -m my_agent_project.worker`进程和`--once`调试模式；直接下载与失败重试不再依赖FastAPI进程内`BackgroundTasks`。
+- `download_paper(raise_on_error=True)`在保留论文失败记录的同时把异常交给Worker决定重试；旧调用默认仍隔离异常。
+- `init_db()`只恢复没有活动持久任务的旧`downloading`记录，避免Web或Worker启动时破坏有效队列任务。
+- `GET /api/papers/statuses`增加最近下载任务状态和尝试次数，原有页面轮询字段保持兼容。
+- 新增6项离线测试，覆盖跨数据库重初始化持久化、并发重复入队、复用下载服务、失败后成功、Worker租约过期接管和达到次数后最终失败；完整测试`163 passed`。
+- B1.1完成时仅迁移“仅下载”和“失败重试”；随后在同一天、同一`v0.13.0`版本继续完成B1.2。
+
+### B1.2 持久论文准备任务
+
+- 新增`enqueue_paper_preparation_job()`：在同一SQLite事务中检查活动下载/准备任务，按当前数据状态锁定`downloading`、`parsing`或`indexing`阶段，并写入`prepare_paper`任务。
+- `/papers/{paper_id}/prepare`不再创建FastAPI `BackgroundTasks`；无本地PDF时仍先检查合法直链，已准备完成时保持幂等返回。
+- Worker注册`prepare_paper`处理器，复用`paper_workflow.prepare_paper_for_qa()`执行`download → parse → index`，已完成阶段自动跳过，不复制三个服务的业务代码。
+- 准备失败时读取下载、解析或索引的真实错误；可重试任务把对应阶段恢复为处理中，达到上限后保留最终失败状态。
+- Web或Worker启动时，存在活动`prepare_paper`任务的`downloading/parsing/indexing`状态不会被旧启动恢复逻辑错误改写。
+- 单独下载任务与完整准备任务按论文互斥，不能同时领取并重复下载同一PDF。
+- 状态API新增最近准备任务状态和尝试次数；原有准备状态轮询保持兼容。
+- 队列专项从6项扩展到12项，新增下载阶段原子入队、解析状态重启保持、工作流委托、解析失败重试、跨任务互斥和解析阶段租约最终失败；完整离线测试`169 passed`。
+- 当前边界：完整“准备问答”已支持持久Worker；单独解析、单独索引、问答、智能研究搜索和报告仍使用原后台机制。
+
+### B1.3 单独解析与索引持久任务
+
+- 新增`enqueue_parse_job()`与`enqueue_index_job()`，使用SQLite写事务校验论文前置状态、检查论文级活动任务、锁定处理状态并创建任务。
+- 活动解析或索引任务存在时拒绝第二个并发任务；任务完成后仍允许页面上的“重新解析/重新建立索引”，并复用PDF页文本和Embedding缓存。
+- `/papers/{paper_id}/parse`与`/index`移除`BackgroundTasks`，只负责校验并持久入队。
+- Worker新增`parse_paper`和`index_paper`处理器，分别复用`parse_paper_pdf()`与`index_paper_chunks()`；服务返回后检查数据库终态，失败才交给队列重试。
+- 下载、完整准备、单独解析和单独索引共享论文级活动任务互斥；同一论文不能由不同入口同时处理。
+- 启动恢复逻辑识别活动`parse_paper/index_paper`任务，不会把有效的`parsing/indexing`误标为失败。
+- 状态API新增单独解析和索引任务的最近状态与尝试次数。
+- 新增6项测试，覆盖解析持久入队与活动任务去重、显式重新解析/索引、服务委托、解析失败重试、跨入口互斥和索引租约最终失败；队列专项`18 passed`，完整离线测试`175 passed`。
+- 当前边界：论文下载和建库任务已迁入持久Worker；问答、智能研究搜索和研究报告仍使用原后台机制。
+
+### B1.4 单篇RAG问答持久任务
+
+- 新增`enqueue_rag_answer_job()`，在同一SQLite事务中校验论文索引状态、创建`rag_queries`记录和`answer_rag_query`任务，避免记录停在`answering`但任务未创建。
+- 同一论文、相同问题和相同重排模式的活动重复请求复用原任务；不同问题仍可分别排队，活动回答会阻止同时重建索引。
+- `/papers/{paper_id}/ask`移除`BackgroundTasks`，Worker复用现有`answer_rag_query()`；服务新增`raise_on_error`供队列识别失败并有限重试。
+- 已完成回答在任务重放时直接返回，不重复调用DeepSeek；旧`answering`孤儿记录在启动时标记失败，活动持久任务则保留。
+- `background_jobs`新增`rag_query_id`关联及旧库补列迁移，状态API新增最近回答任务状态和尝试次数。
+- 默认Worker租约由90秒提高到600秒，以覆盖当前DeepSeek/Seed超时组合；自动心跳续租仍属于后续增强。
+- 新增9项B1.4测试，覆盖原子入队、活动去重、不同问题、旧库迁移、服务委托、失败重试、租约最终失败、孤儿恢复、已完成回答零重复模型调用及完成后租约接管；队列专项`27 passed`，完整离线测试`184 passed`，外部模型均使用mock。
+- 当前边界：论文下载、建库和单篇RAG回答已进入持久Worker；智能研究搜索与报告仍使用原后台机制。
+
+### B1.5 Worker自动心跳续租
+
+- 新增`renew_background_job_lease()`：只有状态为`running`、Worker身份匹配且原租约尚未过期时，才能原子延长租约；过期Worker不能重新取得所有权。
+- `run_one_job()`在处理器执行期间使用守护线程续租，默认间隔为租约三分之一且不超过30秒；任务成功、失败或抛出异常后都会停止心跳。
+- 心跳租约显式要求至少2秒，续期间隔必须短于租约，避免SQLite秒级时间边界下产生无效配置。
+- 默认租约从B1.4临时兜底的600秒恢复为90秒：健康长任务依靠心跳持续执行，Worker真正崩溃后约一个租约窗口即可重新投递。
+- 心跳数据库操作失败时不覆盖业务异常；若租约已经丢失，最终成功确认仍会被Worker所有权条件拒绝，保持至少一次执行语义。
+- 新增3项测试，验证错误Worker和过期Worker无法续租、真实长任务超过原租约后不会被恢复器误接管，以及失去租约的Worker无法记录普通失败；队列专项`30 passed`，完整离线测试`187 passed`。
+- 当前边界：持久Worker本身已具备自动续租；智能研究搜索和报告仍待迁移。
+
+### B1.6 智能研究搜索持久任务
+
+- 新增`enqueue_research_search_job()`，在`BEGIN IMMEDIATE`事务中同时完成研究任务`awaiting_confirmation → running`和`research_search`任务创建，消除业务状态已改变但后台任务未投递的窗口。
+- `POST /research-tasks/{task_id}/confirm`移除FastAPI `BackgroundTasks`，只负责人工确认后的原子入队；重复点击或两个并发请求复用同一个活动任务。
+- Worker新增`research_search`处理器，复用`research_workflow.execute_research_task()`与原LangGraph `thread_id`检查点；服务新增可选`raise_on_error`，默认调用仍保持异常隔离。
+- 单次失败时队列进入`retry_wait`且研究任务恢复为`running`；达到尝试上限或租约最终过期时进入`failed`并保留错误。
+- `init_db()`只把没有活动`research_search`任务的旧`running`孤儿恢复为待确认；有效持久任务不会被Web或Worker启动改写。
+- 已保存候选并进入`awaiting_selection`的任务在租约恢复后直接视为幂等成功，不重复调用arXiv/Crossref搜索Tool。
+- 研究任务查询和状态API新增最近检索任务状态、当前尝试次数和最大尝试次数，任务页在运行期间直接展示。
+- 新增6项B1.6离线测试，覆盖持久原子入队、重复与并发确认、原工作流委托、失败后重试成功、最终租约失败和完成后幂等恢复；队列专项`36 passed`，完整离线测试`193 passed`，外部服务全部mock。
+- 当前边界：论文处理、单篇RAG回答和智能研究搜索已进入持久Worker；研究报告仍使用原后台机制，下一步进入B1.7。
+
 ## `v0.12.3` - 2026-08-16
 
 ### A7.4 stdio MCP Client冒烟验证

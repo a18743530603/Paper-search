@@ -1,13 +1,18 @@
 import csv
+import hashlib
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
 from .config import DATABASE_PATH, EXPORTS_DIR, ensure_runtime_dirs
 from .schemas import (
+    INDEX_INDEXED,
+    INDEX_INDEXING,
     INDEX_NOT_STARTED,
+    PARSE_PARSED,
+    PARSE_PARSING,
     PARSE_NOT_STARTED,
     RAG_ANSWERING,
     RESEARCH_REPORT_RUNNING,
@@ -41,6 +46,38 @@ CREATE TABLE IF NOT EXISTS papers (
 
 CREATE INDEX IF NOT EXISTS idx_papers_created_at ON papers(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_papers_query ON papers(query);
+
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    dedupe_key TEXT NOT NULL,
+    paper_id INTEGER,
+    rag_query_id INTEGER,
+    research_task_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'queued',
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    available_at TEXT NOT NULL,
+    lease_expires_at TEXT,
+    worker_id TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
+    FOREIGN KEY (rag_query_id) REFERENCES rag_queries(id) ON DELETE CASCADE,
+    FOREIGN KEY (research_task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_background_jobs_ready
+ON background_jobs(status, available_at, priority DESC, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_background_jobs_active_dedupe
+ON background_jobs(dedupe_key)
+WHERE status IN ('queued', 'running', 'retry_wait');
 
 CREATE TABLE IF NOT EXISTS research_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -322,11 +359,23 @@ ON generation_evaluation_results(run_id, case_id);
 """
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _db_timestamp(value: Optional[datetime] = None) -> str:
+    current = value or _utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def connect() -> sqlite3.Connection:
     ensure_runtime_dirs()
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -341,6 +390,18 @@ def init_db() -> None:
             conn.execute("ALTER TABLE papers ADD COLUMN publisher TEXT NOT NULL DEFAULT ''")
         if "downloaded_at" not in columns:
             conn.execute("ALTER TABLE papers ADD COLUMN downloaded_at TEXT")
+        background_job_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(background_jobs)").fetchall()
+        }
+        if "rag_query_id" not in background_job_columns:
+            conn.execute("ALTER TABLE background_jobs ADD COLUMN rag_query_id INTEGER")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_rag_query
+            ON background_jobs(rag_query_id, id DESC)
+            """
+        )
         document_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(paper_documents)").fetchall()
@@ -441,6 +502,13 @@ def init_db() -> None:
                 error = '上一次执行被应用重启中断，请重新确认。',
                 updated_at = CURRENT_TIMESTAMP
             WHERE status = 'running'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.research_task_id = research_tasks.id
+                    AND job.job_type = 'research_search'
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
             """
         )
         conn.execute(
@@ -450,6 +518,13 @@ def init_db() -> None:
             WHERE status = 'downloading'
               AND local_path IS NULL
               AND pdf_url IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.paper_id = papers.id
+                    AND job.job_type IN ('download_paper', 'prepare_paper')
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
             """
         )
         conn.execute(
@@ -459,6 +534,29 @@ def init_db() -> None:
                 error = '上一次解析被应用重启中断，可以重新执行。',
                 updated_at = CURRENT_TIMESTAMP
             WHERE parse_status = 'parsing'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.paper_id = paper_documents.paper_id
+                    AND job.job_type IN ('prepare_paper', 'parse_paper')
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE rag_queries
+            SET status = 'answer_failed',
+                error = '上一次问答被应用重启中断，可以重新提交。',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'answering'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.rag_query_id = rag_queries.id
+                    AND job.job_type = 'answer_rag_query'
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
             """
         )
         conn.execute(
@@ -468,6 +566,13 @@ def init_db() -> None:
                 index_error = '上一次索引被应用重启中断，可以重新执行。',
                 updated_at = CURRENT_TIMESTAMP
             WHERE index_status = 'indexing'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.paper_id = paper_documents.paper_id
+                    AND job.job_type IN ('prepare_paper', 'index_paper')
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
             """
         )
         conn.execute(
@@ -478,6 +583,13 @@ def init_db() -> None:
                 completed_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
             WHERE status IN ('preparing', 'retrieving', 'generating')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.research_task_id = research_reports.task_id
+                    AND job.job_type = 'research_report'
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
             """
         )
 
@@ -579,7 +691,35 @@ def create_research_task(
 def get_research_task(task_id: int) -> Optional[dict]:
     with connect() as conn:
         row = conn.execute(
-            "SELECT * FROM research_tasks WHERE id = ?",
+            """
+            SELECT task.*,
+                   (
+                       SELECT job.status
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = task.id
+                         AND job.job_type = 'research_search'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS search_job_status,
+                   (
+                       SELECT job.attempt_count
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = task.id
+                         AND job.job_type = 'research_search'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS search_job_attempts,
+                   (
+                       SELECT job.max_attempts
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = task.id
+                         AND job.job_type = 'research_search'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS search_job_max_attempts
+            FROM research_tasks AS task
+            WHERE task.id = ?
+            """,
             (task_id,),
         ).fetchone()
     return _research_task_from_row(row) if row is not None else None
@@ -589,8 +729,33 @@ def list_research_tasks(limit: int = 100) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT * FROM research_tasks
-            ORDER BY created_at DESC, id DESC
+            SELECT task.*,
+                   (
+                       SELECT job.status
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = task.id
+                         AND job.job_type = 'research_search'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS search_job_status,
+                   (
+                       SELECT job.attempt_count
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = task.id
+                         AND job.job_type = 'research_search'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS search_job_attempts,
+                   (
+                       SELECT job.max_attempts
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = task.id
+                         AND job.job_type = 'research_search'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS search_job_max_attempts
+            FROM research_tasks AS task
+            ORDER BY task.created_at DESC, task.id DESC
             LIMIT ?
             """,
             (limit,),
@@ -818,7 +983,35 @@ def _research_report_from_row(row: sqlite3.Row) -> dict:
 def get_research_report(task_id: int) -> Optional[dict]:
     with connect() as conn:
         row = conn.execute(
-            "SELECT * FROM research_reports WHERE task_id = ?",
+            """
+            SELECT report.*,
+                   (
+                       SELECT job.status
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = report.task_id
+                         AND job.job_type = 'research_report'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS job_status,
+                   (
+                       SELECT job.attempt_count
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = report.task_id
+                         AND job.job_type = 'research_report'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS job_attempts,
+                   (
+                       SELECT job.max_attempts
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = report.task_id
+                         AND job.job_type = 'research_report'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS job_max_attempts
+            FROM research_reports AS report
+            WHERE report.task_id = ?
+            """,
             (task_id,),
         ).fetchone()
     return _research_report_from_row(row) if row is not None else None
@@ -901,6 +1094,21 @@ def update_research_report(
         )
 
 
+def mark_research_report_retry_pending(task_id: int, error: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_reports
+            SET status = 'preparing', error = ?, completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND status IN ('preparing', 'retrieving', 'generating', 'failed')
+            """,
+            (error[:1000], task_id),
+        )
+    return cursor.rowcount == 1
+
+
 def start_research_task(task_id: int) -> bool:
     with connect() as conn:
         cursor = conn.execute(
@@ -914,6 +1122,20 @@ def start_research_task(task_id: int) -> bool:
             (task_id,),
         )
         return cursor.rowcount == 1
+
+
+def mark_research_search_retry_pending(task_id: int, error: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'running', error = ?, completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ('running', 'failed')
+            """,
+            (error[:1000], task_id),
+        )
+    return cursor.rowcount == 1
 
 
 def cancel_research_task(task_id: int) -> bool:
@@ -1074,6 +1296,86 @@ def list_paper_statuses(limit: int = 1000) -> list[dict]:
                 d.index_status,
                 d.index_error,
                 d.indexed_at,
+                (
+                    SELECT job.status
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'download_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS download_job_status,
+                (
+                    SELECT job.attempt_count
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'download_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS download_job_attempts,
+                (
+                    SELECT job.status
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'prepare_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS preparation_job_status,
+                (
+                    SELECT job.attempt_count
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'prepare_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS preparation_job_attempts,
+                (
+                    SELECT job.status
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'parse_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS parse_job_status,
+                (
+                    SELECT job.attempt_count
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'parse_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS parse_job_attempts,
+                (
+                    SELECT job.status
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'index_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS index_job_status,
+                (
+                    SELECT job.attempt_count
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'index_paper'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS index_job_attempts,
+                (
+                    SELECT job.status
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'answer_rag_query'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS rag_job_status,
+                (
+                    SELECT job.attempt_count
+                    FROM background_jobs AS job
+                    WHERE job.paper_id = p.id
+                      AND job.job_type = 'answer_rag_query'
+                    ORDER BY job.id DESC
+                    LIMIT 1
+                ) AS rag_job_attempts,
                 (
                     SELECT q.status
                     FROM rag_queries AS q
@@ -1979,6 +2281,856 @@ def list_generation_evaluation_results(run_id: int) -> list[dict]:
                 item[target] = fallback
         results.append(item)
     return results
+
+
+def _background_job_from_row(row: sqlite3.Row) -> dict:
+    job = dict(row)
+    try:
+        payload = json.loads(job.get("payload_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    job["payload"] = payload if isinstance(payload, dict) else {}
+    return job
+
+
+def enqueue_research_search_job(
+    task_id: int,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    dedupe_key = f"research_search:{task_id}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT id, status FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise LookupError("研究任务不存在")
+
+        active = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE dedupe_key = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        if active is not None:
+            if task["status"] != "running":
+                raise RuntimeError("研究检索队列与任务状态不一致")
+            return {
+                "job_id": int(active["id"]),
+                "task_id": task_id,
+                "created": False,
+            }
+
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET status = 'running', error = NULL, completed_at = NULL,
+                confirmed_at = COALESCE(confirmed_at, ?), updated_at = ?
+            WHERE id = ? AND status = 'awaiting_confirmation'
+            """,
+            (timestamp, timestamp, task_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("研究任务当前状态不允许确认")
+
+        job_cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, research_task_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('research_search', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"task_id": task_id}, ensure_ascii=False),
+                dedupe_key,
+                task_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {
+            "job_id": int(job_cursor.lastrowid),
+            "task_id": task_id,
+            "created": True,
+        }
+
+
+def enqueue_research_report_job(
+    task_id: int,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    dedupe_key = f"research_report:{task_id}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise LookupError("研究任务不存在")
+        if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
+            raise RuntimeError("研究任务尚未冻结可用于报告的论文")
+
+        active = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE dedupe_key = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        report = conn.execute(
+            "SELECT status FROM research_reports WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if active is not None:
+            if report is None or report["status"] not in RESEARCH_REPORT_RUNNING:
+                raise RuntimeError("研究报告队列与业务状态不一致")
+            return {
+                "job_id": int(active["id"]),
+                "task_id": task_id,
+                "created": False,
+            }
+        if report is not None and report["status"] in RESEARCH_REPORT_RUNNING:
+            raise RuntimeError("研究报告已经在执行")
+
+        conn.execute(
+            """
+            INSERT INTO research_reports (
+                task_id, status, content, details_json, model, error,
+                started_at, completed_at, updated_at
+            )
+            VALUES (?, 'preparing', NULL, '{}', NULL, NULL, ?, NULL, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status = 'preparing', content = NULL, details_json = '{}',
+                model = NULL, error = NULL, started_at = excluded.started_at,
+                completed_at = NULL, updated_at = excluded.updated_at
+            """,
+            (task_id, timestamp, timestamp),
+        )
+        job_cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, research_task_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('research_report', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"task_id": task_id}, ensure_ascii=False),
+                dedupe_key,
+                task_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {
+            "job_id": int(job_cursor.lastrowid),
+            "task_id": task_id,
+            "created": True,
+        }
+
+
+def enqueue_download_job(
+    paper_id: int,
+    allowed_statuses: Iterable[str],
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> Optional[int]:
+    statuses = tuple(dict.fromkeys(allowed_statuses))
+    if not statuses:
+        return None
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    dedupe_key = f"download_paper:{paper_id}"
+    placeholders = ", ".join("?" for _ in statuses)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE paper_id = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (paper_id,),
+        ).fetchone()
+        if active is not None:
+            return None
+        cursor = conn.execute(
+            f"""
+            UPDATE papers
+            SET status = ?, error = NULL, updated_at = ?
+            WHERE id = ? AND status IN ({placeholders})
+            """,
+            (STATUS_DOWNLOADING, timestamp, paper_id, *statuses),
+        )
+        if cursor.rowcount != 1:
+            return None
+        job_cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, paper_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('download_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"paper_id": paper_id}, ensure_ascii=False),
+                dedupe_key,
+                paper_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return int(job_cursor.lastrowid)
+
+
+def enqueue_paper_preparation_job(
+    paper_id: int,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    dedupe_key = f"prepare_paper:{paper_id}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paper = conn.execute(
+            "SELECT * FROM papers WHERE id = ?",
+            (paper_id,),
+        ).fetchone()
+        if paper is None:
+            raise LookupError("论文记录不存在")
+
+        active = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE paper_id = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (paper_id,),
+        ).fetchone()
+        if active is not None:
+            raise RuntimeError("论文下载或准备任务已经在执行")
+
+        download_claimed = False
+        if not paper["local_path"]:
+            if paper["status"] not in ("available", "failed"):
+                raise RuntimeError("论文当前状态不允许启动准备任务")
+            cursor = conn.execute(
+                """
+                UPDATE papers
+                SET status = ?, error = NULL, updated_at = ?
+                WHERE id = ? AND status IN ('available', 'failed')
+                """,
+                (STATUS_DOWNLOADING, timestamp, paper_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("论文准备状态已由其他请求改变")
+            preparation_status = STATUS_DOWNLOADING
+            download_claimed = True
+        else:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
+                VALUES (?, ?)
+                """,
+                (paper_id, PARSE_NOT_STARTED),
+            )
+            document = conn.execute(
+                "SELECT * FROM paper_documents WHERE paper_id = ?",
+                (paper_id,),
+            ).fetchone()
+            if document["parse_status"] == PARSE_PARSING:
+                raise RuntimeError("论文解析任务已经在执行")
+            if document["parse_status"] != PARSE_PARSED:
+                conn.execute(
+                    """
+                    UPDATE paper_documents
+                    SET parse_status = ?, error = NULL, updated_at = ?
+                    WHERE paper_id = ?
+                    """,
+                    (PARSE_PARSING, timestamp, paper_id),
+                )
+                preparation_status = PARSE_PARSING
+            elif document["index_status"] == INDEX_INDEXED:
+                return {"job_id": None, "preparation_status": "ready"}
+            else:
+                if document["index_status"] == INDEX_INDEXING:
+                    raise RuntimeError("论文索引任务已经在执行")
+                conn.execute(
+                    """
+                    UPDATE paper_documents
+                    SET index_status = ?, index_error = NULL, updated_at = ?
+                    WHERE paper_id = ?
+                    """,
+                    (INDEX_INDEXING, timestamp, paper_id),
+                )
+                preparation_status = INDEX_INDEXING
+
+        cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, paper_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('prepare_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps(
+                    {
+                        "paper_id": paper_id,
+                        "download_claimed": download_claimed,
+                    },
+                    ensure_ascii=False,
+                ),
+                dedupe_key,
+                paper_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {
+            "job_id": int(cursor.lastrowid),
+            "preparation_status": preparation_status,
+        }
+
+
+def _active_paper_job(conn: sqlite3.Connection, paper_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, job_type
+        FROM background_jobs
+        WHERE paper_id = ?
+          AND status IN ('queued', 'running', 'retry_wait')
+        ORDER BY id
+        LIMIT 1
+        """,
+        (paper_id,),
+    ).fetchone()
+
+
+def enqueue_parse_job(
+    paper_id: int,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    timestamp = _db_timestamp(now)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paper = conn.execute(
+            "SELECT id, local_path FROM papers WHERE id = ?",
+            (paper_id,),
+        ).fetchone()
+        if paper is None:
+            raise LookupError("论文记录不存在")
+        if not paper["local_path"]:
+            raise RuntimeError("论文PDF尚未下载")
+        if _active_paper_job(conn, paper_id) is not None:
+            raise RuntimeError("论文已有后台任务正在执行")
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
+            VALUES (?, ?)
+            """,
+            (paper_id, PARSE_NOT_STARTED),
+        )
+        document = conn.execute(
+            "SELECT parse_status FROM paper_documents WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+        if document["parse_status"] == PARSE_PARSING:
+            raise RuntimeError("论文解析任务已经在执行")
+        queued_parse_status = document["parse_status"]
+        if document["parse_status"] != PARSE_PARSED:
+            conn.execute(
+                """
+                UPDATE paper_documents
+                SET parse_status = ?, error = NULL, updated_at = ?
+                WHERE paper_id = ?
+                """,
+                (PARSE_PARSING, timestamp, paper_id),
+            )
+            queued_parse_status = PARSE_PARSING
+        cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, paper_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('parse_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"paper_id": paper_id}, ensure_ascii=False),
+                f"parse_paper:{paper_id}",
+                paper_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {
+            "job_id": int(cursor.lastrowid),
+            "parse_status": queued_parse_status,
+        }
+
+
+def enqueue_index_job(
+    paper_id: int,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    timestamp = _db_timestamp(now)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paper = conn.execute(
+            "SELECT id FROM papers WHERE id = ?",
+            (paper_id,),
+        ).fetchone()
+        if paper is None:
+            raise LookupError("论文记录不存在")
+        if _active_paper_job(conn, paper_id) is not None:
+            raise RuntimeError("论文已有后台任务正在执行")
+        document = conn.execute(
+            "SELECT parse_status, index_status FROM paper_documents WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+        if document is None or document["parse_status"] != PARSE_PARSED:
+            raise RuntimeError("论文尚未完成解析")
+        if document["index_status"] == INDEX_INDEXING:
+            raise RuntimeError("论文索引任务已经在执行")
+        conn.execute(
+            """
+            UPDATE paper_documents
+            SET index_status = ?, index_error = NULL, updated_at = ?
+            WHERE paper_id = ?
+            """,
+            (INDEX_INDEXING, timestamp, paper_id),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, paper_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('index_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"paper_id": paper_id}, ensure_ascii=False),
+                f"index_paper:{paper_id}",
+                paper_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {"job_id": int(cursor.lastrowid), "index_status": INDEX_INDEXING}
+
+
+def enqueue_rag_answer_job(
+    paper_id: int,
+    question: str,
+    reranker: str = "none",
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    question = question.strip()
+    if not question:
+        raise ValueError("question is required")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    fingerprint = hashlib.sha256(
+        f"{reranker}\0{question}".encode("utf-8")
+    ).hexdigest()[:32]
+    dedupe_key = f"answer_rag_query:{paper_id}:{fingerprint}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paper = conn.execute(
+            "SELECT id FROM papers WHERE id = ?",
+            (paper_id,),
+        ).fetchone()
+        if paper is None:
+            raise LookupError("论文记录不存在")
+        document = conn.execute(
+            "SELECT index_status FROM paper_documents WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+        if document is None or document["index_status"] != INDEX_INDEXED:
+            raise RuntimeError("论文尚未完成索引")
+
+        blocking_job = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE paper_id = ?
+              AND job_type != 'answer_rag_query'
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (paper_id,),
+        ).fetchone()
+        if blocking_job is not None:
+            raise RuntimeError("论文已有准备任务正在执行")
+
+        active = conn.execute(
+            """
+            SELECT id, rag_query_id
+            FROM background_jobs
+            WHERE dedupe_key = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        if active is not None:
+            if active["rag_query_id"] is None:
+                raise RuntimeError("活动问答任务缺少关联记录")
+            return {
+                "job_id": int(active["id"]),
+                "query_id": int(active["rag_query_id"]),
+                "created": False,
+            }
+
+        query_cursor = conn.execute(
+            """
+            INSERT INTO rag_queries (paper_id, question, reranker, status)
+            VALUES (?, ?, ?, ?)
+            """,
+            (paper_id, question, reranker, RAG_ANSWERING),
+        )
+        query_id = int(query_cursor.lastrowid)
+        job_cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, paper_id, rag_query_id,
+                status, max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('answer_rag_query', ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"query_id": query_id}, ensure_ascii=False),
+                dedupe_key,
+                paper_id,
+                query_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {
+            "job_id": int(job_cursor.lastrowid),
+            "query_id": query_id,
+            "created": True,
+        }
+
+
+def get_background_job(job_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM background_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    return _background_job_from_row(row) if row is not None else None
+
+
+def list_background_jobs(limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM background_jobs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_background_job_from_row(row) for row in rows]
+
+
+def claim_next_background_job(
+    worker_id: str,
+    *,
+    lease_seconds: int = 60,
+    job_types: Iterable[str] = (),
+    now: Optional[datetime] = None,
+) -> Optional[dict]:
+    worker_id = worker_id.strip()
+    if not worker_id:
+        raise ValueError("worker_id is required")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be at least 1")
+
+    types = tuple(dict.fromkeys(job_types))
+    current = now or _utc_now()
+    timestamp = _db_timestamp(current)
+    lease_expires_at = _db_timestamp(current + timedelta(seconds=lease_seconds))
+    type_clause = ""
+    parameters: list[object] = [timestamp]
+    if types:
+        placeholders = ", ".join("?" for _ in types)
+        type_clause = f" AND job_type IN ({placeholders})"
+        parameters.extend(types)
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"""
+            SELECT id
+            FROM background_jobs
+            WHERE status IN ('queued', 'retry_wait')
+              AND available_at <= ?
+              {type_clause}
+            ORDER BY priority DESC, id
+            LIMIT 1
+            """,
+            tuple(parameters),
+        ).fetchone()
+        if row is None:
+            return None
+        job_id = int(row["id"])
+        cursor = conn.execute(
+            """
+            UPDATE background_jobs
+            SET status = 'running',
+                worker_id = ?,
+                lease_expires_at = ?,
+                attempt_count = attempt_count + 1,
+                started_at = COALESCE(started_at, ?),
+                updated_at = ?
+            WHERE id = ?
+              AND status IN ('queued', 'retry_wait')
+              AND available_at <= ?
+            """,
+            (
+                worker_id,
+                lease_expires_at,
+                timestamp,
+                timestamp,
+                job_id,
+                timestamp,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        claimed = conn.execute(
+            "SELECT * FROM background_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    return _background_job_from_row(claimed)
+
+
+def renew_background_job_lease(
+    job_id: int,
+    worker_id: str,
+    *,
+    lease_seconds: int = 60,
+    now: Optional[datetime] = None,
+) -> bool:
+    worker_id = worker_id.strip()
+    if not worker_id:
+        raise ValueError("worker_id is required")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be at least 1")
+    current = now or _utc_now()
+    timestamp = _db_timestamp(current)
+    lease_expires_at = _db_timestamp(current + timedelta(seconds=lease_seconds))
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE background_jobs
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND worker_id = ?
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > ?
+            """,
+            (lease_expires_at, timestamp, job_id, worker_id, timestamp),
+        )
+    return cursor.rowcount == 1
+
+
+def complete_background_job(
+    job_id: int,
+    worker_id: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    timestamp = _db_timestamp(now)
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE background_jobs
+            SET status = 'succeeded',
+                lease_expires_at = NULL,
+                last_error = NULL,
+                completed_at = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ?
+            """,
+            (timestamp, timestamp, job_id, worker_id),
+        )
+    return cursor.rowcount == 1
+
+
+def fail_background_job(
+    job_id: int,
+    worker_id: str,
+    error: str,
+    *,
+    retry_delay_seconds: int = 5,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds cannot be negative")
+    current = now or _utc_now()
+    timestamp = _db_timestamp(current)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT attempt_count, max_attempts
+            FROM background_jobs
+            WHERE id = ? AND status = 'running' AND worker_id = ?
+            """,
+            (job_id, worker_id),
+        ).fetchone()
+        if row is None:
+            return None
+        should_retry = int(row["attempt_count"]) < int(row["max_attempts"])
+        next_status = "retry_wait" if should_retry else "failed"
+        available_at = _db_timestamp(
+            current + timedelta(seconds=retry_delay_seconds)
+        )
+        conn.execute(
+            """
+            UPDATE background_jobs
+            SET status = ?,
+                available_at = ?,
+                lease_expires_at = NULL,
+                worker_id = NULL,
+                last_error = ?,
+                completed_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                next_status,
+                available_at,
+                error[:1000],
+                next_status,
+                timestamp,
+                timestamp,
+                job_id,
+            ),
+        )
+    return next_status
+
+
+def recover_expired_background_jobs(
+    *,
+    now: Optional[datetime] = None,
+) -> list[dict]:
+    timestamp = _db_timestamp(now)
+    recovered: list[dict] = []
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM background_jobs
+            WHERE status = 'running'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            ORDER BY id
+            """,
+            (timestamp,),
+        ).fetchall()
+        for row in rows:
+            next_status = (
+                "queued"
+                if int(row["attempt_count"]) < int(row["max_attempts"])
+                else "failed"
+            )
+            error = "Worker lease expired before the task completed"
+            conn.execute(
+                """
+                UPDATE background_jobs
+                SET status = ?,
+                    available_at = ?,
+                    lease_expires_at = NULL,
+                    worker_id = NULL,
+                    last_error = ?,
+                    completed_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END,
+                    updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    next_status,
+                    timestamp,
+                    error,
+                    next_status,
+                    timestamp,
+                    timestamp,
+                    int(row["id"]),
+                ),
+            )
+            item = _background_job_from_row(row)
+            item["status"] = next_status
+            item["last_error"] = error
+            recovered.append(item)
+    return recovered
 
 
 def claim_download(paper_id: int, allowed_statuses: Iterable[str]) -> bool:

@@ -37,7 +37,7 @@ REPORT_CHECKPOINT_NODES = {
 }
 
 
-def execute_research_task(task_id: int) -> None:
+def execute_research_task(task_id: int, *, raise_on_error: bool = False) -> None:
     task = get_research_task(task_id)
     if task is None or task["status"] != RESEARCH_TASK_RUNNING:
         return
@@ -75,6 +75,8 @@ def execute_research_task(task_id: int) -> None:
             update_checkpoint_candidate_ids(thread_id, paper_ids)
     except Exception as exc:
         fail_research_task(task_id, f"{type(exc).__name__}: {exc}")
+        if raise_on_error:
+            raise
 
 
 def _persist_report_graph_state(task_id: int, state: dict) -> None:

@@ -17,16 +17,20 @@ from .config import BASE_DIR, MAX_RESULTS, configure_utf8_stdio, ensure_runtime_
 from .db import (
     attach_agent_traces_to_task,
     cancel_research_task,
-    claim_download,
     clear_paper_history,
     create_research_task,
-    create_rag_query,
+    enqueue_download_job,
+    enqueue_index_job,
+    enqueue_parse_job,
+    enqueue_paper_preparation_job,
+    enqueue_rag_answer_job,
+    enqueue_research_report_job,
+    enqueue_research_search_job,
     export_papers_csv,
     export_papers_json,
     get_document,
     get_evaluation_run,
     get_generation_evaluation_run,
-    get_or_create_document,
     get_paper,
     get_research_task,
     get_research_report,
@@ -45,11 +49,9 @@ from .db import (
     list_research_tool_calls,
     list_rag_queries,
     select_research_task_papers,
-    start_research_task,
-    start_research_report,
     validate_research_task_paper_selection,
 )
-from .download_service import can_attempt_download, download_paper
+from .download_service import can_attempt_download
 from .evaluation_service import (
     create_experiment_run,
     import_benchmark_cases,
@@ -61,20 +63,14 @@ from .generation_evaluation_service import (
     run_generation_evaluation,
 )
 from .origin_service import create_origin_outputs
-from .pdf_service import parse_paper_pdf
 from .paper_workflow import (
-    PREPARATION_READY,
     get_paper_preparation_status,
-    mark_preparation_started,
     paper_preparation_status,
-    prepare_paper_for_qa,
 )
 from .rag_service import (
     RERANKER_DEEPSEEK_LISTWISE,
     RERANKER_NONE,
-    answer_rag_query,
     build_access_notice,
-    index_paper_chunks,
 )
 from .research_agent import (
     SEARCH_MODE_RESEARCH_AGENT,
@@ -87,14 +83,12 @@ from .research_checkpoint import (
     resume_plan_confirmation,
     start_checkpointed_research,
 )
-from .research_workflow import execute_research_report, execute_research_task
 from .schemas import (
     INDEX_INDEXED,
     MAX_RESEARCH_SELECTED_PAPERS,
     PARSE_PARSED,
     RESEARCH_TASK_AWAITING,
     STATUS_AVAILABLE,
-    STATUS_DOWNLOADING,
     STATUS_FAILED,
 )
 from .search_service import search_all
@@ -107,7 +101,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.12.3")
+app = FastAPI(title="Paper Hunter", version="0.13.1")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -231,13 +225,14 @@ def research_task_detail(request: Request, task_id: int):
 
 
 @app.post("/research-tasks/{task_id}/confirm")
-def confirm_research_task(task_id: int, background_tasks: BackgroundTasks):
+def confirm_research_task(task_id: int):
     task = get_research_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Research task not found")
-    if not start_research_task(task_id):
-        raise HTTPException(status_code=409, detail="Research task cannot be confirmed")
-    background_tasks.add_task(execute_research_task, task_id)
+    try:
+        enqueue_research_search_job(task_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
 
 
@@ -297,16 +292,14 @@ def select_research_papers(
 
 
 @app.post("/research-tasks/{task_id}/report")
-def create_research_report_route(
-    task_id: int,
-    background_tasks: BackgroundTasks,
-):
+def create_research_report_route(task_id: int):
     task = get_research_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Research task not found")
-    if not start_research_report(task_id):
-        raise HTTPException(status_code=409, detail="Research report cannot be started")
-    background_tasks.add_task(execute_research_report, task_id)
+    try:
+        enqueue_research_report_job(task_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
 
 
@@ -325,6 +318,9 @@ def research_task_status(task_id: int):
         "result_count": task["result_count"],
         "selected_count": task["selected_count"],
         "error": task["error"],
+        "search_job_status": task.get("search_job_status"),
+        "search_job_attempts": task.get("search_job_attempts"),
+        "search_job_max_attempts": task.get("search_job_max_attempts"),
         "updated_at": task["updated_at"],
         "checkpoint": checkpoint,
         "tool_calls": list_research_tool_calls(task_id),
@@ -333,6 +329,9 @@ def research_task_status(task_id: int):
                 "status": report["status"],
                 "model": report["model"],
                 "error": report["error"],
+                "job_status": report.get("job_status"),
+                "job_attempts": report.get("job_attempts"),
+                "job_max_attempts": report.get("job_max_attempts"),
                 "checkpoint_progress": report["details"].get(
                     "checkpoint_progress", {}
                 ),
@@ -415,51 +414,54 @@ def paper_detail(request: Request, paper_id: int):
 
 
 @app.post("/papers/{paper_id}/prepare")
-def prepare_paper(paper_id: int, background_tasks: BackgroundTasks):
+def prepare_paper(paper_id: int):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
+    if not paper["local_path"] and not can_attempt_download(
+        paper["source"],
+        paper["pdf_url"],
+    ):
+        raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
     try:
-        status = mark_preparation_started(paper_id)
-    except RuntimeError as exc:
+        enqueue_paper_preparation_job(paper_id)
+    except (LookupError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if status != PREPARATION_READY:
-        background_tasks.add_task(
-            prepare_paper_for_qa,
-            paper_id,
-            download_claimed=status == STATUS_DOWNLOADING,
-        )
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/parse")
-def parse_paper(paper_id: int, background_tasks: BackgroundTasks):
+def parse_paper(paper_id: int):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
     if not paper["local_path"]:
         raise HTTPException(status_code=409, detail="Paper PDF is not downloaded")
-    get_or_create_document(paper_id)
-    background_tasks.add_task(parse_paper_pdf, paper_id)
+    try:
+        enqueue_parse_job(paper_id)
+    except (LookupError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/index")
-def index_paper(paper_id: int, background_tasks: BackgroundTasks):
+def index_paper(paper_id: int):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
     document = get_document(paper_id)
     if document is None or document["parse_status"] != PARSE_PARSED:
         raise HTTPException(status_code=409, detail="Paper is not parsed")
-    background_tasks.add_task(index_paper_chunks, paper_id)
+    try:
+        enqueue_index_job(paper_id)
+    except (LookupError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/ask")
 def ask_paper(
     paper_id: int,
-    background_tasks: BackgroundTasks,
     question: str = Form(...),
     use_reranker: bool = Form(False),
 ):
@@ -477,32 +479,32 @@ def ask_paper(
     reranker = (
         RERANKER_DEEPSEEK_LISTWISE if use_reranker else RERANKER_NONE
     )
-    query_id = create_rag_query(paper_id, question, reranker)
-    background_tasks.add_task(answer_rag_query, query_id)
+    try:
+        enqueue_rag_answer_job(paper_id, question, reranker)
+    except (LookupError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/retry")
-def retry_download(paper_id: int, background_tasks: BackgroundTasks):
+def retry_download(paper_id: int):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
     if not can_attempt_download(paper["source"], paper["pdf_url"]):
         raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
-    if claim_download(paper_id, (STATUS_FAILED,)):
-        background_tasks.add_task(download_paper, paper_id)
+    enqueue_download_job(paper_id, (STATUS_FAILED,))
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 
 @app.post("/papers/{paper_id}/download")
-def start_download(paper_id: int, background_tasks: BackgroundTasks):
+def start_download(paper_id: int):
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
     if not can_attempt_download(paper["source"], paper["pdf_url"]):
         raise HTTPException(status_code=409, detail="Paper has no downloadable PDF")
-    if claim_download(paper_id, (STATUS_AVAILABLE,)):
-        background_tasks.add_task(download_paper, paper_id)
+    enqueue_download_job(paper_id, (STATUS_AVAILABLE,))
     return RedirectResponse(url=f"/papers/{paper_id}", status_code=303)
 
 

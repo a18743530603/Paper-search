@@ -1,14 +1,18 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.12.3`
+> 当前版本：`v0.13.1`
 >
-> 更新日期：`2026-08-16`
+> 更新日期：`2026-08-20`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
 > 实验过程：见 [EXPERIMENTS.md](EXPERIMENTS.md)
+>
+> 项目全景：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+
+`v0.13.1` 完成B1可靠Worker阶段。用户点击论文处理按钮、提交单篇问题、确认智能研究检索计划或生成跨论文报告时，业务状态与`background_jobs`都在同一笔SQLite事务中更新；独立Worker通过租约执行下载、准备、解析、索引、RAG回答、研究搜索和研究报告，支持自动心跳、指数退避、最多3次尝试、最终失败和Worker中断恢复。重复请求复用活动任务；LangGraph检查点负责报告逐节点续跑，报告内容已落库后的任务重放不会再次调用DeepSeek。队列专项`42 passed`，完整离线测试`199 passed`。
 
 `v0.12.3` 完成A7.4真实stdio MCP Client冒烟验证，并结束整个A7阶段。新增`scripts/smoke_mcp_client.py`，使用当前Python解释器启动独立`my_agent_project.mcp_server`子进程，通过stdin/stdout完成协议初始化和Tool发现，不调用业务Tool。真实运行确认Server为`paper-hunter`、协议版本`2025-11-25`，并准确发现三个Tool；MCP专项`13 passed`、完整离线测试`157 passed`。
 
@@ -73,7 +77,7 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 
 - arXiv 的 PDF 地址格式稳定，因此优先识别为可下载来源，但需要用户点击下载按钮。
 - Crossref 的链接结构较复杂，只有遇到明确的 `.pdf` 绝对直链才下载，否则保存 DOI 或网页地址。
-- PDF 下载通过 FastAPI 后台任务执行，搜索结果不必等待全部下载完成。
+- “仅下载”和“失败重试”通过SQLite持久队列与独立Worker执行，搜索结果不必等待下载完成，Web重启也不会丢失已入队任务。
 - 单篇论文下载失败不会中断其他论文的处理。
 
 ## 主要功能
@@ -118,7 +122,7 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 
 本项目使用 `uv` 管理 Python 环境和依赖。安装方式请参考 [uv 官方文档](https://docs.astral.sh/uv/)。
 
-### 2. 启动项目
+### 2. 启动 Web 服务
 
 在项目根目录运行：
 
@@ -138,13 +142,29 @@ http://127.0.0.1:8001/
 uv run uvicorn my_agent_project.main:app --host 127.0.0.1 --port 8002
 ```
 
-### 3. 运行测试
+### 3. 启动任务 Worker
+
+另开一个终端，在同一项目根目录运行：
+
+```powershell
+uv run python -m my_agent_project.worker
+```
+
+Web负责校验请求并把论文处理、问答、研究搜索和研究报告任务持久化到SQLite，Worker负责真正执行。两者分开后，即使Web服务重启，已经入队的任务仍然存在；Worker进程异常退出时，超过租约时间的任务会由后续Worker重新领取。只处理当前已经到期的任务并退出，可用于调试：
+
+```powershell
+uv run python -m my_agent_project.worker --once
+```
+
+当前用户研究闭环中的下载、失败重试、完整准备、单独解析、单独索引、单篇RAG问答、智能研究搜索和跨论文报告全部走持久Worker。离线评测页面仍使用FastAPI `BackgroundTasks`，不属于面向用户的长任务闭环。
+
+### 4. 运行测试
 
 ```powershell
 uv run pytest
 ```
 
-### 4. 生成Agent评测报告
+### 5. 生成Agent评测报告
 
 运行冻结的11条可靠性场景，并组合当前本地运行Trace指标：
 
@@ -341,7 +361,7 @@ GET  /evaluation/runs/{run_id}
 
 ### `download_service.py`
 
-负责后台下载 PDF、清洗文件名、处理同名文件、更新数据库状态，以及捕获单篇论文的下载异常。
+负责下载 PDF、清洗文件名、处理同名文件、更新数据库状态，以及捕获单篇论文的下载异常。`raise_on_error=True`只供可靠Worker使用，使下载服务在记录论文失败状态后把异常交给队列判断是否重试；其他旧调用保持原来的异常隔离行为。
 
 文件名清洗的核心规则是：
 
@@ -349,12 +369,29 @@ GET  /evaluation/runs/{run_id}
 re.sub(r'[\\/*?:"<>|]', "_", title)
 ```
 
+### `task_queue_service.py`
+
+负责B1持久任务的业务分发，不复制下载、解析、索引或RAG问答实现：
+
+- `enqueue_download_job()`在数据库层把论文状态抢占与任务入队放进同一事务，避免状态已改但任务没有创建。
+- `enqueue_paper_preparation_job()`按论文当前状态原子锁定下载、解析或索引阶段，并创建`prepare_paper`任务；已完成阶段由原工作流自动跳过。
+- `enqueue_parse_job()`与`enqueue_index_job()`迁移详情页单步操作；活动论文任务统一互斥，完成后仍允许用户显式重新处理。
+- `enqueue_rag_answer_job()`在同一事务中创建`rag_queries`记录和`answer_rag_query`任务；同一论文、问题和重排模式的活动重复请求返回原任务，不重复消耗模型Token。
+- `run_one_job()`通过租约领取一个到期任务，调用注册处理器，并按尝试次数进入`succeeded`、`retry_wait`或`failed`。
+- 下载、准备或问答失败使用指数退避；达到`max_attempts`后停止重试并同步当前阶段失败原因。
+- `recover_expired_jobs()`回收Worker中断后超过租约的`running`任务；仍有尝试次数时重新排队，否则最终失败。
+- `_maintain_job_lease()`在处理器执行期间启动守护心跳；默认每30秒或租约三分之一续期，任务结束后立即停止。
+
+### `worker.py`
+
+独立Worker进程入口。它轮询SQLite队列、回收过期租约并调用`task_queue_service`执行任务，不承载HTTP请求。当前注册`download_paper`、`prepare_paper`、`parse_paper`、`index_paper`和`answer_rag_query`；各处理器复用原Service，不在Worker中复制业务实现。默认租约为90秒，任务执行期间由心跳线程自动续期；只有持有未过期租约的当前Worker才能续租。心跳模式要求租约至少2秒，且续期间隔必须短于租约。
+
 ### `paper_workflow.py`
 
 负责把已有下载、PDF解析和向量索引服务编排成一次用户触发的准备流程，不复制各模块内部实现：
 
 - `paper_preparation_status()`：根据论文、解析和索引记录推导统一准备状态。
-- `mark_preparation_started()`：在加入后台任务前锁定当前阶段，避免用户重复提交。
+- `mark_preparation_started()`：保留的旧流程状态抢占辅助函数；Web主路由已改用原子入队函数。
 - `prepare_paper_for_qa()`：从尚未完成的步骤继续执行；下载、解析或索引任一步失败时立即停止。
 - 已下载论文跳过下载，已解析论文跳过解析，已完成索引直接返回 `ready`。
 - 没有明确 PDF 直链的 Crossref 记录保持 `link_only`，不会进入自动处理流程。
@@ -454,7 +491,7 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 
 负责后台执行已经人工确认的研究任务：
 
-- `execute_research_task()`读取SQLite中冻结的计划并调用`run_confirmed_research_search()`。
+- `execute_research_task()`读取SQLite中冻结的计划并恢复同一个LangGraph检查点；`raise_on_error=True`只供Worker识别失败并进行有限重试。
 - 检索成功后复用`insert_papers()`归档论文，用`replace_research_tool_calls()`幂等保存工具轨迹，并把论文ID写回研究任务。
 - 任意异常只将当前任务标记为`failed`并保存错误，不影响其他任务或普通检索。
 - `execute_research_report()`识别当前检查点位置，逐节点同步报告状态、证据、工具摘要和完成数量；没有A4检查点的旧任务继续调用A3兼容入口。
@@ -475,6 +512,8 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 
 负责 SQLite 的全部数据读写，包括初始化表、持久化研究任务、插入检索结果、查询历史与详情、更新下载状态、缓存 PDF 页文本与 Seed 向量，以及导出 CSV/JSON。
 
+`background_jobs`保存持久任务载荷、活动去重键、状态、尝试次数、可执行时间和Worker租约。`enqueue_download_job()`把论文状态转换与任务创建放在同一事务；领取、完成、失败和租约恢复也都使用数据库条件更新，不依赖Web进程内存。
+
 `research_tasks`保存研究问题、结果上限、计划目标、查询列表、规划模型、规划/执行错误、`checkpoint_thread_id`、业务任务状态、候选论文ID、已选论文ID和各阶段时间。业务表用于列表与审计，LangGraph执行位置由独立Checkpointer负责。
 
 `research_tool_calls`按任务和调用序号保存工具名称、JSON输入、执行状态、结果数、来源分布、错误与耗时；同一任务恢复时整体替换，避免重复审计记录。
@@ -483,7 +522,7 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 
 `details_json.evidence`保存完整原始召回，`details_json.context_evidence`保存真正发送给DeepSeek的证据，`details_json.context_stats`保存`fair_budget_v1`配置、压缩率、论文覆盖和删除审计，`details_json.context_quality`保存质量门禁结果。
 
-应用启动时会把中断的报告标记为可重试`failed`，并将遗留的`downloading/parsing/indexing`阶段恢复成可继续状态；再次点击后由LangGraph检查点决定真正需要执行的下一个节点。
+应用启动时会把中断的报告标记为可重试`failed`，并将没有活动持久任务的遗留`downloading`以及`parsing/indexing`阶段恢复成可继续状态；存在`queued/running/retry_wait`下载任务时必须保留`downloading`，由Worker租约负责恢复。
 
 主要字段包括：
 
@@ -645,7 +684,7 @@ SEED_TIMEOUT=120
   -> 页面展示回答、模型名称和原文证据
 ```
 
-索引和模型回答都使用 `BackgroundTasks`。问答状态包括 `answering`、`answered` 和 `answer_failed`，页面会自动轮询并更新。
+索引和模型回答均已使用持久Worker。问答状态包括`answering`、`answered`和`answer_failed`，页面会自动轮询并更新。
 
 ## 状态自动刷新与历史清理
 
@@ -668,7 +707,8 @@ SEED_TIMEOUT=120
   -> request_plan_confirmation()调用interrupt()保存检查点并暂停
   -> db.create_research_task()保存thread_id与awaiting_confirmation业务状态
   -> 用户在研究任务页确认或取消
-  -> 确认后BackgroundTasks调用Command(resume={approved: true})
+  -> 确认路由在同一SQLite事务中写入running状态与research_search任务
+  -> 独立Worker领取任务并调用Command(resume={approved: true})
   -> 条件边选择多查询或单查询降级节点
   -> invoke_research_tool("search_literature", arguments)
   -> StructuredTool校验参数并复用search_service.search_all()
@@ -682,9 +722,15 @@ SEED_TIMEOUT=120
   -> Command(resume={paper_ids: [...]})恢复第二个中断
   -> 图内与业务层双重校验后冻结论文ID
   -> 任务进入 papers_selected，仍不会自动下载
+  -> 用户点击生成研究报告
+  -> main.py原子创建preparing报告记录与research_report任务
+  -> 独立Worker恢复报告确认或重新生成检查点
+  -> 逐篇准备、证据检索、上下文门禁、DeepSeek生成和引用检查
+  -> 报告完成后进入completed；任务重放不重复调用模型
   -> 用户可继续使用“准备问答”和“仅下载”
   -> 用户点击 POST /papers/{paper_id}/prepare
-  -> main.py 将准备流程加入 BackgroundTasks
+  -> main.py 原子抢占当前准备阶段并写入 background_jobs
+  -> 独立Worker租约领取 prepare_paper
   -> paper_workflow.prepare_paper_for_qa() 判断当前断点
   -> download_service.download_paper() 下载开放 PDF
   -> pdf_service.parse_paper_pdf() 提取页码和文本块
@@ -693,11 +739,13 @@ SEED_TIMEOUT=120
   -> ready 后用户在详情页提问并获得带页码证据的回答
 ```
 
-## 为什么使用后台任务
+## 为什么使用持久队列和后台任务
 
 检索和 PDF 下载都可能耗时。如果全部在 `POST /search` 中同步执行，页面会长时间等待，甚至发生请求超时。
 
-普通检索仍同步完成元数据检索和入库。智能研究先保存计划并返回确认页，用户确认后才通过`BackgroundTasks`执行多路网络检索，任务页每2秒检查状态。发现明确 PDF 地址时状态为 `available`，用户点击下载按钮后才后台下载。这样既避免研究规划自动调用工具，也避免一次搜索自动产生大量本地文件。
+普通检索仍同步完成元数据检索和入库。智能研究先保存计划并返回确认页，用户确认后才执行多路网络检索，任务页每2秒检查状态。发现明确 PDF 地址时状态为`available`，用户点击“仅下载”后，Web只负责在同一事务中把论文改为`downloading`并创建持久任务，独立Worker再执行网络下载。这样既避免研究规划自动调用工具，也避免Web重启丢失已入队下载。
+
+B1完成后，面向用户的论文获取、建库、单篇RAG问答、智能研究搜索和跨论文报告都已进入持久Worker。需要准确说明的是：当前提供SQLite单机持久队列和至少一次执行语义，不等同于Redis/Celery集群，也不保证外部副作用严格只执行一次。
 
 ## 为什么 Crossref 不强制下载
 
@@ -741,7 +789,7 @@ git push
 ## 简历描述参考
 
 ```text
-基于 FastAPI 设计并实现学术文献检索与开放获取下载系统，聚合 arXiv 与 Crossref API，使用 BackgroundTasks 将 PDF 下载任务后台化，并通过 SQLite 记录论文元数据、出版商、DOI、来源 URL、本地路径和下载状态。针对 Crossref 链接结构复杂的问题设计保守降级策略，实现文件名安全清洗、Windows UTF-8 编码兼容、单篇下载失败隔离及 CSV/JSON/Origin 数据导出，提高系统稳定性与可演示性。
+基于FastAPI设计学术文献检索与开放获取下载系统，聚合arXiv与Crossref API；使用SQLite持久任务队列和独立Worker执行用户确认的PDF下载，通过原子入队、租约抢占、有限重试和过期任务恢复避免Web重启丢任务及重复下载，并保留Crossref链接保守降级、文件名安全清洗和单篇失败隔离。
 ```
 
 ## 后续扩展方向

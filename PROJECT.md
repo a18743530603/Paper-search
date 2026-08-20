@@ -1,10 +1,12 @@
 # Paper Hunter 项目概述
 
-> 当前版本：`v0.12.3`
+> 当前版本：`v0.13.1`
 >
-> 更新日期：`2026-08-16`
+> 更新日期：`2026-08-20`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
+>
+> 技术栈、架构和完整流程：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
 Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下载助手。用户输入关键词或论文标题后，系统会检索 arXiv 和 Crossref，保存论文元数据、来源链接、出版商和下载状态，并在后台下载明确可免费获取的 PDF。
 
@@ -14,11 +16,12 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - 同时检索 arXiv 和 Crossref。
 - 保存标题、作者、摘要、发表时间、来源、出版商、DOI、网页地址和 PDF 地址。
 - 使用 SQLite 保存历史记录及下载状态。
-- 检索到明确 PDF 地址时显示下载按钮，用户确认后再通过 FastAPI `BackgroundTasks` 后台下载。
+- 检索到明确 PDF 地址时显示下载按钮；用户确认后把下载持久化入队，由独立Worker执行。
 - arXiv 论文优先显示可下载状态，由用户点击按钮后下载。
 - Crossref 只有在提供明确的 `.pdf` 绝对直链时才下载，否则标记为 `link_only`。
 - 下载失败只影响当前论文，并记录为 `failed` 及具体错误原因。
-- 下载任务使用`claim_download()`执行原子状态抢占：普通下载只允许`available → downloading`，重试允许`failed → downloading`；数据库未更新记录时不创建第二个后台任务。
+- B1.1把单篇下载状态抢占和`background_jobs`入队合并为一笔SQLite事务：普通下载只允许`available → downloading`，重试只允许`failed → downloading`，并发请求只生成一个活动任务。
+- 独立Worker使用租约原子领取任务，失败按指数退避有限重试，超过次数进入最终失败；进程中断后，租约过期任务可重新入队。
 - 自动清洗 Windows/Linux 文件名非法字符并处理重名。
 - 强制使用 UTF-8 标准输出，降低 Windows 中文路径和日志乱码风险。
 - 可选接入 Agent/大模型能力；没有 API Key 时仍可正常运行。
@@ -47,6 +50,7 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - A7.2新增`search_literature` MCP Tool，通过白名单Registry复用现有LangChain StructuredTool的输入校验、双来源检索和部分失败降级；MCP层不写库、不下载，完整离线测试`153 passed`。
 - A7.3新增`retrieve_paper_evidence` MCP Tool，只检索已索引论文的页码证据，不暴露论文准备Tool，也不因无证据自动下载、解析或索引；完整离线测试`156 passed`。
 - A7.4新增独立stdio Client冒烟脚本，以真实子进程验证协议握手和三个Tool发现；不调用业务Tool或外部API。MCP专项`13 passed`，完整离线测试`157 passed`，A7阶段完成。
+- B1.1至B1.6建立SQLite持久队列、独立Worker、原子入队、有限重试、租约恢复、自动心跳，并迁移论文处理、单篇RAG回答和智能研究搜索；B1.7进一步把跨论文报告迁入`research_report`任务。报告业务状态与入队同事务提交，LangGraph检查点负责逐节点续跑，已完成报告重放时不重复调用模型。队列专项`42 passed`，完整离线测试`199 passed`，B1阶段完成。
 
 ## 当前 RAG 建设进度
 
@@ -80,7 +84,7 @@ H2-R 使用8篇未参与开发的论文和40道冻结问题完成外部复核：
 
 报告生成前由`context_service.pack_research_context()`执行`fair_budget_v1`：先在每篇论文内部保留高分证据并去除精确重复与相邻页高重叠文本，再跨论文按轮次分配，先提高论文覆盖再补充第二条证据。`context_stats`区分原始、去重后和最终证据，并记录`duplicate_of`审计关系。当前Token数为语言无关的保守估算；去重是确定性文本规则，不是Embedding语义去重。
 
-最终上下文通过`context-quality-gate-v1`后，才由`build_research_context_payload()`序列化为不可信JSON并交给DeepSeek。门禁状态为`passed/warning/failed`，只有存在合法证据、预算未超限且计数一致时`model_call_allowed=true`。A1-A6单Agent闭环与可靠性评测已经完成；A7.1已接入首个只读MCP Tool，长期记忆和多Agent不在当前范围内。
+最终上下文通过`context-quality-gate-v1`后，才由`build_research_context_payload()`序列化为不可信JSON并交给DeepSeek。门禁状态为`passed/warning/failed`，只有存在合法证据、预算未超限且计数一致时`model_call_allowed=true`。A1-A6单Agent闭环与可靠性评测、A7最小MCP Server和B1可靠Worker均已完成；论文处理、问答、智能研究搜索和跨论文报告都由带自动续租的SQLite持久Worker执行。长期记忆和多Agent不在当前范围内。
 
 ## 分块评测与参数实验
 
@@ -151,7 +155,7 @@ uv run pytest
 ## 简历描述参考
 
 ```text
-基于 FastAPI 设计并实现学术文献检索与开放获取下载系统，聚合 arXiv 与 Crossref API，使用 BackgroundTasks 将 PDF 下载任务后台化，并通过 SQLite 记录论文元数据与处理状态；构建 DeepSeek + Seed/TF-IDF 混合检索 RAG，设计固定边界与论文章节感知分块、参考文献降噪、附录恢复和 15 题可复现实验评测，通过 Hit@K、MRR 与证据覆盖率定位跨语言排序瓶颈。
+基于FastAPI设计学术文献检索与RAG系统，聚合arXiv与Crossref API；使用SQLite持久任务队列和独立Worker执行PDF下载，通过原子入队、租约抢占、有限重试和过期恢复保证任务可靠性；构建DeepSeek + Seed/TF-IDF混合检索，使用人工标注开发集与独立未见集评估分块和重排取舍。
 ```
 
 ## 后续扩展方向
