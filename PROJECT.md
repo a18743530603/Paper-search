@@ -1,19 +1,27 @@
 # Paper Hunter 项目概述
 
-> 当前版本：`v0.13.1`
+> 当前版本：`v0.15.0`
 >
-> 更新日期：`2026-08-20`
+> 更新日期：`2026-08-24`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
 > 技术栈、架构和完整流程：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
-Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下载助手。用户输入关键词或论文标题后，系统会检索 arXiv 和 Crossref，保存论文元数据、来源链接、出版商和下载状态，并在后台下载明确可免费获取的 PDF。
+Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下载助手。用户输入关键词或论文标题后，可以从后端白名单提供的21个论文来源中多选，系统会通过统一论文搜索MCP检索任务所选来源，保存论文元数据、来源链接、出版商和下载状态，并在用户授权后由后台Worker下载明确可免费获取的 PDF。
+
+`2026-08-24`多来源搜索MCP接入已完成四步：`research_tasks.sources_json`保存canonical来源配置，Checkpoint携带执行副本，Worker恢复前以任务表校准；同一任务的全部Planner queries共用一次stdio MCP Session。首页由后端白名单渲染来源多选，默认全部选中，支持全选、清空和零来源双层拦截。Planner Prompt、`PaperCandidate`、去重、下载和报告链路保持不变。完整离线测试`224 passed`。
+
+第5.1步通过真实联网验收修复`paper-search-mcp==0.1.4`的`structuredContent.result`兼容问题，并在不改变搜索决策的前提下记录每条query的来源、原始数量、总数和错误。复验任务均进入Paper Selection，证明MCP Paper能够经过现有Mapper、去重和入库链路；完整离线测试`233 passed`。来源限流和候选相关性治理仍是后续独立任务。
+
+`v0.15.0`把生产 PDF 解析切换到 MinerU 云端精准解析 API。原页面入口与持久 Worker 不变，新增云端任务提交、上传、轮询、结果缓存和结构化块落库；RAG 索引使用章节路径与内容类型补充语义上下文。旧 `pypdf` 链路只供历史实验显式调用，不作为生产失败降级。
+
+`v0.14.0`把搜索、计划确认、论文选择、报告问题和证据追问整合为单一研究工作台。`research_messages`保存任务内消息，计划调整沿用原LangGraph `thread_id`，报告后追问作为`research_followup`持久任务执行。当前只实现最小会话上下文，尚未实现长期记忆或自动历史摘要。
 
 ## 核心功能
 
 - 提供 FastAPI Web 页面，包括搜索、结果、历史、详情和数据导出页面。
-- 同时检索 arXiv 和 Crossref。
+- 通过统一MCP按任务明确来源列表检索；首页默认全选21个白名单来源，旧任务仍兼容arXiv和Crossref。
 - 保存标题、作者、摘要、发表时间、来源、出版商、DOI、网页地址和 PDF 地址。
 - 使用 SQLite 保存历史记录及下载状态。
 - 检索到明确 PDF 地址时显示下载按钮；用户确认后把下载持久化入队，由独立Worker执行。
@@ -26,16 +34,18 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - 强制使用 UTF-8 标准输出，降低 Windows 中文路径和日志乱码风险。
 - 可选接入 Agent/大模型能力；没有 API Key 时仍可正常运行。
 - 支持导出 Origin 统计数据，并可在安装 Origin/OriginPro 后自动绘图。
-- 支持后台解析已下载 PDF，按页切分正文并保存文本块。
+- 支持 Worker 调用 MinerU 云端解析已下载 PDF，保存章节、表格、公式、列表、物理页码和版面坐标。
 - 建立受约束的 RAG Prompt：只有取得全文证据时才能回答论文内容；没有全文时提示合法访问方式并提供论文链接。
 - 使用 `paper_workflow.py` 将用户确认后的下载、PDF解析和向量索引串成后台准备流程，支持失败停止、断点续跑和统一状态展示。
 - 使用LangGraph编排研究检索：DeepSeek生成结构化多查询计划，图先停在人工确认分支；确认后后台搜索节点继续调用现有arXiv/Crossref服务并确定性去重。
 - 使用`research_tasks`持久化研究计划、执行状态、错误和结果论文ID；任务支持取消、失败隔离、自动刷新及应用重启后的待确认恢复。
+- `v0.14.0`统一首页入口和任务内消息区；`research_messages`记录计划调整、报告问题和报告后追问，`research_tasks.report_question`避免把搜索关键词直接当成报告目标。
 - 检索完成后进入第二个人工审批点：用户只能从任务候选中选择1至5篇论文，冻结后续全文准备和综合报告的输入集合，不自动下载或消耗Embedding额度。
 - 使用官方`langgraph-checkpoint-sqlite`：独立`SqliteSaver`保存图检查点，业务任务保存稳定`thread_id`；两个审批点使用动态`interrupt()`，恢复统一使用`Command(resume=...)`。
 - 使用LangChain `StructuredTool`封装论文检索，白名单注册表限制可执行能力；`research_tool_calls`记录参数、来源结果、状态、错误和耗时，支持页面与API审计。
 - 论文选择后由用户显式启动跨论文报告：标准工具复用现有准备与RAG服务，逐篇返回物理页码证据；受限论文只保留合法链接，单篇失败不影响其余论文。
 - 使用`research_reports`保存报告状态、证据、访问限制、模型和错误；只有存在全文证据时才调用DeepSeek，全部无证据时确定性拒答。
+- 报告完成后可提交`research_followup`持久任务：按冻结论文重新召回页码证据并结合当前报告回答；当前不注入完整历史，也不宣称长期记忆。
 - A4将报告确认、逐篇准备、逐篇证据检索、生成和引用检查纳入同一LangGraph线程；每篇论文形成检查点，重启或模型失败后从未完成节点继续。
 - A5-0/A5-1新增多论文Context Packer：保留原始证据，按6000估算Token预算和每篇最多2条的公平配额选择模型上下文，并持久化压缩率、论文覆盖和删除原因。
 - A5-2在公平分配前执行同论文保守去重：规范化精确重复直接合并，同页或相邻页且5-token shingle覆盖率不低于`0.85`的高重叠证据合并；跨论文内容始终保留，删除记录可审计。
@@ -50,13 +60,14 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - A7.2新增`search_literature` MCP Tool，通过白名单Registry复用现有LangChain StructuredTool的输入校验、双来源检索和部分失败降级；MCP层不写库、不下载，完整离线测试`153 passed`。
 - A7.3新增`retrieve_paper_evidence` MCP Tool，只检索已索引论文的页码证据，不暴露论文准备Tool，也不因无证据自动下载、解析或索引；完整离线测试`156 passed`。
 - A7.4新增独立stdio Client冒烟脚本，以真实子进程验证协议握手和三个Tool发现；不调用业务Tool或外部API。MCP专项`13 passed`，完整离线测试`157 passed`，A7阶段完成。
-- B1.1至B1.6建立SQLite持久队列、独立Worker、原子入队、有限重试、租约恢复、自动心跳，并迁移论文处理、单篇RAG回答和智能研究搜索；B1.7进一步把跨论文报告迁入`research_report`任务。报告业务状态与入队同事务提交，LangGraph检查点负责逐节点续跑，已完成报告重放时不重复调用模型。队列专项`42 passed`，完整离线测试`199 passed`，B1阶段完成。
+- B1.1至B1.7建立SQLite持久队列、独立Worker、原子入队、有限重试、租约恢复、自动心跳，并迁移论文处理、单篇RAG回答、研究搜索和跨论文报告。`v0.14.0`继续把报告后追问接入同一Worker，并修复报告状态轮询缓存导致的终态不刷新；完整离线测试`205 passed`。
 
 ## 当前 RAG 建设进度
 
 已经完成第一阶段“PDF 知识库基础层”：
 
-- 新增 `pdf_service.py`，提供文本清理、分页提取、重叠分块和后台解析函数。
+- 新增 `mineru_service.py`，封装精准解析 API 的批量任务申请、PDF 上传、状态轮询、结果下载、安全解压、缓存和结构化块转换。
+- `pdf_service.py` 负责生产/实验解析路由：无显式策略走 MinerU，显式实验策略继续走 `pypdf`，两者不会静默互相降级。
 - 新增 `rag_service.py`，提供论文访问链接、全文缺失提示和 RAG Prompt 构造函数。
 - 新增 `paper_documents` 与 `paper_chunks` 数据表。
 - 新增 `POST /papers/{paper_id}/parse` 接口。

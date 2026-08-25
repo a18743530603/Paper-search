@@ -1,8 +1,8 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.13.1`
+> 当前版本：`v0.15.0`
 >
-> 更新日期：`2026-08-20`
+> 更新日期：`2026-08-24`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -39,10 +39,10 @@ https://github.com/a18743530603/Paper-search.git
 ## 已确定的产品方案
 
 - 项目采用 **FastAPI Web 应用**，而不是只提供命令行脚本。
-- 第一版检索来源为 arXiv 和 Crossref。
+- 新任务可在首页从后端白名单提供的 21 个论文来源中多选，默认全部选中；升级前旧任务仍回退 arXiv 和 Crossref。
 - arXiv 是主要的可下载 PDF 来源，因为它的 PDF 地址格式较稳定；实际下载必须由用户点击按钮触发。
 - Crossref 采用保守策略：只有元数据提供以 `.pdf` 结尾的绝对直链时才尝试下载，否则保存 DOI 或网页地址并标记为 `link_only`。
-- 普通模式的`POST /search`检索并保存元数据；智能研究模式只生成并保存计划，必须由用户确认后才后台检索。
+- `POST /search`统一创建研究工作台任务和可调整计划；只有用户确认后才由后台Worker执行检索。
 - 明确可下载的论文标记为`available`；用户点击“仅下载”或“准备问答”后写入SQLite持久队列，由独立Worker执行。
 - 使用 SQLite 在本地保存论文元数据、研究任务和下载状态。
 - 大模型使用 DeepSeek API；本地搜索下载功能保持独立，没有 API Key 时仍可运行。
@@ -55,10 +55,12 @@ https://github.com/a18743530603/Paper-search.git
 - `main.py`：FastAPI 入口，注册页面和导出接口，连接检索、数据库与后台下载服务。
 - `config.py`：配置运行路径和LangGraph检查点路径，创建下载目录，并处理 Windows UTF-8 输出。
 - `schemas.py`：定义 `PaperCandidate` 和 `available`、`downloading`、`downloaded`、`link_only`、`failed` 等状态。
-- `search_service.py`：检索并解析 arXiv XML 和 Crossref JSON，生成论文元数据和下载策略。
+- `search_service.py`：保持`search_all()`单query兼容接口，并通过`search_many()`把任务queries批量委托给论文搜索MCP；旧arXiv/Crossref解析器仅作为离线夹具保留。
+- `paper_search_mcp_service.py`：用一个stdio MCP Session复用第三方`search_papers`完成多query、多来源元数据召回，将第三方Paper隔离映射为现有`PaperCandidate`，不调用下载Tool。
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常；可靠Worker可要求异常在记录失败后继续抛出。
-- `task_queue_service.py`：注册下载、完整准备、单独解析、索引和RAG回答持久任务处理器，协调租约领取、服务执行、有限重试、最终失败和Worker中断恢复。
-- `worker.py`：独立SQLite任务Worker入口；当前执行`download_paper`、`prepare_paper`、`parse_paper`、`index_paper`和`answer_rag_query`，不承载Web请求。
+- `mineru_service.py`：调用MinerU云端精准解析API，流式上传PDF、轮询批次、下载并安全读取结构化结果，将章节、表格、公式、列表、页码和bbox转换为检索块，并按PDF哈希缓存结果。
+- `task_queue_service.py`：注册下载、完整准备、单独解析、索引、RAG回答、研究搜索、报告和报告后追问处理器，协调租约领取、有限重试、最终失败和Worker中断恢复。
+- `worker.py`：独立SQLite任务Worker入口；执行论文处理、问答、研究搜索、报告和`research_followup`持久任务，不承载Web请求。
 - `paper_workflow.py`：将用户触发的下载、PDF解析和向量索引串成后台准备流程，按现有状态跳过已完成步骤并在失败阶段停止。
 - `agent_trace_service.py`：集中包装LangGraph节点，尽力记录成功、中断、部分成功和失败轨迹；Trace故障不得改变原节点行为。
 - `agent_metrics_service.py`：从任务、报告和Node Trace聚合带明确分子/分母/排除数的Agent运行指标；没有真实usage时不得生成Token数字。
@@ -71,14 +73,16 @@ https://github.com/a18743530603/Paper-search.git
 - `research_tools.py`：以LangChain `StructuredTool`和白名单注册表封装论文元数据检索，统一校验输入并返回来源、状态、错误和耗时摘要。
 - `research_workflow.py`：后台恢复用户已确认的检查点线程，归档论文、同步候选论文ID，并逐节点把报告图状态同步到业务SQLite；旧任务保留A3兼容入口。
 - `research_report_service.py`：在用户冻结论文并点击生成后，按准备、证据检索和DeepSeek综合顺序生成跨论文报告；使用不可信JSON上下文边界，逐篇隔离异常，无证据或门禁失败时确定性拒答。
+- `research_conversation_service.py`：在报告完成后，使用当前追问、已有报告和所选论文新召回证据生成带引用回答；当前是最小上下文骨架，不注入全部历史消息，也不实现长期记忆。
 - `db.py`：初始化和操作 SQLite，保存论文与研究任务、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
-- `pdf_service.py`：使用 PDF 内容哈希复用页文本，支持固定边界与论文章节感知分块、章节层级继承、参考文献过滤和附录恢复，并在后台更新解析状态。
+- `pdf_service.py`：生产解析默认路由到MinerU云端；只有评测显式传入策略时才使用历史`pypdf`分块链路，以保留固定边界、章节感知和多粒度实验的可复现性。
 - `rag_service.py`：按模型命名空间与文本哈希缓存 Seed 稠密向量，提供 TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
 - `evaluation_service.py`：导入人工标注基准、校验 `ExperimentConfig`、按配置差异复用或重建分块与索引、记录缓存命中与耗时、匹配标准证据并聚合 Hit/Recall/MRR 指标。
 - `origin_service.py`：整理统计数据，并在本机安装 Origin/OriginPro 时尝试自动生成图表。
 - `templates/`：Jinja2 页面模板。
 - `static/styles.css`：网页样式。
+- `static/source_picker.js`：读取服务端渲染的来源复选框，处理全选、清空、计数和零来源提交拦截；不得在脚本中维护来源 ID。
 - `tests/`：解析、下载策略、文件名清洗和异常降级等离线测试。
 
 主要接口：
@@ -91,6 +95,7 @@ GET  /research-tasks/{task_id}
 POST /research-tasks/{task_id}/confirm
 POST /research-tasks/{task_id}/cancel
 POST /research-tasks/{task_id}/select
+POST /research-tasks/{task_id}/message
 POST /research-tasks/{task_id}/report
 GET  /api/research-tasks/{task_id}
 GET  /api/research-tasks/{task_id}/traces
@@ -116,15 +121,18 @@ GET  /evaluation/runs/{run_id}
 ```text
 浏览器提交关键词或研究问题
   -> POST /search
-  -> 普通模式保持单查询；智能研究模式进入LangGraph
+  -> 统一创建研究任务、初始会话消息并进入LangGraph
   -> plan_research() 调用DeepSeek JSON生成2至4条检索词
   -> request_plan_confirmation()调用interrupt()保存图检查点并暂停
   -> research_tasks保存计划、待确认状态和稳定checkpoint_thread_id
+  -> 用户可POST /research-tasks/{task_id}/message补充范围
+  -> create_research_plan()重新规划并在同一thread_id更新检查点
   -> 用户确认后原子写入running状态与research_search持久任务
   -> 独立Worker使用Command(resume=...)恢复同一线程
   -> 条件边选择multi_query_search或single_query_search降级
-  -> 节点通过白名单调用search_literature StructuredTool
-  -> Tool校验query/max_results并复用search_service.search_all()
+  -> 两个节点都把当前任务queries与State中的明确sources交给search_literature_batch()
+  -> search_many()一次调用search_queries_via_mcp()，同一stdio Session内逐条执行search_papers
+  -> 每条query保留独立search_literature Tool Trace，单来源失败记录partial并继续使用健康候选
   -> deduplicate_results()按DOI、URL和标题去重并限制数量
   -> db.insert_papers() 保存元数据
   -> replace_research_tool_calls()幂等保存工具输入、来源、状态和耗时
@@ -134,6 +142,7 @@ GET  /evaluation/runs/{run_id}
   -> 用户从当前候选中选择1至5篇，使用Command(resume=...)恢复
   -> 图内和业务层双重校验候选范围，任务进入papers_selected
   -> 图进入第三个report_confirmation interrupt，选择本身不自动下载论文
+  -> 用户在会话区单独填写report_question，不复用最初检索主题
   -> 用户点击 POST /research-tasks/{task_id}/report
   -> Command(resume=...)恢复同一thread_id
   -> prepare_report_paper与retrieve_report_evidence节点逐篇执行并保存检查点
@@ -143,6 +152,10 @@ GET  /evaluation/runs/{run_id}
   -> 存在证据时DeepSeek生成带引用报告；全部无证据时代码直接拒答
   -> validate_report_citations节点零Token校验标题/页码引用
   -> 图停在report_regeneration interrupt，允许同线程重新生成
+  -> 报告完成后用户继续POST /research-tasks/{task_id}/message
+  -> 同一事务写入用户消息、pending助手消息和research_followup任务
+  -> Worker按所选论文重新召回证据，并结合当前报告调用DeepSeek
+  -> research_messages保存回答、证据、模型或失败原因，页面轮询后刷新
   -> 可下载论文继续显示用户触发的下载按钮
   -> 用户点击 POST /papers/{paper_id}/download
   -> main.py在同一SQLite事务中抢占论文状态并写入background_jobs
@@ -152,6 +165,8 @@ GET  /evaluation/runs/{run_id}
   -> 用户也可点击 POST /papers/{paper_id}/prepare
   -> main.py原子锁定当前下载/解析/索引阶段并写入prepare_paper任务
   -> Worker复用paper_workflow.prepare_paper_for_qa()从断点执行到ready
+  -> 解析阶段由MinerU精准解析API申请上传URL、上传PDF、轮询批次并下载content_list.json
+  -> 结构化块连同章节、内容类型、物理页码和bbox写入SQLite
   -> 单独POST /parse或/index分别写入parse_paper/index_paper任务
   -> 活动任务拒绝重复并发；完成后仍允许显式重新解析或索引
   -> 用户提交POST /papers/{paper_id}/ask
@@ -584,7 +599,7 @@ git push
 - M1恢复期间两次遇到Seed SSL EOF；受控评测的严格索引一致性门禁拒绝TF-IDF静默降级。保持同一数据、参数和运行重试成功，异常未进入正式指标。
 - M1只保留为实验选项，普通解析默认继续使用`length_boundary`；不得在`heldout_v2`上调块大小、候选池、RRF常数或查询后再次宣称独立验证。该测试集已正式关闭。
 - 本轮最重要的工程结论是：开发集点估计不能直接代表泛化；冻结数据、预注册门槛、配对区间和降级门禁共同防止了挑结果与错误降级污染。
-- GitHub README用策略总览区分正式链路与实验候选：默认采用固定边界 + Seed/TF-IDF，DeepSeek列表重排为已通过独立集验证的可选能力；M1只宣传开发集Hit@3提高、独立集Hit@5保持与覆盖率提高，不得省略其独立集Hit@3下降的限制。
+- GitHub README用策略总览区分生产解析与冻结实验：生产自`v0.15.0`默认采用MinerU结构块 + Seed/TF-IDF；固定边界是历史实验基线，DeepSeek列表重排仍是已通过独立集验证的可选能力；M1不得省略其独立集Hit@3下降的限制。
 
 ## v0.9.0 论文问答准备闭环
 
@@ -818,14 +833,71 @@ git push
 - 新增6项离线测试：原子持久入队、串行与并发去重、工作流委托与显式再生成、失败重试、最终租约失败、完成后恢复零重复模型调用。队列专项`42 passed`，完整离线测试`199 passed`。
 - 当前边界：B1面向用户的后台任务迁移完成；离线评测路由仍可使用FastAPI `BackgroundTasks`，SQLite Worker提供单机至少一次执行语义，不宣称分布式集群或严格恰好一次。
 
+## v0.14.0 统一研究工作台与最小会话闭环
+
+- 首页移除普通搜索/智能研究模式切换；`POST /search`统一创建研究任务、LangGraph计划和初始`research_messages`。
+- 新增`research_tasks.report_question`，把“用于发现论文的主题”和“报告必须回答的问题”分开，论文选择后必须先明确报告问题才能生成。
+- 新增`POST /research-tasks/{task_id}/message`：计划确认前用于补充范围并更新同一`thread_id`的计划；报告完成后用于提交证据追问。
+- 新增`research_messages`表，保存`role/phase/content/status/evidence/model/error`；当前用于任务内消息展示和异步回答状态，不承担跨任务长期记忆。
+- 新增`research_conversation_service.answer_research_followup()`与`research_followup`持久任务。Worker按冻结论文重新召回页码证据，并把“当前问题 + 当前报告 + 本次证据”交给DeepSeek；无证据时确定性提示，不调用模型。
+- 追问消息和后台任务同事务创建，活动任务按`research_followup:{task_id}`去重；重试、最终失败和租约恢复同步消息状态。
+- 当前明确不包含：完整聊天历史注入、自动摘要、长期用户画像、跨任务记忆或复杂Token预算。这些属于下一阶段上下文/记忆管理。
+- 研究任务页固定加载`research_task_poll.js`，由脚本读取DOM状态决定是否轮询，避免Jinja内容块中定义的状态变量在脚本块不可见；请求使用`cache: "no-store"`，状态API同时返回`Cache-Control: no-store`。
+- 新增6项流程、轮询与检查点测试；旧双模式页面测试改为单入口契约，完整离线测试`205 passed`。
+
+## v0.15.0 MinerU云端精准解析默认链路
+
+- 生产环境不再使用`pypdf + 1200/150`作为默认解析：`parse_paper_pdf()`未传`strategy`时固定调用MinerU云端，现有解析和准备按钮无需新增模式选择。
+- 新增`mineru_service.parse_pdf_with_mineru()`：申请预签名上传地址、PUT上传PDF、轮询批次，下载结果并读取稳定版`content_list.json`。
+- 新增`build_structured_chunks()`，将标题层级和文本、表格、公式、代码、列表、图表说明等转为`PaperChunk`；过滤页眉页脚、页码、侧边文字及参考文献区，保留物理页码和bbox。
+- `paper_documents`新增`parser_backend/parser_model/parser_job_id/parse_stage/parsed_at`；`paper_chunks`新增`section_title/content_type/bbox_json`；`update_remote_parse_state()`保存远程阶段和可恢复任务ID。
+- MinerU结果保存到Git忽略的`downloads/mineru/<model>/<pdf_sha256>/`；相同PDF和模型优先复用本地结构结果，远程处理中断则使用原batch ID继续轮询。
+- RAG索引为MinerU结构块注入简短章节与内容类型前缀，返回证据、重排候选和生成Prompt均携带结构元数据；召回权重和重排算法不变。
+- `evaluation_service.prepare_benchmark()`显式指定`length_boundary`，全部旧分块实验继续由`pypdf`复现。严禁把实验基线误写成当前生产默认，也严禁MinerU失败后自动切回旧解析器。
+- 配置使用`MINERU_API_TOKEN`及相关超时、模型和轮询项。Token不得进入页面、日志、文档或Git；真实解析会把PDF发送给MinerU第三方服务。
+- 官方精准解析API当前限制为单文件200MB/200页，并受账户额度约束；代码已实现200MB前置限制，其他限制错误进入Worker重试或最终失败。
+- 自动化测试使用`httpx.MockTransport`和临时ZIP验证完整协议，不调用真实MinerU；完整离线测试为`209 passed`。
+
+## 2026-08-24 多来源搜索MCP接入进行中
+
+- 当前生产调用链为`multi_query_search/single_query_search -> search_literature_batch() -> search_many() -> search_queries_via_mcp() -> 同一Session内多次MCP search_papers -> PaperCandidate`；`search_all()`只保留单query兼容入口。
+- 新增`paper_search_mcp_service.py`，只允许调用第三方`search_papers`，不得调用其下载、读取或Sci-Hub相关Tool。
+- `SUPPORTED_SOURCE_IDS`冻结第三方统一搜索当前21个来源；新任务选择全部时也必须保存并传递明确ID，不得使用`all`。旧任务缺失来源时回退`LEGACY_SOURCE_IDS = ("arxiv", "crossref")`。
+- `DEFAULT_MAX_RESULTS_PER_SOURCE = 3`是与任务最终`max_results`分离的第一版召回预算，后续只能通过真实检索评测调整，不能按来源数量除法推导。
+- `search_queries_via_mcp_async()`在一个stdio Session内执行同一批queries；不得改回每条query启停一次第三方Server，也暂不建设全局连接池。
+- `paper_candidate_from_mcp()`只归一化元数据和候选`pdf_url`，不得发起网络验证；真实下载资格和响应校验继续由现有下载流程负责。
+- 首页来源选项由后端`SEARCH_SOURCE_OPTIONS`渲染，默认明确选择全部21个来源；前端脚本只操作已渲染复选框，不维护第二套来源ID。最终数量继续由Paper Hunter的`max_results`控制。
+- 旧`search_arxiv()`、`search_crossref()`及直接HTTP实现已删除，不作为fallback；`parse_arxiv_feed()`、`parse_crossref_items()`只保留为纯解析函数和离线测试夹具。
+- 第1步完整回归`214 passed`；第2步定向回归`136 passed`、完整离线回归`215 passed`，均未调用真实外部搜索API；这些数字只表示当时步骤，当前结果以第3步为准。
+- 第3步已新增`research_tasks.sources_json`作为任务来源canonical value；LangGraph State只保存执行副本，Worker恢复前必须用数据库值调用`update_checkpoint_sources()`校准，然后再`Command(resume=...)`。
+- 升级前旧任务或缺失来源的Checkpoint统一回退`["arxiv", "crossref"]`；新任务必须保存用户创建时提交并经过`normalize_source_ids()`校验的明确ID列表。
+- `multi_query_search`和`single_query_search`现已统一调用`search_literature_batch()`；一次任务只调用一次`search_many()`和`search_queries_via_mcp()`，同一Session内依次执行全部Planner queries，每条query仍保存独立Tool Trace。
+- 第4步完成首页来源多选、默认全选、全选/清空、实时计数和零来源双层拦截。`POST /search`只接受后端白名单中的明确source ID列表，并继续把同一列表写入Checkpoint和`research_tasks.sources_json`。
+- 第4步浏览器验收确认：默认`21/21`、清空后`0/21`且提交按钮禁用、再次全选后恢复提交；完整离线回归`224 passed`。Planner Prompt、`PaperCandidate`、搜索实现、去重、下载、报告及MCP下载边界均未修改。
+- 第5步首轮真实联网任务`#10/#11/#12`发现`paper-search-mcp==0.1.4`的业务数据位于`structuredContent.result`，旧Adapter因读取顶层`papers`而把全部真实结果转换为失败；这些任务保留为失败现场。
+- 第5.1步仅修复MCP返回结构兼容：支持真实`result` envelope、旧直接payload和文本回退，校验并读取`papers/sources_used/source_results/errors/raw_total/total`，同时让`ExceptionGroup`错误摘要保留叶子根因。不得把该修复描述为Planner、Mapper、去重或Reranker改造。
+- Tool Trace的Checkpoint副本新增`sources_used/source_results/raw_total/total`验收字段；业务库表未迁移，现有页面持久Trace字段保持兼容。完整离线回归`233 passed`。
+- 原样复验任务`#13/#14/#15`均在一个任务级MCP Session内连续完成4条Planner query，并分别以`5/18/19`篇候选进入Paper Selection；合并前/去重后为`20->5、20->18、20->19`。后台只存在`research_search`任务，未调用任何MCP下载Tool。
+- `#13`全21来源存在Zenodo日期类型错误且最终5篇明显无关；`#14/#15`中Semantic Scholar均因429返回0但第三方`errors={}`；`#15`仍召回人类记忆论文。第5.1只证明通路恢复，不能宣称多来源排序质量已达标。
+- `2026-08-25`新增P2冻结回归集`benchmarks/rerank_p2_cases.json`和独立脚本`scripts/evaluate_rerank_p2.py`。15例使用生产`_rerank_prompt()`、`ask_deepseek_json()`及当前`deepseek-v4-pro`配置真实调用，未进入RAG或LangGraph。
+- P2结果：JSON/ID契约`15/15`、Top1`15/15`、关键词陷阱`2/2`、Candidate Injection`2/2`；严格关键关系判定`14 PASS / 1 FAIL = 93.33%`。唯一失败为模型比较题的次级顺序，直接答案仍为Top1；当前结论是不修改P2，保留固定案例继续回归。
+- `2026-08-25`新增P3冻结集`benchmarks/rag_p3_cases.json`与脚本`scripts/evaluate_rag_p3.py`，仅调用生产`build_rag_prompt()`和`ask_deepseek()`；真实配置是`deepseek-v4-pro`、thinking开启、temperature未显式设置。
+- P3结果为`14 PASS / 1 WARN / 0 FAIL`，Strict Pass Rate `93.33%`、Unsupported Claim Cases `0`、Citation Error Cases `1`、证据不足处理`4/4`、Evidence Injection `2/2`。唯一WARN是证据不足回答末尾的“证据来源”为空；本轮不修改Prompt，后续只需针对不足分支强化标题/页码输出并复跑同一冻结集。
+- 用户随后只为P3增加“证据不足时，实际用于判断缺失的片段也必须列入证据来源”规则，并用同一15例复跑。Case 12成功补出`Neural Architecture Description，第5页`，原14个PASS回归`0/14`；最终`15 PASS`，Citation Error和Unsupported Claim均为0。该规则已通过冻结回归，可以保留。
+- `2026-08-25`新增P4冻结集`benchmarks/research_report_p4_cases.json`和脚本`scripts/evaluate_research_report_p4.py`，按生产`research-context-json-v1`与真实`deepseek-v4-pro`配置运行15例。结果`10 PASS / 5 WARN / 0 FAIL`；跨论文污染、错误泛化、非法数值比较、冲突解释、unsupported claim均为0，冲突/部分证据/Injection分别`1/1、1/1、2/2`。
+- P4的5个WARN仅为多来源引用格式：模型写成`[A, p.x; B, p.y]`而非独立`[A, p.x][B, p.y]`，标题页码事实正确但不满足引用解析契约。后续只需强化这一条并复跑固定15例，不应改动已经通过的跨论文证据边界和安全规则。
+- 用户已将P4改为适合网页展示的中文纯文本，并采用`[论文标题，第3页]`及`[论文A，第3页；论文B，第5页]`引用。使用同一冻结15例和真实`deepseek-v4-pro`配置复跑后为`15 PASS / 0 WARN / 0 FAIL`，Strict Pass Rate `100%`；旧5个Citation WARN全部消失，原10个PASS全部保持。
+- P4新回归的Unsupported Claim、Cross-paper Attribution Error、Unsupported Generalization、Invalid Numerical Comparison和Citation Error均为0；冲突、部分证据和Injection分别通过`1/1、1/1、2/2`。报告没有Markdown标题、表格、代码块、空章节或机械固定四段，当前Prompt可以保留。
+- `scripts/evaluate_research_report_p4.py`现按新中文引用和纯文本契约检查；冻结案例事实预期未改变，新原始输出为Git忽略的`outputs/research_report_p4_results_plaintext.json`。不得再用旧`[A, p.3]`解析器误判新结果。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为`v0.13.1`：A1-A7保持完成；B1.1至B1.7已把论文下载、完整准备、单独解析、索引、单篇RAG回答、智能研究搜索和跨论文报告迁移到带自动续租的SQLite持久Worker，完整测试`199 passed`。B1阶段完成。
-- `pdf_service.extract_pdf_chunks()` 与 `parse_paper_pdf()` 接受 `chunk_size`、`overlap`；普通论文解析仍使用默认 `1200/150`。
+- 当前版本为`v0.15.0`：A1-A7与B1保持完成；生产PDF解析默认使用MinerU云端结构化结果，首页可明确选择论文来源，任务级多query共用一次论文搜索MCP Session，真实0.1.4返回结构已兼容，完整离线测试`233 passed`。高级会话压缩和长期记忆尚未开始。
+- `pdf_service.parse_paper_pdf()`不传策略时使用MinerU；`extract_pdf_chunks()`及`chunk_size/overlap`只属于显式受控实验路径。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。
 - `v0.8.0` 已提供 `length_boundary`、`academic_section` 与 `academic_section_no_prefix`；本地 E3a/E3b/E3c/E4/C1/C2/C3/C4/C5 已提供固定英文查询、BM25实验、中英文RRF、DeepSeek Top-20重排、`paper_section_sentence`、`paper_parent_child`、`paper_table_context`、`paper_semantic_breakpoint_global` 和公平固定边界基线。论文分块、候选融合与重排实验已完成，下一步是生成质量评测。

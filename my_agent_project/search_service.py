@@ -1,16 +1,20 @@
 import urllib.parse
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from typing import Any
 
-import requests
-
+from .paper_search_mcp_service import (
+    DEFAULT_MAX_RESULTS_PER_SOURCE,
+    LEGACY_SOURCE_IDS,
+    McpSearchBatch,
+    normalize_queries,
+    normalize_source_ids,
+    search_queries_via_mcp,
+)
 from .schemas import PaperCandidate, STATUS_AVAILABLE, STATUS_FAILED, STATUS_LINK_ONLY
 
 
-ARXIV_API = "https://export.arxiv.org/api/query"
-CROSSREF_API = "https://api.crossref.org/works"
 XML_NS = "http://www.w3.org/2005/Atom"
-REQUEST_TIMEOUT = 20
 
 
 def normalize_text(value: str | None) -> str:
@@ -53,19 +57,6 @@ def parse_arxiv_feed(xml_text: str) -> list[PaperCandidate]:
             )
         )
     return papers
-
-
-def search_arxiv(query: str, max_results: int) -> list[PaperCandidate]:
-    params = {
-        "search_query": f"all:{query}",
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "relevance",
-        "sortOrder": "descending",
-    }
-    response = requests.get(ARXIV_API, params=params, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return parse_arxiv_feed(response.text)
 
 
 def first_text(values: Any) -> str:
@@ -140,38 +131,73 @@ def parse_crossref_items(items: list[dict[str, Any]]) -> list[PaperCandidate]:
     return papers
 
 
-def search_crossref(query: str, max_results: int) -> list[PaperCandidate]:
-    response = requests.get(
-        CROSSREF_API,
-        params={"query": query, "rows": max_results, "sort": "relevance"},
-        timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": "paper-hunter/0.1 (mailto:example@example.com)"},
+def _failed_search_candidate(source: str, error: str) -> PaperCandidate:
+    return PaperCandidate(
+        title=f"{source} failed",
+        authors="",
+        summary=error[:500],
+        published="",
+        source="system",
+        publisher="",
+        doi=None,
+        page_url="",
+        pdf_url=None,
+        status=STATUS_FAILED,
     )
-    response.raise_for_status()
-    payload = response.json()
-    items = payload.get("message", {}).get("items", [])
-    return parse_crossref_items(items if isinstance(items, list) else [])
+
+
+def _papers_from_mcp_batch(
+    batch: McpSearchBatch,
+    max_results: int,
+) -> list[PaperCandidate]:
+    failures = [
+        _failed_search_candidate(source, error)
+        for source, error in batch.errors.items()
+    ]
+    return (list(batch.candidates) + failures)[:max_results]
+
+
+def search_many(
+    queries: list[str],
+    *,
+    sources: list[str] | tuple[str, ...],
+    max_results: int,
+) -> list[McpSearchBatch]:
+    normalized_queries = normalize_queries(queries)
+    normalized_sources = normalize_source_ids(sources)
+    if not 1 <= max_results <= 50:
+        raise ValueError("max_results必须在1到50之间")
+
+    try:
+        batches = search_queries_via_mcp(
+            normalized_queries,
+            sources=normalized_sources,
+            max_results_per_source=DEFAULT_MAX_RESULTS_PER_SOURCE,
+        )
+        if len(batches) != len(normalized_queries):
+            raise RuntimeError("MCP search_papers返回了无效批次数量")
+        return [
+            replace(batch, candidates=list(batch.candidates[:max_results]))
+            for batch in batches
+        ]
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:500]
+        return [
+            McpSearchBatch(
+                query=query,
+                candidates=[],
+                source_counts={},
+                errors={"paper_search_mcp": error},
+                raw_total=0,
+            )
+            for query in normalized_queries
+        ]
 
 
 def search_all(query: str, max_results: int) -> list[PaperCandidate]:
-    per_source = max(1, max_results // 2)
-    papers: list[PaperCandidate] = []
-    for searcher in (search_arxiv, search_crossref):
-        try:
-            papers.extend(searcher(query, per_source))
-        except Exception as exc:
-            papers.append(
-                PaperCandidate(
-                    title=f"{searcher.__name__} failed",
-                    authors="",
-                    summary=str(exc),
-                    published="",
-                    source="system",
-                    publisher="",
-                    doi=None,
-                    page_url="",
-                    pdf_url=None,
-                    status=STATUS_FAILED,
-                )
-            )
-    return papers[:max_results]
+    batch = search_many(
+        [query],
+        sources=LEGACY_SOURCE_IDS,
+        max_results=max_results,
+    )[0]
+    return _papers_from_mcp_batch(batch, max_results)

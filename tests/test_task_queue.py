@@ -4,7 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier, Event
 
-from my_agent_project import db, rag_service, task_queue_service
+from my_agent_project import (
+    db,
+    rag_service,
+    research_conversation_service,
+    task_queue_service,
+)
 from my_agent_project.schemas import PaperCandidate
 
 
@@ -63,6 +68,69 @@ def _create_selected_research_task(paper_id: int) -> int:
     db.save_research_task_results(task_id, [paper_id])
     assert db.select_research_task_papers(task_id, [paper_id])
     return task_id
+
+
+def _complete_research_report(task_id: int) -> None:
+    db.update_research_report(
+        task_id,
+        "completed",
+        content="Existing evidence-grounded report.",
+        model="deepseek-test",
+    )
+
+
+def test_research_task_starts_with_conversation_and_separate_report_question(
+    tmp_path,
+    monkeypatch,
+):
+    _setup_database(tmp_path, monkeypatch)
+    task_id = _create_research_task()
+
+    task = db.get_research_task(task_id)
+    messages = db.list_research_messages(task_id)
+
+    assert task["report_question"] == ""
+    assert [(item["role"], item["phase"]) for item in messages] == [
+        ("user", "discovery"),
+        ("assistant", "planning"),
+    ]
+    assert "Find research agent papers" in messages[1]["content"]
+
+
+def test_revise_plan_and_set_report_question_are_persisted_as_messages(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_research_task()
+    revised = db.revise_research_task_plan(
+        task_id,
+        question="RAG evaluation with a faithfulness focus",
+        plan_goal="Compare RAG evaluation metrics",
+        plan_queries=["RAG faithfulness evaluation", "RAG retrieval recall metrics"],
+        plan_rationale="Cover generation and retrieval quality.",
+        plan_model="deepseek-test",
+        planner_status="planned",
+        planner_error="",
+        user_message="重点关注Faithfulness",
+    )
+    assert revised is True
+    assert db.start_research_task(task_id)
+    db.save_research_task_results(task_id, [paper_id])
+    assert db.select_research_task_papers(task_id, [paper_id])
+    assert db.set_research_report_question(task_id, "两种指标有什么区别？")
+
+    task = db.get_research_task(task_id)
+    messages = db.list_research_messages(task_id)
+
+    assert task["plan_goal"] == "Compare RAG evaluation metrics"
+    assert task["report_question"] == "两种指标有什么区别？"
+    assert [item["phase"] for item in messages[-4:]] == [
+        "planning",
+        "planning",
+        "report_question",
+        "report_question",
+    ]
 
 
 def test_download_enqueue_is_durable_across_database_reinitialization(
@@ -451,6 +519,85 @@ def test_recovered_report_job_does_not_repeat_completed_generation(
     report = db.get_research_report(task_id)
     assert report["status"] == "completed"
     assert report["content"] == "already persisted"
+
+
+def test_research_followup_enqueue_and_worker_complete_message(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    queued = db.enqueue_research_followup_job(task_id, "What evidence supports it?")
+
+    def fake_answer(message_id, question, *, raise_on_error=False):
+        assert question == "What evidence supports it?"
+        assert raise_on_error is True
+        db.update_research_message(
+            message_id,
+            "completed",
+            content="Evidence-based follow-up answer.",
+            evidence=[{"paper_id": paper_id, "page_number": 2}],
+            model="deepseek-test",
+        )
+
+    monkeypatch.setattr(
+        task_queue_service,
+        "answer_research_followup",
+        fake_answer,
+    )
+
+    result = task_queue_service.run_one_job("worker-a")
+    message = db.get_research_message(queued["message_id"])
+
+    assert result["status"] == "succeeded"
+    assert message["status"] == "completed"
+    assert message["content"] == "Evidence-based follow-up answer."
+    assert message["evidence"] == [{"paper_id": paper_id, "page_number": 2}]
+
+
+def test_research_followup_without_evidence_completes_without_model(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    queued = db.enqueue_research_followup_job(task_id, "Explain the missing result")
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "retrieve_report_paper_evidence",
+        lambda *_args, **_kwargs: {
+            "evidence": [],
+            "access_limitation": {
+                "paper_id": paper_id,
+                "paper_title": "Durable Queue Paper",
+                "reason": "全文不可用",
+                "url": "https://example.com/paper",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("model must not run without evidence")
+        ),
+    )
+
+    research_conversation_service.answer_research_followup(
+        queued["message_id"],
+        "Explain the missing result",
+        raise_on_error=True,
+    )
+    message = db.get_research_message(queued["message_id"])
+
+    assert message["status"] == "completed"
+    assert message["model"] == "deterministic-no-evidence"
+    assert "不能可靠作答" in message["content"]
 
 
 def test_download_enqueue_atomically_rejects_duplicate_requests(tmp_path, monkeypatch):

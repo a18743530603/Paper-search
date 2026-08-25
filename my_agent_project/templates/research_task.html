@@ -2,12 +2,60 @@
 {% block title %}研究任务 #{{ task["id"] }} - Paper Hunter{% endblock %}
 {% block content %}
 {% set report_status = report["status"] if report else "not_started" %}
-<section class="section-head research-task-heading" data-research-task-id="{{ task['id'] }}" data-research-task-status="{{ task['status'] }}" data-research-report-status="{{ report_status }}">
+{% set latest_message_status = messages[-1]["status"] if messages else "completed" %}
+<section class="section-head research-task-heading" data-research-task-id="{{ task['id'] }}" data-research-task-status="{{ task['status'] }}" data-research-report-status="{{ report_status }}" data-research-message-status="{{ latest_message_status }}">
   <div>
-    <p class="eyebrow">LangGraph Research Task #{{ task["id"] }}</p>
+    <p class="eyebrow">Research Workspace #{{ task["id"] }}</p>
     <h1>{{ task["question"] }}</h1>
   </div>
   <span class="status status-{{ task['status'] }}">{{ task["status"] }}</span>
+</section>
+
+<section class="research-conversation" aria-labelledby="research-conversation-title">
+  <div class="section-head compact-heading">
+    <div>
+      <p class="eyebrow">Conversation</p>
+      <h2 id="research-conversation-title">研究对话</h2>
+    </div>
+    <span class="selection-limit">{{ messages | length }} 条</span>
+  </div>
+  <div class="conversation-stream">
+    {% for message in messages %}
+      <article class="conversation-message conversation-{{ message['role'] }}">
+        <div class="conversation-meta">
+          <strong>{{ "你" if message["role"] == "user" else "Paper Hunter" }}</strong>
+          <span>{{ message["phase"] }}</span>
+          {% if message["status"] != "completed" %}<span class="status status-message-{{ message['status'] }}">{{ message["status"] }}</span>{% endif %}
+        </div>
+        <div class="conversation-content">{{ message["content"] }}</div>
+        {% if message["model"] %}<small>模型：{{ message["model"] }}</small>{% endif %}
+        {% if message["error"] %}<small class="tool-error">{{ message["error"] }}</small>{% endif %}
+        {% if message["evidence"] %}<small>证据：{{ message["evidence"] | length }} 条</small>{% endif %}
+      </article>
+    {% endfor %}
+  </div>
+
+  {% if task["status"] == "awaiting_confirmation" %}
+    <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post">
+      <label for="research-message">补充研究范围或调整计划</label>
+      <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：只检索2023年后的论文，并重点关注Faithfulness指标" required></textarea>
+      <button type="submit">更新计划</button>
+    </form>
+  {% elif task["status"] == "papers_selected" and report_status not in ["preparing", "retrieving", "generating", "completed"] %}
+    <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post">
+      <label for="research-message">告诉我报告需要回答什么</label>
+      <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：比较这些论文如何评估RAG回答的忠实性与检索召回效果" required></textarea>
+      <button type="submit">设置报告问题</button>
+    </form>
+  {% elif task["status"] == "papers_selected" and report_status == "completed" %}
+    <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post">
+      <label for="research-message">继续追问当前报告和所选论文</label>
+      <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：第二篇论文为什么选择这个评价指标？" required></textarea>
+      <button type="submit" {% if latest_message_status in ["pending", "retry_wait"] %}disabled{% endif %}>发送追问</button>
+    </form>
+  {% else %}
+    <p class="conversation-waiting">当前阶段正在执行任务，完成后可以继续对话。</p>
+  {% endif %}
 </section>
 
 <section class="research-plan" aria-labelledby="research-plan-title">
@@ -176,10 +224,15 @@
     </div>
 
     {% if not report %}
-      <form action="/research-tasks/{{ task['id'] }}/report" method="post">
-        <button type="submit">生成研究报告</button>
-      </form>
-      <p class="report-note">该操作会准备所选论文全文、检索证据，并在存在证据时调用 DeepSeek。</p>
+      {% if task["report_question"] %}
+        <p class="report-question"><strong>报告问题：</strong>{{ task["report_question"] }}</p>
+        <form action="/research-tasks/{{ task['id'] }}/report" method="post">
+          <button type="submit">确认生成研究报告</button>
+        </form>
+        <p class="report-note">该操作会准备所选论文全文、检索证据，并在存在证据时调用 DeepSeek。</p>
+      {% else %}
+        <p class="empty-state">请先在上方研究对话中说明报告需要回答的问题。</p>
+      {% endif %}
     {% elif report["status"] in ["preparing", "retrieving", "generating"] %}
       <p class="task-progress">报告正在后台{{ {"preparing": "准备论文", "retrieving": "检索证据", "generating": "生成内容"}[report["status"]] }}，页面会自动更新。</p>
       {% if report["job_status"] %}
@@ -266,7 +319,5 @@
 {% endif %}
 {% endblock %}
 {% block scripts %}
-  {% if task["status"] == "running" or report_status in ["preparing", "retrieving", "generating"] %}
-    <script src="{{ url_for('static', path='/research_task_poll.js') }}" defer></script>
-  {% endif %}
+  <script src="{{ url_for('static', path='/research_task_poll.js') }}" defer></script>
 {% endblock %}

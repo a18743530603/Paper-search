@@ -12,7 +12,7 @@ from my_agent_project import research_agent
 from my_agent_project import research_report_service
 from my_agent_project import research_tools
 from my_agent_project import search_service
-from my_agent_project.schemas import PaperCandidate, STATUS_AVAILABLE, STATUS_FAILED
+from my_agent_project.schemas import PaperCandidate, STATUS_AVAILABLE
 
 
 def _paper(
@@ -50,6 +50,25 @@ def _planned_response(*_args, **_kwargs):
     )
 
 
+def _batch_search(search_one):
+    def search(queries, *, sources, max_results):
+        batches = []
+        for query in queries:
+            papers = search_one(query, max_results)
+            batches.append(
+                search_service.McpSearchBatch(
+                    query=query,
+                    candidates=papers,
+                    source_counts={},
+                    errors={},
+                    raw_total=len(papers),
+                )
+            )
+        return batches
+
+    return search
+
+
 def test_scenario_01_planner_failure_uses_original_question_once(monkeypatch):
     def fail_planner(*_args, **_kwargs):
         raise model_service.ModelRequestError("planner unavailable")
@@ -58,8 +77,10 @@ def test_scenario_01_planner_failure_uses_original_question_once(monkeypatch):
     monkeypatch.setattr(research_agent, "ask_deepseek_json", fail_planner)
     monkeypatch.setattr(
         research_tools,
-        "search_all",
-        lambda query, _max_results: search_queries.append(query) or [_paper()],
+        "search_many",
+        _batch_search(
+            lambda query, _max_results: search_queries.append(query) or [_paper()]
+        ),
     )
 
     result = research_agent.run_research_search("How is memory stored?", 5)
@@ -79,7 +100,11 @@ def test_scenario_02_rejected_plan_never_calls_search_tool(tmp_path, monkeypatch
         raise AssertionError("search must not run after rejection")
 
     monkeypatch.setattr(research_agent, "ask_deepseek_json", _planned_response)
-    monkeypatch.setattr(research_tools, "search_all", fail_if_searched)
+    monkeypatch.setattr(
+        research_tools,
+        "search_many",
+        _batch_search(fail_if_searched),
+    )
     connection = sqlite3.connect(tmp_path / "rejected-plan.db", check_same_thread=False)
     graph = research_agent.build_checkpointed_research_graph(SqliteSaver(connection))
     config = {"configurable": {"thread_id": "scenario-rejected-plan"}}
@@ -118,26 +143,34 @@ def test_scenario_03_unregistered_tool_is_blocked_without_side_effect(monkeypatc
 
 
 def test_scenario_04_one_search_source_failure_returns_partial_result(monkeypatch):
-    def fail_arxiv(_query, _max_results):
-        raise RuntimeError("arXiv unavailable")
+    def partial_search(_queries, *, sources, max_results):
+        assert tuple(sources) == ("arxiv", "crossref")
+        assert max_results == 4
+        return [
+            search_service.McpSearchBatch(
+                query="agent memory",
+                candidates=[_paper(source="crossref")],
+                source_counts={"arxiv": 0, "crossref": 1},
+                errors={"arxiv": "arXiv unavailable"},
+                raw_total=1,
+            )
+        ]
 
-    monkeypatch.setattr(search_service, "search_arxiv", fail_arxiv)
-    monkeypatch.setattr(
-        search_service,
-        "search_crossref",
-        lambda _query, _max_results: [_paper(source="crossref")],
-    )
+    monkeypatch.setattr(research_tools, "search_many", partial_search)
 
-    result = research_tools.invoke_research_tool(
-        research_tools.LITERATURE_SEARCH_TOOL_NAME,
-        {"query": "agent memory", "max_results": 4},
+    candidates, tool_calls = research_tools.search_literature_batch(
+        ["agent memory"],
+        sources=["arxiv", "crossref"],
+        max_results=4,
     )
+    result = tool_calls[0]
 
     assert result["status"] == "partial"
     assert result["result_count"] == 1
     assert result["source_counts"] == {"crossref": 1}
     assert "arXiv unavailable" in result["error"]
-    assert any(item["status"] == STATUS_FAILED for item in result["candidates"])
+    assert len(candidates) == 1
+    assert candidates[0]["source"] == "crossref"
 
 
 def test_scenario_05_one_paper_failure_does_not_stop_remaining_papers(monkeypatch):
@@ -224,8 +257,10 @@ def test_scenario_07_checkpoint_restart_does_not_repeat_planner(tmp_path, monkey
     monkeypatch.setattr(research_agent, "ask_deepseek_json", plan)
     monkeypatch.setattr(
         research_tools,
-        "search_all",
-        lambda query, _max_results: search_queries.append(query) or [_paper()],
+        "search_many",
+        _batch_search(
+            lambda query, _max_results: search_queries.append(query) or [_paper()]
+        ),
     )
     checkpoint_path = tmp_path / "restart.db"
     config = {"configurable": {"thread_id": "scenario-restart"}}

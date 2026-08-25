@@ -13,6 +13,15 @@ from .db import (
     replace_cached_pdf_pages,
     replace_paper_chunks,
     update_parse_status,
+    update_remote_parse_state,
+)
+from .config import MINERU_MODEL_VERSION
+from .mineru_service import (
+    MINERU_CHUNK_STRATEGY,
+    MINERU_PARSER_BACKEND,
+    build_structured_chunks,
+    load_cached_content_list,
+    parse_pdf_with_mineru,
 )
 from .schemas import (
     CHUNK_ROLE_CHILD,
@@ -985,7 +994,7 @@ def extract_pdf_chunks(
     return len(pages), chunks
 
 
-def parse_paper_pdf(
+def _parse_paper_pdf_legacy(
     paper_id: int,
     *,
     strategy: str = CHUNK_STRATEGY_LENGTH,
@@ -1078,6 +1087,8 @@ def parse_paper_pdf(
             chunk_size=chunk_size,
             chunk_overlap=overlap,
             layout_stats=layout_stats,
+            parser_backend="legacy_pypdf",
+            parser_model="pypdf",
         )
         _increment_cache_stat(cache_stats, "chunk_layout_misses", len(chunks))
         return {
@@ -1091,3 +1102,158 @@ def parse_paper_pdf(
     except Exception as exc:
         update_parse_status(paper_id, PARSE_FAILED, error=str(exc)[:500])
         return {"chunks_reused": False, "error": str(exc)[:500]}
+
+
+def _parse_paper_pdf_with_mineru(
+    paper_id: int,
+    *,
+    cache_stats: dict[str, int] | None = None,
+) -> dict[str, object]:
+    paper = get_paper(paper_id)
+    if paper is None:
+        return {"chunks_reused": False}
+
+    try:
+        local_path = paper["local_path"]
+        if not local_path:
+            raise RuntimeError("当前论文没有可解析的本地 PDF")
+        path = Path(local_path)
+        if not path.is_file():
+            raise RuntimeError("本地 PDF 文件不存在")
+
+        source_hash = pdf_source_hash(path)
+        document = get_document(paper_id)
+        if (
+            document is not None
+            and document["parse_status"] == "parsed"
+            and document["source_hash"] == source_hash
+            and document["chunk_strategy"] == MINERU_CHUNK_STRATEGY
+            and document["parser_backend"] == MINERU_PARSER_BACKEND
+            and document["parser_model"] == MINERU_MODEL_VERSION
+            and int(document["chunk_count"] or 0) > 0
+        ):
+            _increment_cache_stat(
+                cache_stats,
+                "mineru_chunk_hits",
+                int(document["chunk_count"]),
+            )
+            try:
+                layout_stats = json.loads(document["layout_stats_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                layout_stats = {}
+            return {
+                "chunks_reused": True,
+                "source_hash": source_hash,
+                "page_count": int(document["page_count"] or 0),
+                "chunk_count": int(document["chunk_count"] or 0),
+                "parent_chunk_count": 0,
+                "layout_stats": layout_stats,
+                "parser_backend": MINERU_PARSER_BACKEND,
+                "parser_job_id": document["parser_job_id"],
+            }
+
+        cached_content = load_cached_content_list(source_hash, MINERU_MODEL_VERSION)
+        batch_id = ""
+        if cached_content is not None:
+            content_list = cached_content
+            if document is not None:
+                batch_id = str(document["parser_job_id"] or "")
+            _increment_cache_stat(cache_stats, "mineru_result_hits")
+        else:
+            _increment_cache_stat(cache_stats, "mineru_result_misses")
+            existing_batch_id = None
+            if (
+                document is not None
+                and document["source_hash"] == source_hash
+                and document["parser_backend"] == MINERU_PARSER_BACKEND
+                and document["parser_model"] == MINERU_MODEL_VERSION
+                and document["parser_job_id"]
+                and str(document["parse_stage"] or "")
+                in {"pending", "running", "converting", "done"}
+            ):
+                existing_batch_id = str(document["parser_job_id"])
+
+            update_remote_parse_state(
+                paper_id,
+                source_hash=source_hash,
+                parser_backend=MINERU_PARSER_BACKEND,
+                parser_model=MINERU_MODEL_VERSION,
+                parser_job_id=existing_batch_id or "",
+                parse_stage="submitting" if existing_batch_id is None else "running",
+            )
+
+            def record_progress(
+                state: str,
+                remote_batch_id: str | None,
+                _extracted_pages: int | None,
+                _total_pages: int | None,
+            ) -> None:
+                update_remote_parse_state(
+                    paper_id,
+                    source_hash=source_hash,
+                    parser_backend=MINERU_PARSER_BACKEND,
+                    parser_model=MINERU_MODEL_VERSION,
+                    parser_job_id=remote_batch_id,
+                    parse_stage=state,
+                )
+
+            result = parse_pdf_with_mineru(
+                path,
+                source_hash=source_hash,
+                data_id=f"paper_{paper_id}_{source_hash[:16]}",
+                existing_batch_id=existing_batch_id,
+                on_progress=record_progress,
+            )
+            content_list = result.content_list
+            batch_id = result.batch_id
+
+        page_count, chunks, layout_stats = build_structured_chunks(content_list)
+        if not chunks:
+            raise RuntimeError("MinerU没有提取到可用于检索的论文内容")
+        layout_stats["mineru_result_cache_hit"] = cached_content is not None
+        replace_paper_chunks(
+            paper_id,
+            chunks,
+            page_count=page_count,
+            source_hash=source_hash,
+            chunk_strategy=MINERU_CHUNK_STRATEGY,
+            layout_stats=layout_stats,
+            parser_backend=MINERU_PARSER_BACKEND,
+            parser_model=MINERU_MODEL_VERSION,
+            parser_job_id=batch_id or None,
+        )
+        _increment_cache_stat(cache_stats, "mineru_chunk_misses", len(chunks))
+        return {
+            "chunks_reused": False,
+            "source_hash": source_hash,
+            "page_count": page_count,
+            "chunk_count": len(chunks),
+            "parent_chunk_count": 0,
+            "layout_stats": layout_stats,
+            "parser_backend": MINERU_PARSER_BACKEND,
+            "parser_job_id": batch_id or None,
+        }
+    except Exception as exc:
+        update_parse_status(paper_id, PARSE_FAILED, error=str(exc)[:500])
+        return {"chunks_reused": False, "error": str(exc)[:500]}
+
+
+def parse_paper_pdf(
+    paper_id: int,
+    *,
+    strategy: str | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+    cache_stats: dict[str, int] | None = None,
+    semantic_embedder: SemanticEmbedder | None = None,
+) -> dict[str, object]:
+    if strategy is None:
+        return _parse_paper_pdf_with_mineru(paper_id, cache_stats=cache_stats)
+    return _parse_paper_pdf_legacy(
+        paper_id,
+        strategy=strategy,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        cache_stats=cache_stats,
+        semantic_embedder=semantic_embedder,
+    )

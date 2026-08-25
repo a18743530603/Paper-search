@@ -165,7 +165,7 @@ def prepare_benchmark() -> dict:
     for paper_id in imported["paper_ids"].values():
         document = get_document(paper_id)
         if document is None or document["parse_status"] != PARSE_PARSED:
-            parse_paper_pdf(paper_id)
+            parse_paper_pdf(paper_id, strategy=CHUNK_STRATEGY_LENGTH)
             document = get_document(paper_id)
         if document is None or document["parse_status"] != PARSE_PARSED:
             error = document["error"] if document else "解析状态不存在"

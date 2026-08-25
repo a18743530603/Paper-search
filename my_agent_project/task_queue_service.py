@@ -35,6 +35,7 @@ from .schemas import (
     STATUS_FAILED,
 )
 from .rag_service import answer_rag_query, index_paper_chunks
+from .research_conversation_service import answer_research_followup
 from .research_workflow import execute_research_task
 from .research_workflow import execute_research_report
 
@@ -46,6 +47,7 @@ JOB_INDEX_PAPER = "index_paper"
 JOB_ANSWER_RAG_QUERY = "answer_rag_query"
 JOB_RESEARCH_SEARCH = "research_search"
 JOB_RESEARCH_REPORT = "research_report"
+JOB_RESEARCH_FOLLOWUP = "research_followup"
 JOB_STATUS_RETRY_WAIT = "retry_wait"
 JOB_STATUS_FAILED = "failed"
 DEFAULT_JOB_LEASE_SECONDS = 90
@@ -158,6 +160,25 @@ def _research_report_handler(payload: dict[str, Any]) -> None:
         raise RuntimeError(str(error or "Research report did not complete"))
 
 
+def _research_followup_handler(payload: dict[str, Any]) -> None:
+    message_id = int(payload.get("message_id") or 0)
+    question = str(payload.get("question") or "").strip()
+    message = db.get_research_message(message_id)
+    if message_id < 1 or message is None:
+        raise RuntimeError("Research follow-up job references a missing message")
+    if message["status"] == "completed":
+        return
+    answer_research_followup(
+        message_id,
+        question,
+        raise_on_error=True,
+    )
+    message = db.get_research_message(message_id)
+    if message is None or message["status"] != "completed":
+        error = message["error"] if message is not None else None
+        raise RuntimeError(str(error or "Research follow-up did not complete"))
+
+
 JOB_HANDLERS: dict[str, JobHandler] = {
     JOB_DOWNLOAD_PAPER: _download_paper_handler,
     JOB_PREPARE_PAPER: _prepare_paper_handler,
@@ -166,6 +187,7 @@ JOB_HANDLERS: dict[str, JobHandler] = {
     JOB_ANSWER_RAG_QUERY: _answer_rag_query_handler,
     JOB_RESEARCH_SEARCH: _research_search_handler,
     JOB_RESEARCH_REPORT: _research_report_handler,
+    JOB_RESEARCH_FOLLOWUP: _research_followup_handler,
 }
 
 
@@ -271,9 +293,39 @@ def _mark_research_report_failed(task_id: int, error: str) -> None:
         db.update_research_report(task_id, "failed", error=error[:1000])
 
 
+def _mark_research_followup_retry_pending(message_id: int, error: str) -> None:
+    message = db.get_research_message(message_id)
+    if message is not None and message["status"] != "completed":
+        db.mark_research_message_retry_pending(
+            message_id,
+            f"Research follow-up failed; waiting for retry: {error}"[:1000],
+        )
+
+
+def _mark_research_followup_failed(message_id: int, error: str) -> None:
+    message = db.get_research_message(message_id)
+    if message is not None and message["status"] != "completed":
+        db.update_research_message(
+            message_id,
+            "failed",
+            error=error[:1000],
+        )
+
+
 def recover_expired_jobs() -> list[dict]:
     recovered = db.recover_expired_background_jobs()
     for job in recovered:
+        if job["job_type"] == JOB_RESEARCH_FOLLOWUP:
+            message_id = int(job.get("payload", {}).get("message_id") or 0)
+            if message_id:
+                if job["status"] == JOB_STATUS_FAILED:
+                    _mark_research_followup_failed(message_id, job["last_error"])
+                else:
+                    _mark_research_followup_retry_pending(
+                        message_id,
+                        job["last_error"],
+                    )
+            continue
         if job["job_type"] == JOB_RESEARCH_REPORT and job.get("research_task_id"):
             task_id = int(job["research_task_id"])
             if job["status"] == JOB_STATUS_FAILED:
@@ -468,6 +520,12 @@ def _execute_claimed_job(
                 _mark_research_report_retry_pending(task_id, error)
             elif next_status == JOB_STATUS_FAILED:
                 _mark_research_report_failed(task_id, error)
+        elif job["job_type"] == JOB_RESEARCH_FOLLOWUP:
+            message_id = int(job.get("payload", {}).get("message_id") or 0)
+            if message_id and next_status == JOB_STATUS_RETRY_WAIT:
+                _mark_research_followup_retry_pending(message_id, error)
+            elif message_id and next_status == JOB_STATUS_FAILED:
+                _mark_research_followup_failed(message_id, error)
         job["status"] = next_status or job["status"]
         job["last_error"] = error
         return job

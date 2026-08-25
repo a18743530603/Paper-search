@@ -6,10 +6,11 @@ from typing import Any
 from langchain_core.tools import tool
 
 from .db import get_document, get_paper
+from .paper_search_mcp_service import LEGACY_SOURCE_IDS, normalize_source_ids
 from .paper_workflow import PREPARATION_READY, prepare_paper_for_qa
 from .rag_service import paper_access_url, retrieve_relevant_chunks
 from .schemas import STATUS_FAILED
-from .search_service import search_all
+from .search_service import search_all, search_many
 
 
 LITERATURE_SEARCH_TOOL_NAME = "search_literature"
@@ -19,7 +20,7 @@ RETRIEVE_EVIDENCE_TOOL_NAME = "retrieve_paper_evidence"
 
 @tool(LITERATURE_SEARCH_TOOL_NAME)
 def search_literature(query: str, max_results: int) -> dict[str, Any]:
-    """Search arXiv and Crossref for academic paper metadata."""
+    """Search the configured academic sources for paper metadata."""
     query = " ".join(query.split())
     if not query:
         raise ValueError("检索词不能为空")
@@ -53,6 +54,55 @@ def search_literature(query: str, max_results: int) -> dict[str, Any]:
         "duration_ms": max(0, round((perf_counter() - started) * 1000)),
         "candidates": [asdict(paper) for paper in candidates],
     }
+
+
+def search_literature_batch(
+    queries: list[str],
+    *,
+    sources: list[str] | tuple[str, ...] = LEGACY_SOURCE_IDS,
+    max_results: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    selected_sources = normalize_source_ids(sources)
+    batches = search_many(
+        queries,
+        sources=selected_sources,
+        max_results=max_results,
+    )
+    candidates: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    for batch in batches:
+        source_counts = Counter(paper.source for paper in batch.candidates)
+        error = "; ".join(
+            f"{source}: {message}"
+            for source, message in sorted(batch.errors.items())
+        )[:500]
+        if batch.errors and batch.candidates:
+            status = "partial"
+        elif batch.errors:
+            status = "failed"
+        else:
+            status = "succeeded"
+        candidates.extend(asdict(paper) for paper in batch.candidates)
+        tool_calls.append(
+            {
+                "tool_name": LITERATURE_SEARCH_TOOL_NAME,
+                "input": {
+                    "query": batch.query,
+                    "max_results": max_results,
+                    "sources": list(selected_sources),
+                },
+                "status": status,
+                "result_count": len(batch.candidates),
+                "source_counts": dict(sorted(source_counts.items())),
+                "sources_used": list(batch.sources_used),
+                "source_results": dict(sorted(batch.source_counts.items())),
+                "raw_total": batch.raw_total,
+                "total": batch.total,
+                "error": error,
+                "duration_ms": batch.duration_ms,
+            }
+        )
+    return candidates, tool_calls
 
 
 @tool(PREPARE_PAPER_TOOL_NAME)

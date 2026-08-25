@@ -1,8 +1,8 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.13.1`
+> 当前版本：`v0.15.0`
 >
-> 更新日期：`2026-08-20`
+> 更新日期：`2026-08-24`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -10,9 +10,15 @@
 >
 > 项目全景：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
-Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，系统会从 arXiv 和 Crossref 检索相关论文，保存论文网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，可以在首页从统一白名单提供的21个论文来源中多选，系统再通过统一论文搜索MCP检索相关论文并保存网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
 
-`v0.13.1` 完成B1可靠Worker阶段。用户点击论文处理按钮、提交单篇问题、确认智能研究检索计划或生成跨论文报告时，业务状态与`background_jobs`都在同一笔SQLite事务中更新；独立Worker通过租约执行下载、准备、解析、索引、RAG回答、研究搜索和研究报告，支持自动心跳、指数退避、最多3次尝试、最终失败和Worker中断恢复。重复请求复用活动任务；LangGraph检查点负责报告逐节点续跑，报告内容已落库后的任务重放不会再次调用DeepSeek。队列专项`42 passed`，完整离线测试`199 passed`。
+`2026-08-24`已完成多来源搜索MCP的四步接入：首页来源多选由后端白名单渲染，默认全部勾选并支持全选、清空和零来源提交拦截；任务来源列表保存于`research_tasks.sources_json`，LangGraph Checkpoint携带执行副本，Worker恢复时以任务表为准；同一任务的2至4条Planner queries共用一次stdio MCP Session。搜索层只调用第三方`search_papers`，没有调用其下载Tool，也没有修改现有`PaperCandidate`、下载与报告流程。完整离线测试`224 passed`。
+
+同日第5.1步根据真实联网验收兼容`paper-search-mcp==0.1.4`的`structuredContent.result`返回结构，并把`sources_used/source_results/raw_total/total`带入Checkpoint Tool Trace。相同问题和来源配置的复验任务均完成4条query、进入现有去重和Paper Selection；完整离线测试`233 passed`。全21来源和Agent记忆场景仍存在来源故障未完整上报、候选排序噪声等问题，当前不把这些质量问题包装成已解决。
+
+`v0.15.0` 将生产环境的 PDF 默认解析器替换为 MinerU 云端精准解析 API。现有“解析 PDF”和“准备论文问答”入口不变，Worker 自动完成申请上传地址、上传 PDF、轮询云端任务、下载结构化结果并落库；章节、表格、公式、列表、页码和版面坐标会进入后续 Seed + TF-IDF 检索。系统不会在 MinerU 失败时静默切回 `pypdf`，避免同一功能产生不可预测的两套知识库；原 `pypdf` 分块仅保留给历史实验和受控对照。完整离线测试 `209 passed`，未调用真实 MinerU、DeepSeek、Seed 或论文源。
+
+`v0.14.0` 将原来的普通搜索和智能研究入口合并为一个连续研究工作台。用户输入主题后先获得可修改的检索计划，确认后搜索并选择论文，再单独说明报告要回答的问题；报告完成后仍可在同一任务中基于所选论文证据继续追问。会话消息保存到SQLite，报告后追问通过持久Worker执行；报告轮询同时在浏览器和接口层禁用缓存，完成或失败后页面会自动重载。本版尚未加入历史消息摘要、长期记忆和自动上下文压缩。完整离线测试`205 passed`。
 
 `v0.12.3` 完成A7.4真实stdio MCP Client冒烟验证，并结束整个A7阶段。新增`scripts/smoke_mcp_client.py`，使用当前Python解释器启动独立`my_agent_project.mcp_server`子进程，通过stdin/stdout完成协议初始化和Tool发现，不调用业务Tool。真实运行确认Server为`paper-hunter`、协议版本`2025-11-25`，并准确发现三个Tool；MCP专项`13 passed`、完整离线测试`157 passed`。
 
@@ -83,14 +89,16 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 ## 主要功能
 
 - 通过网页输入关键词或论文标题。
-- 可选择LangGraph“智能研究”模式，将研究问题拆成多条检索词，保存任务并由用户确认后执行；DeepSeek不可用或计划无效时保存单查询降级计划。
+- 首页只有一个研究工作台入口；输入主题、论文标题或问题后，LangGraph生成可调整的检索计划，经用户确认才执行搜索。
+- 在计划确认前可通过同一对话区补充范围并重新规划；选择论文后，报告问题与最初搜索主题分开保存。
+- 报告完成后可继续提问，Worker会根据所选论文重新召回页码证据，并结合当前报告调用DeepSeek回答。
 - 多路检索完成后由用户从候选结果中选择最多5篇论文，冻结后续解析和跨论文研究的输入范围。
 - 使用LangGraph原生SQLite Checkpointer保存图状态；两个审批点均由`interrupt()`暂停并通过`Command(resume=...)`恢复。
 - 用户确认论文集合后可显式启动跨论文报告；系统复用下载、解析、索引和RAG检索服务，输出带论文标题与物理页码的证据报告。
 - 报告准备、逐篇检索、生成和引用检查均属于同一LangGraph线程；应用重启后可从最后一个检查点继续。
 - 生成报告前使用跨论文公平配额和总Token预算整理上下文，原始证据与最终模型上下文分别保存，便于审计。
 - 全文受限论文不会被模型猜测内容，而是显示购买或机构订阅说明及合法访问链接；全部论文均无证据时不会调用DeepSeek。
-- 同时检索 arXiv 和 Crossref。
+- 通过统一MCP按任务的明确来源列表检索论文；首页默认全选后端白名单提供的21个来源，升级前旧任务回退arXiv和Crossref。
 - 保存标题、作者、摘要、发表时间、来源、出版商、DOI、网页 URL 和 PDF URL。
 - 将论文元数据和下载状态保存到 SQLite。
 - 为具有明确 PDF 地址的论文显示下载按钮，由用户决定是否下载。
@@ -103,7 +111,7 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 - 论文问答可按题开启 DeepSeek 重排：从初召回 Top-20 中重新选择 Top-5；默认关闭，失败时自动退回原始排序并保存降级原因。
 - 支持 Seed1.6 `Doubao-embedding-vision-251215` 稠密语义向量与本地 TF-IDF 的双路混合召回，同时兼容旧文本 Embedding 接口。
 - Seed API 未配置或暂时失败时自动降级为本地 TF-IDF，不影响论文问答主流程。
-- 支持对已下载 PDF 进行后台解析，按页切分文本并保存到 SQLite。
+- 支持通过 MinerU 云端精准解析 API 处理已下载 PDF，将章节、表格、公式、列表、物理页码和版面坐标保存到 SQLite。
 - 对未取得全文的论文提示可能需要购买或机构订阅，并提供论文原始链接。
 - 下载与解析状态每 2 秒自动刷新，无需手动刷新整个页面。
 - 保存并展示论文实际下载成功日期。
@@ -122,7 +130,17 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 
 本项目使用 `uv` 管理 Python 环境和依赖。安装方式请参考 [uv 官方文档](https://docs.astral.sh/uv/)。
 
-### 2. 启动 Web 服务
+### 2. 配置 MinerU 默认解析器
+
+复制 `.env.example` 为 `.env`，至少填写：
+
+```text
+MINERU_API_TOKEN=你的 MinerU API Token
+```
+
+Token 只由后端 Worker 读取，不会发送到浏览器。每次生产解析都会把对应 PDF 上传到 MinerU 云端；如果论文涉及隐私、保密或第三方数据处理限制，请不要提交。未配置 Token 时搜索和下载仍可运行，但 PDF 解析会明确失败，不会静默使用旧解析器。
+
+### 3. 启动 Web 服务
 
 在项目根目录运行：
 
@@ -142,7 +160,7 @@ http://127.0.0.1:8001/
 uv run uvicorn my_agent_project.main:app --host 127.0.0.1 --port 8002
 ```
 
-### 3. 启动任务 Worker
+### 4. 启动任务 Worker
 
 另开一个终端，在同一项目根目录运行：
 
@@ -158,13 +176,13 @@ uv run python -m my_agent_project.worker --once
 
 当前用户研究闭环中的下载、失败重试、完整准备、单独解析、单独索引、单篇RAG问答、智能研究搜索和跨论文报告全部走持久Worker。离线评测页面仍使用FastAPI `BackgroundTasks`，不属于面向用户的长任务闭环。
 
-### 4. 运行测试
+### 5. 运行测试
 
 ```powershell
 uv run pytest
 ```
 
-### 5. 生成Agent评测报告
+### 6. 生成Agent评测报告
 
 运行冻结的11条可靠性场景，并组合当前本地运行Trace指标：
 
@@ -182,20 +200,17 @@ JSON与文本报告保存到`outputs/agent_evaluation/`。该目录由`.gitignor
 
 ## 使用方法
 
-1. 打开首页。
-2. 输入关键词或论文标题，例如 `multimodal agent`。
-3. 提交搜索后，页面先显示已经获得的论文元数据。
-4. 对需要阅读的论文点击“准备问答”，系统在后台依次完成下载、解析和索引。
-5. 页面每 2 秒自动更新 `downloading`、`parsing`、`indexing` 和 `ready` 状态。
-6. 状态变为 `ready` 后进入详情页提问；也可以使用“仅下载”保留原来的单步流程。
+统一研究工作台的完整流程：
 
-智能研究模式的完整流程：
+1. 在首页输入主题、论文标题或研究问题，系统创建一个研究任务并生成2至4条检索计划。
+2. 在任务页补充研究范围可更新计划；只有点击确认后才执行arXiv/Crossref检索。
+3. 从本次任务的候选论文中选择1至5篇，冻结后续报告与追问的论文范围。
+4. 在对话区单独输入报告要回答的问题，再点击“生成研究报告”。Worker准备全文、检索页码证据并生成报告。
+5. 报告完成后继续在同一对话区提问；追问会持久入队，完成后自动刷新答案。
 
-1. 在首页选择“智能研究”，输入一个研究问题。
-2. 查看DeepSeek生成的2至4条检索计划，确认后才执行arXiv/Crossref检索。
-3. 从本次任务的候选论文中选择1至5篇，保存为后续报告的冻结输入。
-4. 点击“生成研究报告”，后台准备可下载全文并检索每篇论文的页码证据。
-5. 页面自动刷新报告状态；完成后显示综合结论、证据数量、未验证论文及其合法访问链接。
+候选论文仍可从历史页进入单篇详情。对明确可下载的论文点击“准备问答”后，Worker会按`download -> parse -> index`处理，页面每2秒刷新状态；进入`ready`后也可使用原有单篇RAG问答。
+
+当前会话边界：页面会保存和展示全部消息，但报告后追问暂时只把“当前问题 + 已完成报告 + 本次重新召回的证据”发送给模型，不会自动压缩全部聊天历史，也没有跨任务长期记忆。
 
 下载状态说明：
 
@@ -270,7 +285,9 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- config.py
 |   |-- schemas.py
 |   |-- search_service.py
+|   |-- paper_search_mcp_service.py
 |   |-- download_service.py
+|   |-- mineru_service.py
 |   |-- paper_workflow.py
 |   |-- context_service.py
 |   |-- agent_trace_service.py
@@ -310,7 +327,7 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 
 ### `main.py`
 
-FastAPI 应用入口，负责注册路由、接收搜索表单、调用检索服务、写入数据库、安排后台下载并返回 HTML 页面。
+FastAPI 应用入口，负责注册路由、创建统一研究任务、校验人工操作、持久化后台任务并返回 HTML 页面；长任务由独立Worker执行。
 
 主要接口：
 
@@ -322,6 +339,7 @@ GET  /research-tasks/{task_id}
 POST /research-tasks/{task_id}/confirm
 POST /research-tasks/{task_id}/cancel
 POST /research-tasks/{task_id}/select
+POST /research-tasks/{task_id}/message
 POST /research-tasks/{task_id}/report
 GET  /api/research-tasks/{task_id}
 GET  /api/research-tasks/{task_id}/traces
@@ -355,9 +373,13 @@ GET  /evaluation/runs/{run_id}
 
 ### `search_service.py`
 
-负责调用 arXiv 和 Crossref、解析 XML/JSON、统一论文元数据、生成 arXiv PDF 地址，并判断 Crossref 是否提供可直接下载的 PDF。
+保留`search_all()`单query兼容入口，并通过`search_many()`把任务queries批量交给论文搜索MCP。旧arXiv XML和Crossref JSON解析函数只作为离线测试夹具保留，不再属于生产搜索fallback。
 
 该模块只负责“查找论文和解析信息”，不负责把文件写入本地。
+
+### `paper_search_mcp_service.py`
+
+负责启动并管理第三方论文搜索MCP的stdio Session，只调用统一`search_papers`。同一任务的多条query复用一个Session，来源必须是明确的白名单ID；返回结果在本层映射为现有`PaperCandidate`，候选PDF地址不在搜索阶段联网验证。
 
 ### `download_service.py`
 
@@ -555,7 +577,8 @@ created_at, updated_at
 - `split_academic_page_text()`：跨页维护章节树，在章节内部继续生成定长子块，并过滤参考文献噪声。
 - `pdf_source_hash()`：计算 PDF 的 SHA-256 内容指纹，文件变化后自动失效旧页文本。
 - `extract_pdf_pages()` 与 `build_pdf_chunks()`：把昂贵的 PDF 文本提取和可重复的分块策略拆开，使不同策略共享同一份页文本。
-- `extract_pdf_chunks()`：使用 `pypdf` 提取每页正文，按 `length_boundary` 或 `academic_section` 生成带页码和顺序编号的文本块。
+- `parse_paper_pdf()`：生产调用不传实验策略时固定走 MinerU 云端结构化解析；显式传入实验策略时才使用历史 `pypdf` 分块链路。
+- `extract_pdf_chunks()`：仅服务于受控实验，使用 `pypdf` 提取每页正文，再按指定实验策略生成带页码的文本块。
 - `parse_paper_pdf()`：按 PDF 指纹和分块配置复用页文本或当前分块，只在缓存未命中时读取文件和生成新块。
 
 ### `rag_service.py`
@@ -622,14 +645,17 @@ created_at, updated_at
 ```text
 本地 PDF
   -> SHA-256 检查 PDF 内容是否变化
-  -> pdf_text_cache 复用或通过 pypdf 提取每页正文
-  -> normalize_pdf_text() 清理文本
-  -> split_page_text() 生成重叠文本块
-  -> paper_documents 保存解析状态
-  -> paper_chunks 保存页码、顺序和文本内容
+  -> 命中 MinerU 结果缓存则直接复用
+  -> 未命中时申请预签名地址并上传 PDF
+  -> Worker 轮询 MinerU 批次并下载结果 ZIP
+  -> build_structured_chunks() 读取 content_list.json
+  -> paper_documents 保存解析后端、模型、任务ID和阶段
+  -> paper_chunks 保存章节、类型、页码、bbox和正文
   -> embedding_cache 复用或补算 Seed 向量
   -> 详情页展示解析结果预览
 ```
+
+`pypdf`、固定边界和项目自定义分块仍保留在评测路径中，用于复现既有实验；它们不再是普通用户解析的自动后备方案。
 
 解析状态包括：
 

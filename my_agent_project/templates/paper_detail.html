@@ -26,7 +26,7 @@
     </p>
     <ol class="workflow-steps">
       <li>下载开放 PDF</li>
-      <li>解析正文与页码</li>
+      <li>通过 MinerU 云端解析正文、章节、表格与公式</li>
       <li>建立 Seed + TF-IDF 检索索引</li>
     </ol>
     {% if preparation_status == "ready" %}
@@ -49,11 +49,28 @@
   <section class="document-section">
     <h2>全文解析</h2>
     {% if paper["local_path"] %}
+      {% if not mineru_ready %}
+        <div class="access-notice">
+          <strong>MinerU 尚未配置</strong>
+          <p>请在项目根目录的 .env 中填写 MINERU_API_TOKEN 并重启 Web 与 Worker。解析时 PDF 会上传到 MinerU 云端。</p>
+        </div>
+      {% endif %}
       <p>
         解析状态：
         <span class="status" data-parse-status>{{ document["parse_status"] if document else "not_started" }}</span>
         {% if document and document["parse_status"] == "parsed" %}
           ，共 {{ document["page_count"] }} 页、{{ document["chunk_count"] }} 个文本块。
+        {% endif %}
+      </p>
+      <p class="section-note">
+        默认解析器：MinerU 云端精准解析
+        {% if document and document["parser_model"] %}
+          / 模型：{{ document["parser_model"] }}
+        {% endif %}
+        {% if document and document["parse_stage"] %}
+          / 云端阶段：<span data-parse-stage>{{ document["parse_stage"] }}</span>
+        {% else %}
+          / 云端阶段：<span data-parse-stage>尚未提交</span>
         {% endif %}
       </p>
       {% if document and document["error"] %}
@@ -80,7 +97,11 @@
       <h2>已解析文本预览</h2>
       {% for chunk in chunks %}
         <article class="chunk-preview">
-          <p class="chunk-meta">第 {{ chunk["page_number"] }} 页 / 文本块 {{ chunk["chunk_index"] + 1 }}</p>
+          <p class="chunk-meta">
+            第 {{ chunk["page_number"] }} 页 / 结构块 {{ chunk["chunk_index"] + 1 }}
+            / {{ chunk["content_type"] or "text" }}
+            {% if chunk["section_title"] %} / {{ chunk["section_title"] }}{% endif %}
+          </p>
           <p>{{ chunk["content"] }}</p>
         </article>
       {% endfor %}

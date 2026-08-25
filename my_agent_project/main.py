@@ -6,12 +6,13 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .model_service import enhance_query, is_deepseek_configured
+from .model_service import is_deepseek_configured
+from .mineru_service import is_mineru_configured
 from .agent_metrics_service import build_agent_metrics
 from .config import BASE_DIR, MAX_RESULTS, configure_utf8_stdio, ensure_runtime_dirs
 from .db import (
@@ -19,6 +20,7 @@ from .db import (
     cancel_research_task,
     clear_paper_history,
     create_research_task,
+    enqueue_research_followup_job,
     enqueue_download_job,
     enqueue_index_job,
     enqueue_parse_job,
@@ -35,7 +37,6 @@ from .db import (
     get_research_task,
     get_research_report,
     init_db,
-    insert_papers,
     list_evaluation_cases,
     list_evaluation_results,
     list_evaluation_runs,
@@ -46,9 +47,12 @@ from .db import (
     list_paper_statuses,
     list_papers,
     list_research_tasks,
+    list_research_messages,
     list_research_tool_calls,
     list_rag_queries,
     select_research_task_papers,
+    set_research_report_question,
+    revise_research_task_plan,
     validate_research_task_paper_selection,
 )
 from .download_service import can_attempt_download
@@ -67,21 +71,27 @@ from .paper_workflow import (
     get_paper_preparation_status,
     paper_preparation_status,
 )
+from .paper_search_mcp_service import (
+    DEFAULT_SOURCE_IDS,
+    SEARCH_SOURCE_OPTIONS,
+    normalize_source_ids,
+)
 from .rag_service import (
     RERANKER_DEEPSEEK_LISTWISE,
     RERANKER_NONE,
     build_access_notice,
 )
 from .research_agent import (
-    SEARCH_MODE_RESEARCH_AGENT,
-    SEARCH_MODE_STANDARD,
+    create_research_plan,
 )
 from .research_checkpoint import (
     delete_research_checkpoint,
     research_checkpoint_info,
+    revise_checkpointed_research_plan,
     resume_paper_selection,
     resume_plan_confirmation,
     start_checkpointed_research,
+    update_checkpoint_report_question,
 )
 from .schemas import (
     INDEX_INDEXED,
@@ -91,9 +101,6 @@ from .schemas import (
     STATUS_AVAILABLE,
     STATUS_FAILED,
 )
-from .search_service import search_all
-
-
 configure_utf8_stdio()
 ensure_runtime_dirs()
 init_db()
@@ -101,7 +108,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.13.1")
+app = FastAPI(title="Paper Hunter", version="0.15.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -122,7 +129,8 @@ def home(request: Request):
         "index.html",
         {
             "max_results": MAX_RESULTS,
-            "search_mode": SEARCH_MODE_STANDARD,
+            "source_options": SEARCH_SOURCE_OPTIONS,
+            "selected_sources": DEFAULT_SOURCE_IDS,
         },
     )
 
@@ -132,9 +140,10 @@ def search(
     request: Request,
     query: str = Form(...),
     max_results: int = Form(MAX_RESULTS),
-    search_mode: str = Form(SEARCH_MODE_STANDARD),
+    sources: list[str] | None = Form(default=None),
 ):
     query = query.strip()
+    submitted_sources = list(sources or [])
     if not query:
         return templates.TemplateResponse(
             request,
@@ -143,51 +152,50 @@ def search(
                 "max_results": MAX_RESULTS,
                 "error": "请输入关键词。",
                 "query": query,
-                "search_mode": search_mode,
+                "source_options": SEARCH_SOURCE_OPTIONS,
+                "selected_sources": submitted_sources,
             },
             status_code=400,
         )
 
     max_results = max(1, min(max_results, 50))
-    if search_mode == SEARCH_MODE_RESEARCH_AGENT:
-        thread_id = f"research-{uuid4()}"
-        research_plan = start_checkpointed_research(
-            thread_id,
-            query,
-            max_results,
+    try:
+        selected_sources = normalize_source_ids(submitted_sources)
+    except ValueError as exc:
+        return templates.TemplateResponse(
+            request,
+            "index.html",
+            {
+                "max_results": max_results,
+                "error": str(exc),
+                "query": query,
+                "source_options": SEARCH_SOURCE_OPTIONS,
+                "selected_sources": submitted_sources,
+            },
+            status_code=400,
         )
-        task_id = create_research_task(
-            question=query,
-            max_results=max_results,
-            plan_goal=research_plan.goal,
-            plan_queries=research_plan.queries,
-            plan_rationale=research_plan.rationale,
-            plan_model=research_plan.model,
-            planner_status=research_plan.status,
-            planner_error=research_plan.error,
-            status=RESEARCH_TASK_AWAITING,
-            checkpoint_thread_id=thread_id,
-        )
-        attach_agent_traces_to_task(thread_id, task_id)
-        return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
-
-    search_mode = SEARCH_MODE_STANDARD
-    enhanced_query = enhance_query(query)
-    candidates = search_all(enhanced_query, max_results)
-    paper_ids = insert_papers(query, candidates)
-
-    papers = [get_paper(paper_id) for paper_id in paper_ids]
-    return templates.TemplateResponse(
-        request,
-        "results.html",
-        {
-            "query": query,
-            "enhanced_query": enhanced_query,
-            "search_mode": search_mode,
-            "research_plan": None,
-            "papers": [paper_view(paper) for paper in papers if paper is not None],
-        },
+    thread_id = f"research-{uuid4()}"
+    research_plan = start_checkpointed_research(
+        thread_id,
+        query,
+        max_results,
+        selected_sources,
     )
+    task_id = create_research_task(
+        question=query,
+        max_results=max_results,
+        plan_goal=research_plan.goal,
+        plan_queries=research_plan.queries,
+        plan_rationale=research_plan.rationale,
+        plan_model=research_plan.model,
+        planner_status=research_plan.status,
+        planner_error=research_plan.error,
+        status=RESEARCH_TASK_AWAITING,
+        checkpoint_thread_id=thread_id,
+        sources=selected_sources,
+    )
+    attach_agent_traces_to_task(thread_id, task_id)
+    return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
 
 
 @app.get("/research-tasks")
@@ -218,6 +226,7 @@ def research_task_detail(request: Request, task_id: int):
                 paper_view(paper) for paper in selected_papers if paper is not None
             ],
             "tool_calls": list_research_tool_calls(task_id),
+            "messages": list_research_messages(task_id),
             "report": get_research_report(task_id),
             "max_selected_papers": MAX_RESEARCH_SELECTED_PAPERS,
         },
@@ -233,6 +242,72 @@ def confirm_research_task(task_id: int):
         enqueue_research_search_job(task_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.post("/research-tasks/{task_id}/message")
+def post_research_message(
+    task_id: int,
+    message: str = Form(...),
+):
+    message = " ".join(message.split())
+    if not message:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+    if len(message) > 2000:
+        raise HTTPException(status_code=400, detail="消息不能超过2000个字符")
+
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    thread_id = task.get("checkpoint_thread_id") or ""
+    report = get_research_report(task_id)
+
+    if task["status"] == "awaiting_confirmation":
+        revised_question = f"{task['question']}\n补充要求：{message}"
+        plan = create_research_plan(revised_question)
+        revised = revise_research_task_plan(
+            task_id,
+            question=revised_question,
+            plan_goal=plan["plan_goal"],
+            plan_queries=plan["plan_queries"],
+            plan_rationale=plan["plan_rationale"],
+            plan_model=plan["plan_model"],
+            planner_status=plan["plan_status"],
+            planner_error=plan["plan_error"],
+            user_message=message,
+        )
+        if not revised:
+            raise HTTPException(status_code=409, detail="当前阶段不能修改计划")
+        if thread_id:
+            revise_checkpointed_research_plan(
+                thread_id,
+                question=revised_question,
+                plan_goal=plan["plan_goal"],
+                plan_queries=plan["plan_queries"],
+                plan_rationale=plan["plan_rationale"],
+                plan_model=plan["plan_model"],
+                plan_status=plan["plan_status"],
+                plan_error=plan["plan_error"],
+            )
+    elif task["status"] == "papers_selected" and (
+        report is None or report["status"] != "completed"
+    ):
+        if report is not None and report["status"] in {
+            "preparing",
+            "retrieving",
+            "generating",
+        }:
+            raise HTTPException(status_code=409, detail="报告正在生成，请稍后再发消息")
+        if not set_research_report_question(task_id, message):
+            raise HTTPException(status_code=409, detail="当前阶段不能设置报告问题")
+    elif task["status"] == "papers_selected" and report is not None:
+        try:
+            enqueue_research_followup_job(task_id, message)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    else:
+        raise HTTPException(status_code=409, detail="当前任务阶段暂不接受对话")
+
     return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
 
 
@@ -296,6 +371,12 @@ def create_research_report_route(task_id: int):
     task = get_research_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Research task not found")
+    report_question = str(task.get("report_question") or "").strip()
+    if not report_question:
+        raise HTTPException(status_code=409, detail="请先在对话中说明报告要回答的问题")
+    thread_id = task.get("checkpoint_thread_id") or ""
+    if thread_id:
+        update_checkpoint_report_question(thread_id, report_question)
     try:
         enqueue_research_report_job(task_id)
     except RuntimeError as exc:
@@ -304,7 +385,8 @@ def create_research_report_route(task_id: int):
 
 
 @app.get("/api/research-tasks/{task_id}")
-def research_task_status(task_id: int):
+def research_task_status(task_id: int, response: Response):
+    response.headers["Cache-Control"] = "no-store"
     task = get_research_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Research task not found")
@@ -312,6 +394,8 @@ def research_task_status(task_id: int):
     if task.get("checkpoint_thread_id"):
         checkpoint = research_checkpoint_info(task["checkpoint_thread_id"])
     report = get_research_report(task_id)
+    messages = list_research_messages(task_id)
+    latest_message = messages[-1] if messages else None
     return {
         "id": task["id"],
         "status": task["status"],
@@ -322,6 +406,9 @@ def research_task_status(task_id: int):
         "search_job_attempts": task.get("search_job_attempts"),
         "search_job_max_attempts": task.get("search_job_max_attempts"),
         "updated_at": task["updated_at"],
+        "latest_message_status": (
+            latest_message["status"] if latest_message is not None else None
+        ),
         "checkpoint": checkpoint,
         "tool_calls": list_research_tool_calls(task_id),
         "report": (
@@ -407,6 +494,7 @@ def paper_detail(request: Request, paper_id: int):
             "chunks": chunks,
             "rag_queries": rag_queries,
             "deepseek_ready": is_deepseek_configured(),
+            "mineru_ready": is_mineru_configured(),
             "access_notice": build_access_notice(dict(paper)),
             "preparation_status": get_paper_preparation_status(paper_id),
         },

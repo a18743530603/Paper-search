@@ -1,32 +1,44 @@
 {% extends "base.html" %}
-{% block title %}搜索文献 - Paper Hunter{% endblock %}
+{% block title %}开始研究 - Paper Hunter{% endblock %}
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Literature Search Assistant</p>
-    <h1>搜索关键词，归档论文链接，并按需下载开放 PDF。</h1>
-    <p class="lede">优先识别 arXiv PDF；发现可下载文件后由你手动确认，Crossref 没有明确 PDF 直链时保存为链接记录。</p>
+    <p class="eyebrow">Research Workspace</p>
+    <h1>从一个主题开始，持续完成论文检索、证据问答与研究报告。</h1>
+    <p class="lede">系统先提出可调整的检索计划，经你确认后才调用搜索工具；论文下载、报告生成等关键操作仍由你决定。</p>
   </div>
   <form class="search-form" action="/search" method="post">
     {% if error %}<div class="alert">{{ error }}</div>{% endif %}
-    <fieldset class="search-mode-fieldset">
-      <legend>检索模式</legend>
-      <div class="segmented-control">
-        <label>
-          <input name="search_mode" type="radio" value="standard" {% if search_mode != "research_agent" %}checked{% endif %}>
-          <span>普通检索</span>
-        </label>
-        <label>
-          <input name="search_mode" type="radio" value="research_agent" {% if search_mode == "research_agent" %}checked{% endif %}>
-          <span>智能研究</span>
-        </label>
-      </div>
-    </fieldset>
-    <label for="query">关键词或研究问题</label>
-    <input id="query" name="query" type="text" value="{{ query or '' }}" placeholder="multimodal agent" required autofocus>
-    <label for="max_results">结果数量</label>
+    <label for="query">研究主题、论文标题或问题</label>
+    <input id="query" name="query" type="text" value="{{ query or '' }}" placeholder="例如：RAG evaluation" required autofocus>
+    <label for="max_results">候选论文数量</label>
     <input id="max_results" name="max_results" type="number" min="1" max="50" value="{{ max_results }}">
-    <button type="submit">开始检索</button>
+    <fieldset class="source-picker" data-source-picker>
+      <legend>论文来源</legend>
+      <div class="source-picker-head">
+        <p class="source-picker-count" data-source-count aria-live="polite"></p>
+        <div class="source-picker-actions">
+          <button class="button secondary compact" type="button" data-select-all>全选</button>
+          <button class="button secondary compact" type="button" data-clear-all>清空</button>
+        </div>
+      </div>
+      <div class="source-grid">
+        {% for source_id, source_label in source_options %}
+        <label class="source-option">
+          <input
+            type="checkbox"
+            name="sources"
+            value="{{ source_id }}"
+            {% if source_id in selected_sources %}checked{% endif %}
+          >
+          <span>{{ source_label }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      <p class="source-picker-error" data-source-error hidden>至少选择一个论文来源。</p>
+    </fieldset>
+    <button type="submit" data-create-task>创建研究任务</button>
   </form>
 </section>
+<script src="{{ url_for('static', path='/source_picker.js') }}" defer></script>
 {% endblock %}

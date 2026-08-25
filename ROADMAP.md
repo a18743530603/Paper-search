@@ -1,6 +1,6 @@
 # Paper Hunter 后续开发路线与实施日志
 
-> 当前项目版本：`v0.13.1`
+> 当前项目版本：`v0.15.0`
 >
 > 日志建立日期：`2026-08-16`
 >
@@ -324,12 +324,34 @@ MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒�
 
 实现结果：新增6项测试，队列专项`42 passed`，完整回归`199 passed`。B1面向用户的可靠后台任务迁移完成。
 
+## B2：统一研究工作台与上下文管理
+
+### B2.1 单入口会话骨架
+
+**状态：已完成（v0.14.0）**
+
+- 首页统一创建研究任务，不再要求用户预先判断“普通搜索”还是“智能研究”。
+- 同一任务页串联计划补充、人工确认、论文选择、报告问题、报告生成和报告后追问。
+- `research_tasks.report_question`把检索主题与报告问题分离；`research_messages`保存任务内消息和异步状态。
+- 计划修订更新原LangGraph `thread_id`，不会额外创建第二个研究任务。
+- 报告后追问进入`research_followup`持久任务，复用所选论文证据检索、重试和租约恢复。
+
+实现结果：完整离线测试`205 passed`。报告状态轮询在客户端和接口层禁用缓存，终态会自动重载；当前模型上下文只包含当前问题、当前报告和新召回证据，尚未使用完整历史消息。
+
+### B2.2 会话上下文与记忆管理
+
+**状态：待开始**
+
+- 先定义短期历史窗口、摘要触发条件、Token预算和可审计的压缩结果。
+- 区分任务内短期记忆、结构化研究状态和跨任务长期偏好，避免把所有消息无上限塞给模型。
+- 使用固定场景评测上下文连续性、证据忠实性、延迟和Token成本，再决定是否引入更复杂的记忆存储。
+
 ## 暂不纳入当前主线
 
 - 多 Agent：当前复杂度和项目收益不匹配。
 - GraphRAG：当前论文证据问题主要是单段和页码级检索。
 - Dashboard：A6 第一版先保证 Trace、场景和指标口径正确。
-- 长期用户记忆：等 Agent 可靠性、MCP 和任务队列稳定后再评估。
+- 跨任务长期用户记忆：先完成B2.2任务内上下文管理，再评估是否有真实用户价值。
 
 ## 实施日志
 
@@ -498,3 +520,130 @@ MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒�
 - 页面和状态API展示报告队列状态及尝试次数；Web/Worker初始化不会破坏活动报告任务。
 - 新增6项离线测试，队列专项累计`42 passed`，完整离线回归`199 passed`，没有调用真实DeepSeek、Seed或外部搜索源。
 - 结论：B1可靠Worker阶段完成；后续应先确定部署、生产数据库或可观测性增强中的下一条主线。
+
+### 2026-08-23：完成B2.1统一研究工作台骨架
+
+- 发布版本升级为`v0.14.0`，首页从双模式切换改为单一研究任务入口。
+- 计划确认前的补充消息会重新生成计划并更新原LangGraph检查点，不创建平行任务。
+- 论文选择后新增独立报告问题；只有用户明确报告目标后才允许生成报告。
+- 报告完成后新增持久化证据追问，复用冻结论文、RAG召回与Worker可靠性能力。
+- 消息全部落入`research_messages`供展示和审计，但当前模型不读取完整对话历史。
+- 新增6项流程与轮询测试并更新1项旧页面契约，完整离线回归`205 passed`。
+- 下一步：B2.2先设计可评测的短期上下文窗口与摘要策略，再实现长期记忆。
+
+### 2026-08-24：生产PDF解析迁移到MinerU云端
+
+- 发布版本升级为`v0.15.0`，没有增加新的用户按钮；现有解析和准备问答流程默认调用MinerU精准解析API。
+- 在Service层新增独立MinerU适配器，可靠Worker继续负责任务执行、重试、租约与恢复，Web层只入队和轮询状态。
+- 解析输出从字符边界块升级为带章节、内容类型、物理页码和bbox的结构化块；RAG层只补充结构上下文，不改召回权重或重排策略。
+- 用PDF哈希与模型版本缓存云端结果；远程批次ID写入SQLite，进程中断后可继续轮询，避免重复上传和重复占用额度。
+- 生产链路禁止静默回退`pypdf`；历史分块实验通过显式策略继续复现，保证产品一致性和实验可比性。
+- 新增4项MinerU专项测试，完整离线测试`209 passed`，没有读取真实Token或上传用户PDF。
+- 下一步：用户配置`MINERU_API_TOKEN`后，经明确授权用一篇非敏感PDF做真实端到端验收，再单独评估MinerU结构块对现有检索基准的影响，不覆盖冻结历史基线。
+
+### 2026-08-24：多来源搜索MCP接入第1步
+
+- 当前仍使用`v0.15.0`，本步骤只建立适配边界，尚未替换生产`search_all()`，前端、数据库和LangGraph还没有接入来源选择。
+- 新增`paper_search_mcp_service.py`，冻结`openags/paper-search-mcp`统一`search_papers`当前支持的21个来源ID；“全部来源”始终展开为明确ID列表，禁止向第三方发送`sources="all"`。
+- 新增`normalize_source_ids()`和`normalize_queries()`，对来源、检索词、重复项和长度执行本地白名单校验；升级前旧任务的回退来源固定为`arxiv/crossref`。
+- 新增`search_queries_via_mcp_async()`与`search_queries_with_session()`：一次研究搜索只打开一个stdio MCP Session，在同一Session内顺序执行2至4条Planner query，第一版每来源独立召回预算固定为`3`。
+- 新增`paper_candidate_from_mcp()`和`parse_search_papers_result()`，在适配层完成第三方Paper到`PaperCandidate`的字段归一化、来源约束、单条坏记录隔离及单来源错误保留；`pdf_url`只做字符串和绝对URL格式处理，不发起HEAD/GET验证。
+- Wrapper只调用`search_papers`，没有调用或暴露第三方下载Tool；默认外部命令固定为`uvx --from paper-search-mcp==0.1.4 paper-search-mcp`，避免运行版本漂移。
+- 新增5项完全离线契约测试，覆盖明确来源、拒绝`all`、零网络PDF映射、部分来源失败、单Session复用和坏记录隔离；完整离线回归`214 passed`。
+- 下一步：第2步让现有`search_all()`委托批量Wrapper，同时保持任务级`max_results`最终上限和现有跨query去重边界。
+
+### 2026-08-24：多来源搜索MCP接入第2步
+
+- 当前仍使用`v0.15.0`；本步骤只替换生产搜索底座，未接入前端来源选择，也未修改Planner、去重、下载、报告和后续工作流。
+- `search_service.search_all()`不再直接请求arXiv与Crossref REST API，而是把单条query交给`paper_search_mcp_service.search_queries_via_mcp()`，由stdio MCP Session调用第三方统一`search_papers`。
+- 在来源配置尚未贯通前，生产链路显式传递`LEGACY_SOURCE_IDS = ("arxiv", "crossref")`，保证当前产品可见来源不被本次内部替换意外扩大；每来源召回预算固定为`3`，任务最终结果仍由`search_all(max_results)`截断。
+- MCP返回继续在适配层转换为现有`PaperCandidate`，因此`research_tools`、LangGraph候选去重、论文选择、下载与后续处理接口均保持不变。
+- 单个来源失败时保留健康候选，并追加当前项目既有的`failed`占位记录；MCP进程、协议或整个调用失败时返回单条`paper_search_mcp failed`记录，避免异常穿透并中断研究任务。
+- 旧`search_arxiv()`、`search_crossref()`及其直接HTTP请求已删除，不作为fallback保留；`parse_arxiv_feed()`与`parse_crossref_items()`仅作为纯解析函数和离线测试夹具继续存在，不参与当前生产搜索。
+- Wrapper已经支持同一批queries复用一个Session，但现有LangGraph仍按query逐次调用稳定接口`search_all()`；由于本步骤明确不修改Planner和工作流，生产多Query暂时仍是一次query对应一次MCP Session，后续在任务来源贯通时再把调用边界提升到批量搜索阶段。
+- 新增和调整离线测试覆盖`search_all()`委托参数、最终数量上限、部分来源失败和整体MCP失败；定向回归`136 passed`，完整离线回归`215 passed`，未启动真实MCP Server或调用外部论文API。
+- 下一步：贯通任务级明确`sources`列表，并在不改变Planner输出的前提下让一次研究搜索的2至4条query共享同一MCP Session，随后再实现前端来源多选。
+
+### 2026-08-24：多来源搜索MCP接入第3步
+
+- 当前仍使用`v0.15.0`；本步骤只贯通后端`sources`和任务级批量Session，未增加前端checkbox，也未修改Planner Prompt、候选去重、下载、报告或其他后续工作流。
+- `research_tasks`新增`sources_json`；它是任务来源配置的canonical value。新任务创建时保存经过白名单归一化的明确source ID列表，LangGraph State中的`sources`只作为执行副本。
+- 数据库迁移为升级前任务补充`["arxiv", "crossref"]`；任务记录来源缺失、空值或不可解析时，读取层也保守回退为`arxiv/crossref`。
+- `POST /search`后端已接受可重复的`sources`表单参数；当前页面尚未提供控件，因此普通网页创建任务仍使用旧默认来源。无来源、`all`或未知来源继续由现有白名单规则拒绝或回退。
+- `start_checkpointed_research()`把明确来源写入初始State；Worker每次恢复前调用`update_checkpoint_sources()`，用业务库canonical值校准Checkpoint副本，再执行`Command(resume=...)`，不会重新启动Planner。
+- 新增`search_service.search_many()`和`research_tools.search_literature_batch()`；`multi_query_search`与`single_query_search`都使用同一批量入口。一次任务将2至4条Planner queries整体交给现有`search_queries_via_mcp()`，只建立一个stdio Session，再在Session内逐条调用`search_papers`。
+- 每条query仍保存独立的`search_literature` Tool Trace，输入中新增明确`sources`；每来源候选预算仍固定为`3`，每query上限和任务最终上限继续由Paper Hunter控制。
+- MCP返回的单来源错误保留为该query的`partial` Tool结果，健康候选继续参与现有去重；MCP进程或协议整体失败时转换为每条query的`failed` Tool结果，不让异常越过现有搜索错误边界。
+- `search_all(query, max_results)`继续兼容旧单query调用，并默认使用`arxiv/crossref`；MCP下载Tool仍未调用或暴露，`PaperCandidate`未改变。
+- 新增并调整来源持久化、旧任务兼容、批量委托、部分/整体失败、Checkpoint恢复和Planner不重放测试；相关回归`192 passed`，完整离线回归`221 passed`，最终测试未启动真实MCP Server或访问外部论文API。
+- 下一步：第4步只实现前端来源多选、全选/清空与0来源提交拦截，复用本步骤已完成的后端链路。
+
+### 2026-08-24：多来源搜索MCP接入第4步
+
+- 当前仍使用`v0.15.0`；本步骤只增加首页来源选择和提交校验，没有修改搜索服务、Planner Prompt、候选去重、下载、报告或其他工作流节点。
+- `GET /`把后端唯一白名单派生的`SEARCH_SOURCE_OPTIONS`和`DEFAULT_SOURCE_IDS`传给Jinja；模板循环渲染复选框，HTML和JavaScript都不维护第二套source ID列表。
+- 新任务默认明确勾选全部21个来源，支持全选、清空和实时已选数量；清空后前端显示错误并禁用提交按钮。
+- `POST /search`对可重复的`sources`字段再次执行`normalize_source_ids()`白名单校验；0个来源、`all`和未知ID不能进入Planner，避免绕过浏览器校验。
+- 有效来源继续沿既有链路写入初始Checkpoint和`research_tasks.sources_json`；业务表仍是canonical source，Worker恢复前用它校准State副本。旧任务仍回退`["arxiv", "crossref"]`。
+- 浏览器验收确认默认`21/21`、清空后`0/21`且不可提交、全选后恢复；新增页面契约、零来源拒绝和选定来源传递测试，完整离线回归`224 passed`。
+- 多来源搜索MCP接入的四个最小步骤已完成；这些改动尚未在本次任务中提交或推送。
+
+### 2026-08-24：第5步真实联网验收与第5.1步返回结构兼容
+
+- 首轮真实任务`#10/#11/#12`均完成DeepSeek Planner、人工确认、Worker、搜索节点和去重节点，但没有候选进入Paper Selection。根因是`paper-search-mcp==0.1.4`把业务对象放在`structuredContent.result`，旧Adapter错误地从`structuredContent.papers`读取。
+- 第5.1步只修改Adapter响应边界：兼容真实`result` envelope、旧直接payload和文本JSON回退；严格校验`papers/sources_used/source_results/errors/raw_total/total`；嵌套`ExceptionGroup`现在保留叶子根因。Planner、sources、Mapper、去重、下载、报告、工作流和Reranker均未修改。
+- `McpSearchBatch`保存`sources_used/source_results/raw_total/total`，现有Tool Trace在Checkpoint中携带这些验收元数据；没有修改业务数据库表或候选排序。
+- 新增真实0.1.4形状、文本回退、畸形结构、异常根因和Trace元数据契约测试；完整离线回归`233 passed`。
+- 保留失败任务`#10/#11/#12`作为前后对照，使用相同问题和来源配置创建复验任务`#13/#14/#15`。三项任务均只执行一次Planner，每个任务只建立一个MCP Session并连续完成4次`search_papers`调用。
+- `#13`全21来源：4条query进入Paper Hunter的候选数均被每query预算截为5，合并前20、现有去重后5，任务进入`awaiting_selection`；第1/4条query记录Zenodo日期类型错误，因此搜索节点为`partial`。最终5篇均明显偏离土壤肥力主题，说明第三方多源结果顺序不能直接作为最终排序。
+- `#14`仅`semantic/crossref/openalex`：4条query的`source_results`均为`semantic=0/crossref=3/openalex=3`，每条`raw_total=total=6`；合并前20、去重后18，进入Paper Selection。Semantic Scholar真实日志持续429，但第三方payload没有写入`errors`。
+- `#15`仅`arxiv/semantic/crossref/openalex`：4条query的`raw_total/total`分别为`8/8、9/9、7/7、7/7`，合并前20、去重后19，进入Paper Selection；存在人类记忆论文和宽泛LLM综述等明显噪声。
+- 三项复验任务的后台队列均只有`succeeded research_search`，未创建下载、解析、索引或报告任务，也未调用第三方MCP下载Tool。
+- 第5.1步兼容修复通过。下一步必须单独决定来源健康与候选质量治理；不得把Semantic 429、SSRN 403、OpenAIRE/CiteSeerX、Zenodo错误或Reranker混入本步骤结论。
+
+### 2026-08-25：P2 Rerank Prompt冻结回归
+
+- 本步骤只测试当前`RERANK_SYSTEM_PROMPT`，没有修改Prompt、生产重排代码、RAG、LangGraph或模型配置。
+- 新增`benchmarks/rerank_p2_cases.json`，冻结15个案例：事实、方法、参数、结果、原因各2例，完整回答对部分回答1例，关键词/长文本陷阱2例，Candidate Prompt Injection 2例。
+- 新增`scripts/evaluate_rerank_p2.py`，复用生产`_rerank_prompt()`和`ask_deepseek_json()`，按当前`deepseek-v4-pro`、`temperature=0`、thinking关闭和JSON Object配置逐例独立调用P2；不执行搜索、Embedding、RAG或Agent节点。
+- 输出契约15/15通过：所有响应均为合法JSON且只有`ranking`字段，候选ID完整、唯一、无越界，没有回答Question或输出Markdown；Top1为15/15正确，关键词陷阱2/2和注入2/2通过。
+- 严格总体结果为14 PASS、1 FAIL，通过率`93.33%`。唯一失败是结果型`result_01_model_comparison`：期望关键次序`1 > 2 > 3`，实际`[1, 3, 2]`；直接包含比较数值和结论的Candidate 1仍正确排第一，失败仅来自预先冻结的次级关键关系`2 > 3`。
+- 当前不建议立即修改P2：它已稳定识别直接答案、完整答案、原因证据和注入文本；应先保留该失败作为回归样本，后续只有在更多真实证据案例重复出现同类次级排序问题时再调整Prompt。
+- 原始运行结果保存于Git忽略的`outputs/rerank_p2_results.json`；后续P2改动必须复用同一冻结集，不得重新生成更容易的案例。
+
+### 2026-08-25：P3 RAG Prompt冻结回归
+
+- 本步骤只测试当前`RAG_SYSTEM_PROMPT`，没有修改Prompt、生产RAG代码、LangGraph、下载或向量检索。`benchmarks/rag_p3_cases.json`冻结15例，覆盖事实、方法、参数、结果、原因、部分证据、完全不足、相邻信息诱导、多页证据和两种Evidence Injection。
+- 独立脚本`scripts/evaluate_rag_p3.py`复用生产`build_rag_prompt()`和`ask_deepseek()`；当前真实P3配置为`deepseek-v4-pro`、thinking开启、temperature未显式设置而沿用服务端默认。不得把P2的`temperature=0/thinking=disabled`误写成P3配置。
+- 自动检查回答非空、论文标题、证据来源、输入/预期页码、必要内容、禁止陈述、部分回答和“当前证据不足”；原始回答保存在Git忽略的`outputs/rag_p3_results.json`，`--recheck-existing`可在不重复调用模型时重跑确定性检查。
+- 人工最终结果为`14 PASS / 1 WARN / 0 FAIL`，Strict Pass Rate=`93.33%`；Unsupported Claim Cases=`0`，Citation Error Cases=`1`，证据不足处理=`4/4`，Prompt Injection=`2/2`。
+- 唯一WARN为`insufficient_01_dropout`：模型正确说明当前证据不足、没有猜测dropout值，并指出需要训练/正则化参数；正文提到第5页，但末尾“证据来源”为空且缺论文标题，属于无事实错误的引用结构问题。
+- 建议后续对P3做一次很小的不足分支约束：即使结论为证据不足，只要使用了片段判断不足，末尾仍必须列出论文标题和页码；修改前不重写其他规则，修改后复用同一15例回归。本轮按要求不自动修改Prompt。
+
+### 2026-08-25：P3证据不足来源规则回归
+
+- 用户在现有P3中只增加一条规则：即使结论为“当前证据不足”或无法确定，只要依据某个片段判断其缺少所需信息，该片段仍必须列入末尾“证据来源”。本次没有继续修改Prompt或生产代码。
+- 使用完全相同的`benchmarks/rag_p3_cases.json`和真实生产P3配置重新调用15例，新输出另存为`outputs/rag_p3_results_after_source_rule.json`，未覆盖首次基线。
+- Case 12由WARN修复为PASS：回答继续拒绝猜测dropout rate，并在证据来源中明确列出`Neural Architecture Description，第5页`。
+- 原14个PASS全部保持PASS，回归`0/14`；人工复核没有发现新增外部知识、unsupported claim、数值变更、错误页码或Evidence Injection执行。
+- 新结果为`15 PASS / 0 WARN / 0 FAIL`，Strict Pass Rate=`100%`、Unsupported Claim Cases=`0`、Citation Error Cases=`0`、证据不足处理=`4/4`、Prompt Injection=`2/2`。当前新增规则可以保留。
+
+### 2026-08-25：P4跨论文研究报告Prompt冻结回归
+
+- 本步骤只测试当前`RESEARCH_REPORT_SYSTEM_PROMPT`，没有修改Prompt、生产报告代码、LangGraph、搜索、下载或RAG。新增`benchmarks/research_report_p4_cases.json`与独立脚本`scripts/evaluate_research_report_p4.py`，固定15个真实`research-context-json-v1`形状案例。
+- 覆盖共同研究问题、共同方法、方法横向比较、数据来源、单篇结论泛化、多篇一致结论、冲突结论、不可比/可比数值、禁止重新计算、部分证据、访问受限、跨论文污染及两种JSON Injection。
+- P4真实配置为`deepseek-v4-pro`、thinking开启、temperature和max_tokens均未显式设置而使用服务端默认；不得套用P2配置。原始报告保存在Git忽略的`outputs/research_report_p4_results.json`。
+- 自动检查固定四部分、必要/禁止内容、合法URL和`[标题, p.页码]`引用契约；人工复核每份报告的事实归属、泛化、冲突解释、数值比较和Injection。最终结果为`10 PASS / 5 WARN / 0 FAIL`，Strict Pass Rate=`66.67%`。
+- 5个WARN为`compare_01_method_routes`、`numbers_01_incomparable_datasets`、`numbers_02_comparable_protocol`、`numbers_03_no_recalculation`和`injection_02_fake_system_format`。它们的事实、标题和页码均正确，但综合段落把多个来源合写为`[A, p.x; B, p.y]`，违反每条引用独立使用`[标题, p.页码]`的格式；没有跨论文错配，因此不判FAIL。
+- 指标：Unsupported Claim Cases=`0`、Cross-paper Attribution Error=`0`、Unsupported Generalization=`0`、Invalid Numerical Comparison=`0`、Citation Error Cases=`5`（仅格式契约）、Conflict Handling=`1/1`、Partial Evidence Handling=`1/1`、Prompt Injection=`2/2`。
+- 建议只对P4引用规则做小幅强化并给出多来源正确示例：多个来源必须写成`[A, p.x][B, p.y]`，不得放进同一对方括号。不要重写已通过的证据边界、数值比较、访问限制或Injection规则；修改后必须复用同一15例回归。本轮按要求不自动修改Prompt。
+
+### 2026-08-25：P4中文纯文本与引用规则回归
+
+- 用户修改生产`RESEARCH_REPORT_SYSTEM_PROMPT`后，继续复用完全相同的`benchmarks/research_report_p4_cases.json`，没有修改Prompt、生产报告逻辑或冻结案例。
+- `scripts/evaluate_research_report_p4.py`只更新输出契约检查：移除固定四部分Markdown要求，改为校验中文单篇引用`[论文标题，第3页]`和多篇引用`[论文A，第3页；论文B，第5页]`，并拦截Markdown标题、表格、代码块及无内容的`【...】`章节。
+- 使用当前真实生产配置`deepseek-v4-pro`、thinking开启、temperature和max_tokens沿用服务端默认重新调用15例；新原始输出另存为Git忽略的`outputs/research_report_p4_results_plaintext.json`，未覆盖旧基线。
+- 自动契约检查与人工语义复核均为`15 PASS / 0 WARN / 0 FAIL`，Strict Pass Rate=`100%`。旧版5个Citation WARN全部消失，原10个PASS全部保持PASS。
+- 指标：Unsupported Claim Cases=`0`、Cross-paper Attribution Error=`0`、Unsupported Generalization=`0`、Invalid Numerical Comparison=`0`、Citation Error Cases=`0`、Conflict Handling=`1/1`、Partial Evidence Handling=`1/1`、Prompt Injection=`2/2`。
+- 15份报告均未出现`# / ## / ###`标题、Markdown表格、代码块、空章节或机械补齐的固定四部分；多篇共同引用经人工核对，每个引用项均真实支持其相邻事实。
+- 结论：取消固定四段结构没有造成内容能力回归，当前P4 Prompt可以正式保留；后续修改必须继续复用同一冻结集，避免只优化格式却破坏证据边界。

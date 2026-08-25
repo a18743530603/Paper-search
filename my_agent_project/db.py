@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     question TEXT NOT NULL,
     max_results INTEGER NOT NULL,
+    sources_json TEXT NOT NULL DEFAULT '["arxiv", "crossref"]',
     plan_goal TEXT NOT NULL,
     plan_queries_json TEXT NOT NULL,
     plan_rationale TEXT NOT NULL DEFAULT '',
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     result_count INTEGER NOT NULL DEFAULT 0,
     selected_paper_ids_json TEXT NOT NULL DEFAULT '[]',
     selected_count INTEGER NOT NULL DEFAULT 0,
+    report_question TEXT NOT NULL DEFAULT '',
     error TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -164,6 +166,24 @@ CREATE TABLE IF NOT EXISTS research_reports (
     FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS research_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_messages_task_id
+ON research_messages(task_id, id);
+
 CREATE TABLE IF NOT EXISTS paper_documents (
     paper_id INTEGER PRIMARY KEY,
     parse_status TEXT NOT NULL DEFAULT 'not_started',
@@ -175,6 +195,11 @@ CREATE TABLE IF NOT EXISTS paper_documents (
     chunk_size INTEGER,
     chunk_overlap INTEGER,
     layout_stats_json TEXT,
+    parser_backend TEXT,
+    parser_model TEXT,
+    parser_job_id TEXT,
+    parse_stage TEXT,
+    parsed_at TEXT,
     index_status TEXT NOT NULL DEFAULT 'not_indexed',
     index_error TEXT,
     vectorizer TEXT,
@@ -207,6 +232,9 @@ CREATE TABLE IF NOT EXISTS paper_chunks (
     content TEXT NOT NULL,
     parent_chunk_id INTEGER,
     chunk_role TEXT NOT NULL DEFAULT 'retrieval',
+    section_title TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT 'text',
+    bbox_json TEXT,
     vector_json TEXT,
     dense_vector_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -412,6 +440,11 @@ def init_db() -> None:
             ("chunk_size", "INTEGER"),
             ("chunk_overlap", "INTEGER"),
             ("layout_stats_json", "TEXT"),
+            ("parser_backend", "TEXT"),
+            ("parser_model", "TEXT"),
+            ("parser_job_id", "TEXT"),
+            ("parse_stage", "TEXT"),
+            ("parsed_at", "TEXT"),
             ("index_status", "TEXT NOT NULL DEFAULT 'not_indexed'"),
             ("index_error", "TEXT"),
             ("vectorizer", "TEXT"),
@@ -437,6 +470,18 @@ def init_db() -> None:
                 "ALTER TABLE paper_chunks "
                 "ADD COLUMN chunk_role TEXT NOT NULL DEFAULT 'retrieval'"
             )
+        if "section_title" not in chunk_columns:
+            conn.execute(
+                "ALTER TABLE paper_chunks "
+                "ADD COLUMN section_title TEXT NOT NULL DEFAULT ''"
+            )
+        if "content_type" not in chunk_columns:
+            conn.execute(
+                "ALTER TABLE paper_chunks "
+                "ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"
+            )
+        if "bbox_json" not in chunk_columns:
+            conn.execute("ALTER TABLE paper_chunks ADD COLUMN bbox_json TEXT")
         evaluation_run_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(evaluation_runs)").fetchall()
@@ -473,9 +518,14 @@ def init_db() -> None:
         }
         for name, definition in (
             ("checkpoint_thread_id", "TEXT"),
+            (
+                "sources_json",
+                "TEXT NOT NULL DEFAULT '[\"arxiv\", \"crossref\"]'",
+            ),
             ("selected_paper_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("selected_count", "INTEGER NOT NULL DEFAULT 0"),
             ("selected_at", "TEXT"),
+            ("report_question", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in research_task_columns:
                 conn.execute(
@@ -592,6 +642,24 @@ def init_db() -> None:
               )
             """
         )
+        conn.execute(
+            """
+            UPDATE research_messages
+            SET status = 'failed',
+                error = '上一次追问执行被应用重启中断，请重新提交。',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE role = 'assistant'
+              AND phase = 'followup'
+              AND status IN ('pending', 'retry_wait')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.research_task_id = research_messages.task_id
+                    AND job.job_type = 'research_followup'
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
+            """
+        )
 
 
 def insert_papers(query: str, papers: Iterable[PaperCandidate]) -> list[int]:
@@ -637,6 +705,7 @@ def list_papers(limit: int = 100) -> list[sqlite3.Row]:
 def _research_task_from_row(row: sqlite3.Row) -> dict:
     task = dict(row)
     for source, target in (
+        ("sources_json", "sources"),
         ("plan_queries_json", "plan_queries"),
         ("paper_ids_json", "paper_ids"),
         ("selected_paper_ids_json", "selected_paper_ids"),
@@ -646,6 +715,8 @@ def _research_task_from_row(row: sqlite3.Row) -> dict:
         except (json.JSONDecodeError, TypeError):
             value = []
         task[target] = value if isinstance(value, list) else []
+    if not task.get("sources"):
+        task["sources"] = ["arxiv", "crossref"]
     return task
 
 
@@ -661,20 +732,25 @@ def create_research_task(
     planner_error: str,
     status: str,
     checkpoint_thread_id: str = "",
+    sources: Iterable[str] = ("arxiv", "crossref"),
 ) -> int:
+    selected_sources = list(dict.fromkeys(str(source) for source in sources))
+    if not selected_sources:
+        selected_sources = ["arxiv", "crossref"]
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO research_tasks (
-                question, max_results, plan_goal, plan_queries_json,
+                question, max_results, sources_json, plan_goal, plan_queries_json,
                 plan_rationale, plan_model, planner_status, planner_error,
                 checkpoint_thread_id, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 question,
                 max_results,
+                json.dumps(selected_sources, ensure_ascii=False),
                 plan_goal,
                 json.dumps(plan_queries, ensure_ascii=False),
                 plan_rationale,
@@ -685,7 +761,132 @@ def create_research_task(
                 status,
             ),
         )
-        return int(cursor.lastrowid)
+        task_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content)
+            VALUES (?, 'user', 'discovery', ?)
+            """,
+            (task_id, question),
+        )
+        plan_lines = "\n".join(f"{index}. {item}" for index, item in enumerate(plan_queries, 1))
+        plan_message = f"研究目标：{plan_goal}\n\n检索计划：\n{plan_lines}"
+        if plan_rationale:
+            plan_message += f"\n\n规划说明：{plan_rationale}"
+        conn.execute(
+            """
+            INSERT INTO research_messages (
+                task_id, role, phase, content, model, error
+            )
+            VALUES (?, 'assistant', 'planning', ?, ?, ?)
+            """,
+            (
+                task_id,
+                plan_message,
+                plan_model or None,
+                planner_error or None,
+            ),
+        )
+        return task_id
+
+
+def revise_research_task_plan(
+    task_id: int,
+    *,
+    question: str,
+    plan_goal: str,
+    plan_queries: list[str],
+    plan_rationale: str,
+    plan_model: str,
+    planner_status: str,
+    planner_error: str,
+    user_message: str,
+) -> bool:
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET question = ?, plan_goal = ?, plan_queries_json = ?,
+                plan_rationale = ?, plan_model = ?, planner_status = ?,
+                planner_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'awaiting_confirmation'
+            """,
+            (
+                question,
+                plan_goal,
+                json.dumps(plan_queries, ensure_ascii=False),
+                plan_rationale,
+                plan_model,
+                planner_status,
+                planner_error or None,
+                task_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return False
+        conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content)
+            VALUES (?, 'user', 'planning', ?)
+            """,
+            (task_id, user_message),
+        )
+        plan_lines = "\n".join(f"{index}. {item}" for index, item in enumerate(plan_queries, 1))
+        assistant_message = f"已更新研究目标：{plan_goal}\n\n新的检索计划：\n{plan_lines}"
+        if plan_rationale:
+            assistant_message += f"\n\n规划说明：{plan_rationale}"
+        conn.execute(
+            """
+            INSERT INTO research_messages (
+                task_id, role, phase, content, model, error
+            )
+            VALUES (?, 'assistant', 'planning', ?, ?, ?)
+            """,
+            (
+                task_id,
+                assistant_message,
+                plan_model or None,
+                planner_error or None,
+            ),
+        )
+        return True
+
+
+def set_research_report_question(
+    task_id: int,
+    question: str,
+) -> bool:
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET report_question = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'papers_selected'
+            """,
+            (question, task_id),
+        )
+        if cursor.rowcount != 1:
+            return False
+        conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content)
+            VALUES (?, 'user', 'report_question', ?)
+            """,
+            (task_id, question),
+        )
+        conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content)
+            VALUES (
+                ?, 'assistant', 'report_question',
+                '已记录报告问题。确认后我会准备所选论文、检索页码证据并生成报告。'
+            )
+            """,
+            (task_id,),
+        )
+        return True
 
 
 def get_research_task(task_id: int) -> Optional[dict]:
@@ -1017,6 +1218,84 @@ def get_research_report(task_id: int) -> Optional[dict]:
     return _research_report_from_row(row) if row is not None else None
 
 
+def _research_message_from_row(row: sqlite3.Row) -> dict:
+    message = dict(row)
+    try:
+        evidence = json.loads(message.get("evidence_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        evidence = []
+    message["evidence"] = evidence if isinstance(evidence, list) else []
+    return message
+
+
+def get_research_message(message_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM research_messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+    return _research_message_from_row(row) if row is not None else None
+
+
+def list_research_messages(task_id: int, limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM research_messages
+            WHERE task_id = ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (task_id, limit),
+        ).fetchall()
+    return [_research_message_from_row(row) for row in rows]
+
+
+def update_research_message(
+    message_id: int,
+    status: str,
+    *,
+    content: Optional[str] = None,
+    evidence: Optional[list[dict]] = None,
+    model: Optional[str] = None,
+    error: Optional[str] = None,
+) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_messages
+            SET status = ?,
+                content = COALESCE(?, content),
+                evidence_json = COALESCE(?, evidence_json),
+                model = COALESCE(?, model),
+                error = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND role = 'assistant'
+            """,
+            (
+                status,
+                content,
+                (
+                    json.dumps(evidence, ensure_ascii=False)
+                    if evidence is not None
+                    else None
+                ),
+                model,
+                error[:1000] if error else None,
+                message_id,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def mark_research_message_retry_pending(message_id: int, error: str) -> bool:
+    return update_research_message(
+        message_id,
+        "retry_wait",
+        error=error,
+    )
+
+
 def start_research_report(task_id: int) -> bool:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1293,6 +1572,9 @@ def list_paper_statuses(limit: int = 1000) -> list[dict]:
                 d.page_count,
                 d.chunk_count,
                 d.error AS parse_error,
+                d.parser_backend,
+                d.parser_model,
+                d.parse_stage,
                 d.index_status,
                 d.index_error,
                 d.indexed_at,
@@ -1613,6 +1895,44 @@ def update_parse_status(
         )
 
 
+def update_remote_parse_state(
+    paper_id: int,
+    *,
+    source_hash: str,
+    parser_backend: str,
+    parser_model: str,
+    parser_job_id: Optional[str] = None,
+    parse_stage: str,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO paper_documents (
+                paper_id, parse_status, source_hash, parser_backend,
+                parser_model, parser_job_id, parse_stage, error
+            )
+            VALUES (?, 'parsing', ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(paper_id) DO UPDATE SET
+                parse_status = 'parsing',
+                source_hash = excluded.source_hash,
+                parser_backend = excluded.parser_backend,
+                parser_model = excluded.parser_model,
+                parser_job_id = COALESCE(excluded.parser_job_id, parser_job_id),
+                parse_stage = excluded.parse_stage,
+                error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                paper_id,
+                source_hash,
+                parser_backend,
+                parser_model,
+                parser_job_id,
+                parse_stage,
+            ),
+        )
+
+
 def replace_paper_chunks(
     paper_id: int,
     chunks: Iterable[PaperChunk],
@@ -1624,6 +1944,9 @@ def replace_paper_chunks(
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
     layout_stats: Optional[dict] = None,
+    parser_backend: Optional[str] = None,
+    parser_model: Optional[str] = None,
+    parser_job_id: Optional[str] = None,
 ) -> int:
     chunk_list = list(chunks)
     parent_list = list(parent_chunks)
@@ -1665,9 +1988,9 @@ def replace_paper_chunks(
             """
             INSERT INTO paper_chunks (
                 paper_id, page_number, chunk_index, content, parent_chunk_id,
-                chunk_role
+                chunk_role, section_title, content_type, bbox_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1677,6 +2000,13 @@ def replace_paper_chunks(
                     chunk.content,
                     parent_ids.get(chunk.parent_index),
                     chunk.role,
+                    chunk.section_title,
+                    chunk.content_type,
+                    (
+                        json.dumps(chunk.bbox)
+                        if chunk.bbox is not None
+                        else None
+                    ),
                 )
                 for chunk in chunk_list
             ],
@@ -1686,13 +2016,14 @@ def replace_paper_chunks(
             INSERT INTO paper_documents (
                 paper_id, parse_status, page_count, chunk_count, error,
                 source_hash, chunk_strategy, chunk_size, chunk_overlap,
-                layout_stats_json,
+                layout_stats_json, parser_backend, parser_model,
+                parser_job_id, parse_stage, parsed_at,
                 index_status, index_error, vectorizer, embedding_namespace,
                 indexed_at
             )
             VALUES (
                 ?, 'parsed', ?, ?, NULL, ?, ?, ?, ?,
-                ?,
+                ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP,
                 'not_indexed', NULL, NULL, NULL, NULL
             )
             ON CONFLICT(paper_id) DO UPDATE SET
@@ -1705,6 +2036,11 @@ def replace_paper_chunks(
                 chunk_size = excluded.chunk_size,
                 chunk_overlap = excluded.chunk_overlap,
                 layout_stats_json = excluded.layout_stats_json,
+                parser_backend = excluded.parser_backend,
+                parser_model = excluded.parser_model,
+                parser_job_id = excluded.parser_job_id,
+                parse_stage = 'completed',
+                parsed_at = CURRENT_TIMESTAMP,
                 index_status = 'not_indexed',
                 index_error = NULL,
                 vectorizer = NULL,
@@ -1721,6 +2057,9 @@ def replace_paper_chunks(
                 chunk_size,
                 chunk_overlap,
                 json.dumps(layout_stats or {}, ensure_ascii=False),
+                parser_backend,
+                parser_model,
+                parser_job_id,
             ),
         )
     return len(chunk_list)
@@ -2451,6 +2790,102 @@ def enqueue_research_report_job(
         return {
             "job_id": int(job_cursor.lastrowid),
             "task_id": task_id,
+            "created": True,
+        }
+
+
+def enqueue_research_followup_job(
+    task_id: int,
+    question: str,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    question = " ".join(str(question or "").split())
+    if not question:
+        raise ValueError("追问内容不能为空")
+    if len(question) > 2000:
+        raise ValueError("追问内容不能超过2000个字符")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    dedupe_key = f"research_followup:{task_id}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise LookupError("研究任务不存在")
+        if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
+            raise RuntimeError("研究任务尚未冻结论文集合")
+        report = conn.execute(
+            "SELECT status FROM research_reports WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if report is None or report["status"] != "completed":
+            raise RuntimeError("研究报告完成后才能继续追问")
+        active = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE dedupe_key = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        if active is not None:
+            raise RuntimeError("上一条研究追问仍在处理中")
+
+        conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content)
+            VALUES (?, 'user', 'followup', ?)
+            """,
+            (task_id, question),
+        )
+        assistant_cursor = conn.execute(
+            """
+            INSERT INTO research_messages (
+                task_id, role, phase, content, status
+            )
+            VALUES (?, 'assistant', 'followup', '正在检索所选论文证据...', 'pending')
+            """,
+            (task_id,),
+        )
+        message_id = int(assistant_cursor.lastrowid)
+        job_cursor = conn.execute(
+            """
+            INSERT INTO background_jobs (
+                job_type, payload_json, dedupe_key, research_task_id, status,
+                max_attempts, available_at, created_at, updated_at
+            )
+            VALUES ('research_followup', ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps(
+                    {
+                        "task_id": task_id,
+                        "message_id": message_id,
+                        "question": question,
+                    },
+                    ensure_ascii=False,
+                ),
+                dedupe_key,
+                task_id,
+                max_attempts,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return {
+            "job_id": int(job_cursor.lastrowid),
+            "task_id": task_id,
+            "message_id": message_id,
             "created": True,
         }
 

@@ -13,6 +13,7 @@ from .research_checkpoint import (
     resume_plan_confirmation,
     stream_checkpointed_research_report,
     update_checkpoint_candidate_ids,
+    update_checkpoint_sources,
 )
 from .research_agent import run_confirmed_research_search
 from .research_report_service import generate_research_report
@@ -45,6 +46,7 @@ def execute_research_task(task_id: int, *, raise_on_error: bool = False) -> None
     try:
         thread_id = task.get("checkpoint_thread_id") or ""
         if thread_id:
+            update_checkpoint_sources(thread_id, task["sources"])
             checkpoint = research_checkpoint_info(thread_id)
             next_nodes = set(checkpoint["next_nodes"])
             if "request_plan_confirmation" in next_nodes:
@@ -67,6 +69,7 @@ def execute_research_task(task_id: int, *, raise_on_error: bool = False) -> None
                 model=task["plan_model"],
                 status=task["planner_status"],
                 error=task["planner_error"] or "",
+                sources=task["sources"],
             )
         paper_ids = insert_papers(task["question"], result.candidates)
         replace_research_tool_calls(task_id, result.tool_calls)

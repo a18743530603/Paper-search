@@ -69,6 +69,9 @@ class PaperChunk:
     content: str
     parent_index: Optional[int] = None
     role: str = CHUNK_ROLE_RETRIEVAL
+    section_title: str = ""
+    content_type: str = "text"
+    bbox: Optional[tuple[float, float, float, float]] = None
 
 
 @dataclass(frozen=True)

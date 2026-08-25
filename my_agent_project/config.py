@@ -37,6 +37,19 @@ SEED_BASE_URL = os.getenv(
 SEED_EMBEDDING_MODEL = os.getenv("SEED_EMBEDDING_MODEL", "").strip()
 SEED_EMBEDDING_API_MODE = os.getenv("SEED_EMBEDDING_API_MODE", "auto").strip().lower()
 SEED_TIMEOUT = float(os.getenv("SEED_TIMEOUT", "120"))
+MINERU_API_TOKEN = (
+    os.getenv("MINERU_API_TOKEN", "").strip()
+    or os.getenv("MINERU_TOKEN", "").strip()
+)
+MINERU_BASE_URL = os.getenv(
+    "MINERU_BASE_URL",
+    "https://mineru.net/api/v4",
+).rstrip("/")
+MINERU_MODEL_VERSION = os.getenv("MINERU_MODEL_VERSION", "vlm").strip().lower()
+MINERU_REQUEST_TIMEOUT = float(os.getenv("MINERU_REQUEST_TIMEOUT", "120"))
+MINERU_PARSE_TIMEOUT = float(os.getenv("MINERU_PARSE_TIMEOUT", "1200"))
+MINERU_POLL_INTERVAL = float(os.getenv("MINERU_POLL_INTERVAL", "5"))
+MINERU_RESULTS_DIR = DOWNLOAD_DIR / "mineru"
 
 
 def configure_utf8_stdio() -> None:
@@ -53,3 +66,4 @@ def ensure_runtime_dirs() -> None:
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ORIGIN_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    MINERU_RESULTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from .config import LANGGRAPH_CHECKPOINT_PATH, ensure_runtime_dirs
+from .paper_search_mcp_service import LEGACY_SOURCE_IDS, normalize_source_ids
 from .research_agent import (
     ResearchSearchResult,
     build_checkpointed_research_graph,
@@ -68,10 +69,16 @@ def start_checkpointed_research(
     thread_id: str,
     question: str,
     max_results: int,
+    sources: list[str] | tuple[str, ...] = LEGACY_SOURCE_IDS,
 ) -> ResearchSearchResult:
     graph = get_checkpointed_research_graph()
+    selected_sources = normalize_source_ids(sources)
     graph.invoke(
-        {"question": question, "max_results": max_results},
+        {
+            "question": question,
+            "max_results": max_results,
+            "sources": list(selected_sources),
+        },
         config=checkpoint_config(thread_id),
     )
     return _checkpoint_result(thread_id, default_status="awaiting_confirmation")
@@ -114,6 +121,53 @@ def update_checkpoint_candidate_ids(thread_id: str, paper_ids: list[int]) -> Non
     graph.update_state(
         checkpoint_config(thread_id),
         {"candidate_paper_ids": list(paper_ids)},
+    )
+
+
+def update_checkpoint_sources(
+    thread_id: str,
+    sources: list[str] | tuple[str, ...],
+) -> None:
+    selected_sources = normalize_source_ids(sources)
+    graph = get_checkpointed_research_graph()
+    graph.update_state(
+        checkpoint_config(thread_id),
+        {"sources": list(selected_sources)},
+    )
+
+
+def revise_checkpointed_research_plan(
+    thread_id: str,
+    *,
+    question: str,
+    plan_goal: str,
+    plan_queries: list[str],
+    plan_rationale: str,
+    plan_model: str,
+    plan_status: str,
+    plan_error: str,
+) -> None:
+    graph = get_checkpointed_research_graph()
+    graph.update_state(
+        checkpoint_config(thread_id),
+        {
+            "question": question,
+            "plan_goal": plan_goal,
+            "plan_queries": list(plan_queries),
+            "plan_rationale": plan_rationale,
+            "plan_model": plan_model,
+            "plan_status": plan_status,
+            "plan_error": plan_error,
+            "workflow_status": "awaiting_confirmation",
+        },
+    )
+
+
+def update_checkpoint_report_question(thread_id: str, question: str) -> None:
+    graph = get_checkpointed_research_graph()
+    graph.update_state(
+        checkpoint_config(thread_id),
+        {"question": question},
     )
 
 
@@ -167,6 +221,7 @@ def research_checkpoint_info(thread_id: str) -> dict[str, Any]:
             "",
         ),
         "workflow_status": snapshot.values.get("workflow_status", ""),
+        "sources": list(snapshot.values.get("sources") or LEGACY_SOURCE_IDS),
     }
 
 

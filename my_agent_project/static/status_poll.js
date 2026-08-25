@@ -64,6 +64,11 @@ function updatePaperStatus(paper) {
     }
   }
 
+  const parseStage = document.querySelector(".detail [data-parse-stage]");
+  if (parseStage && paper.parse_stage) {
+    parseStage.textContent = paper.parse_stage;
+  }
+
   const indexStatus = document.querySelector(".detail [data-index-status]");
   if (indexStatus && paper.index_status) {
     const previousIndexStatus = indexStatus.textContent.trim();

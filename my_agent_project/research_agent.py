@@ -12,13 +12,14 @@ from .model_service import (
     ask_deepseek_json,
 )
 from .schemas import PaperCandidate
+from .paper_search_mcp_service import LEGACY_SOURCE_IDS
 from .research_report_service import (
     generate_report_content,
     prepare_report_paper,
     retrieve_report_paper_evidence,
     validate_research_report_citations,
 )
-from .research_tools import LITERATURE_SEARCH_TOOL_NAME, invoke_research_tool
+from .research_tools import search_literature_batch
 
 
 SEARCH_MODE_STANDARD = "standard"
@@ -27,15 +28,38 @@ PLANNER_STATUS_PLANNED = "planned"
 PLANNER_STATUS_FALLBACK = "fallback"
 MAX_PLANNED_QUERIES = 4
 
-RESEARCH_PLANNER_SYSTEM_PROMPT = """You plan academic literature searches.
-Return one JSON object with exactly these fields:
-- goal: a concise restatement of the research goal;
-- queries: 2 to 4 distinct English academic search queries;
-- rationale: one concise sentence explaining the query coverage.
+RESEARCH_PLANNER_SYSTEM_PROMPT = """你负责将用户的研究问题转换为适合学术论文检索的搜索计划。
 
-Keep named methods, datasets, model names, acronyms, and paper titles unchanged.
-Do not answer the research question. Do not decide whether any paper should be
-downloaded. Do not include Markdown or fields outside the JSON object.
+你的任务不是回答研究问题，而是生成能够准确召回相关论文的英文检索式。
+
+生成检索式时，应先根据用户的完整问题判断：
+
+- 研究对象是什么；
+- 所属研究领域是什么；
+- 主要研究主题、方法、变量或关系是什么；
+- 是否存在容易产生歧义的词语；
+- 哪些明显无关的研究语境应当避免被检索结果引入。
+
+不要只从原问题中机械提取关键词。应结合上下文理解关键词在当前研究中的实际含义，并在必要时使用更准确的学术术语、标准名称、同义表达或常用学术英文表达扩展查询。
+
+例如，若用户研究“不同温度对西瓜植株生长的影响”，应将 watermelon 理解为农业或植物科学中的西瓜植株，而不是食品、市场、计算机视觉或微生物研究中的 watermelon。
+
+生成 2 到 4 条彼此有区别但围绕同一研究目标的英文检索式。每条检索式应包含足以限定研究对象、研究领域或研究主题的关键信息，避免生成过于宽泛、仅依赖表面关键词匹配的查询。
+
+不同检索式应在学术术语表达、研究对象限定、研究关系或检索角度上形成互补，不要仅对同一组关键词进行换序或简单同义改写。
+
+只返回一个 JSON 对象，并且必须恰好包含以下字段：
+
+- goal：简洁概括用户的研究目标；
+- queries：2 到 4 条英文论文检索式；
+- rationale：用一句简洁的话说明这些检索式如何覆盖研究目标并减少无关结果。
+
+不要回答研究问题。
+不要判断具体论文是否应该下载。
+不要输出 Markdown。
+不要增加其他字段。
+
+
 """
 
 
@@ -46,6 +70,7 @@ class ResearchPlanError(ValueError):
 class ResearchSearchState(TypedDict, total=False):
     question: str
     max_results: int
+    sources: list[str]
     confirmed: bool
     plan_goal: str
     plan_queries: list[str]
@@ -117,10 +142,7 @@ def normalize_research_plan(
     return goal, queries, rationale
 
 
-def plan_research(state: ResearchSearchState) -> dict[str, Any]:
-    if state.get("plan_queries") and state.get("plan_status"):
-        return {}
-    question = state["question"]
+def create_research_plan(question: str) -> dict[str, Any]:
     try:
         payload, model = ask_deepseek_json(
             RESEARCH_PLANNER_SYSTEM_PROMPT,
@@ -145,6 +167,12 @@ def plan_research(state: ResearchSearchState) -> dict[str, Any]:
             "plan_status": PLANNER_STATUS_FALLBACK,
             "plan_error": str(exc)[:500],
         }
+
+
+def plan_research(state: ResearchSearchState) -> dict[str, Any]:
+    if state.get("plan_queries") and state.get("plan_status"):
+        return {}
+    return create_research_plan(state["question"])
 
 
 def route_after_plan(
@@ -200,30 +228,24 @@ def cancel_research(_state: ResearchSearchState) -> dict[str, Any]:
 def _candidate_dicts(
     queries: list[str],
     per_query_results: int,
+    sources: list[str] | tuple[str, ...],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    candidates: list[dict[str, Any]] = []
-    tool_calls: list[dict[str, Any]] = []
-    for query in queries:
-        tool_result = invoke_research_tool(
-            LITERATURE_SEARCH_TOOL_NAME,
-            {"query": query, "max_results": per_query_results},
-        )
-        candidates.extend(tool_result.get("candidates", []))
-        tool_calls.append(
-            {
-                key: value
-                for key, value in tool_result.items()
-                if key != "candidates"
-            }
-        )
-    return candidates, tool_calls
+    return search_literature_batch(
+        queries,
+        sources=sources,
+        max_results=per_query_results,
+    )
 
 
 def multi_query_search(state: ResearchSearchState) -> dict[str, Any]:
     queries = state["plan_queries"]
     max_results = state["max_results"]
     per_query_results = max(2, (max_results + len(queries) - 1) // len(queries))
-    candidates, tool_calls = _candidate_dicts(queries, per_query_results)
+    candidates, tool_calls = _candidate_dicts(
+        queries,
+        per_query_results,
+        state.get("sources") or LEGACY_SOURCE_IDS,
+    )
     return {"raw_candidates": candidates, "tool_calls": tool_calls}
 
 
@@ -231,6 +253,7 @@ def single_query_search(state: ResearchSearchState) -> dict[str, Any]:
     candidates, tool_calls = _candidate_dicts(
         [state["question"]],
         state["max_results"],
+        state.get("sources") or LEGACY_SOURCE_IDS,
     )
     return {"raw_candidates": candidates, "tool_calls": tool_calls}
 
@@ -621,11 +644,13 @@ def run_confirmed_research_search(
     model: str,
     status: str,
     error: str,
+    sources: list[str] | tuple[str, ...] = LEGACY_SOURCE_IDS,
 ) -> ResearchSearchResult:
     state = RESEARCH_SEARCH_GRAPH.invoke(
         {
             "question": question,
             "max_results": max_results,
+            "sources": list(sources),
             "confirmed": True,
             "plan_goal": goal,
             "plan_queries": queries,
