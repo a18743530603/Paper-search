@@ -1,8 +1,8 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.15.0`
+> 当前版本：`v0.17.1`
 >
-> 更新日期：`2026-08-24`
+> 更新日期：`2026-08-27`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -73,7 +73,9 @@ https://github.com/a18743530603/Paper-search.git
 - `research_tools.py`：以LangChain `StructuredTool`和白名单注册表封装论文元数据检索，统一校验输入并返回来源、状态、错误和耗时摘要。
 - `research_workflow.py`：后台恢复用户已确认的检查点线程，归档论文、同步候选论文ID，并逐节点把报告图状态同步到业务SQLite；旧任务保留A3兼容入口。
 - `research_report_service.py`：在用户冻结论文并点击生成后，按准备、证据检索和DeepSeek综合顺序生成跨论文报告；使用不可信JSON上下文边界，逐篇隔离异常，无证据或门禁失败时确定性拒答。
-- `research_conversation_service.py`：在报告完成后，使用当前追问、已有报告和所选论文新召回证据生成带引用回答；当前是最小上下文骨架，不注入全部历史消息，也不实现长期记忆。
+- `research_conversation_service.py`：在报告完成后，先更新Task Memory，再使用当前追问、active Memory、滚动摘要、最近10条有效followup消息、已有报告和新召回证据生成带引用回答；摘要和Memory提取非流式，网页回答真实流式，旧Worker任务保留为无JavaScript回退。
+- `followup_context.py`：Unified Follow-up ContextBuilder纯装配层；接收上游已准备的Memory、Summary、Recent、Question、Report、Evidence和Access Limitations，输出稳定`research-followup-context-v4`，不查库、不检索、不调用模型或修改输入。
+- `task_memory_service.py`：使用DeepSeek严格JSON从当前User消息提取任务内持久偏好、要求、研究重点和决定；LLM只提出操作，代码校验临时性、论文事实、分类、长度、任务归属和幂等后再事务写库。
 - `db.py`：初始化和操作 SQLite，保存论文与研究任务、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
 - `pdf_service.py`：生产解析默认路由到MinerU云端；只有评测显式传入策略时才使用历史`pypdf`分块链路，以保留固定边界、章节感知和多粒度实验的可复现性。
@@ -152,10 +154,19 @@ GET  /evaluation/runs/{run_id}
   -> 存在证据时DeepSeek生成带引用报告；全部无证据时代码直接拒答
   -> validate_report_citations节点零Token校验标题/页码引用
   -> 图停在report_regeneration interrupt，允许同线程重新生成
-  -> 报告完成后用户继续POST /research-tasks/{task_id}/message
-  -> 同一事务写入用户消息、pending助手消息和research_followup任务
-  -> Worker按所选论文重新召回证据，并结合当前报告调用DeepSeek
-  -> research_messages保存回答、证据、模型或失败原因，页面轮询后刷新
+  -> 报告完成后用户在同一页面继续提问
+  -> JavaScript调用POST /research-tasks/{task_id}/chat
+  -> 短事务写入用户消息和pending助手消息，不修改已有报告
+  -> 当前User消息先由Task Memory Extractor提出ADD/UPDATE/REMOVE或NOOP
+  -> 代码校验后事务更新当前任务active Memory；失败保留旧Memory并继续
+  -> Web流式链路按所选论文重新召回证据，并结合当前报告调用DeepSeek
+  -> 读取同任务conversation_summary和最近10条有效原文
+  -> 仅把刚退出窗口且未被summary_up_to_message_id覆盖的旧消息非流式合并进摘要
+  -> 摘要失败记录错误并继续使用旧摘要；摘要和历史都不能替代Evidence
+  -> research-followup-context-v4按Memory、Summary、Recent、Current、Report、Evidence组织
+  -> 浏览器消费status/delta/done/error事件并增量更新同一助手消息
+  -> 完成时research_messages保存完整回答、证据和模型；刷新后由服务端历史恢复
+  -> 无JavaScript时旧/message入口仍可创建research_followup持久任务交给Worker
   -> 可下载论文继续显示用户触发的下载按钮
   -> 用户点击 POST /papers/{paper_id}/download
   -> main.py在同一SQLite事务中抢占论文状态并写入background_jobs
@@ -190,6 +201,8 @@ downloads/exports/
 .pytest_cache/
 __pycache__/
 ```
+
+本机Eval存储约定：新增的冻结案例、临时数据库、模型原始输出和不准备提交Git的评测脚本统一放在`E:\PaperHunterData\smolagent-tests\`。仓库中的`tests/`、`benchmarks/`、`outputs/`及历史held-out运行目录通过Junction保持Git和旧代码路径兼容，但实际文件不得重复保存在C盘；未来Eval默认也使用该E盘根目录。Git跟踪的项目脚本继续保留在仓库，因为部分脚本会按自身路径推导项目根目录。
 
 ## 常用命令
 
@@ -890,13 +903,75 @@ git push
 - P4新回归的Unsupported Claim、Cross-paper Attribution Error、Unsupported Generalization、Invalid Numerical Comparison和Citation Error均为0；冲突、部分证据和Injection分别通过`1/1、1/1、2/2`。报告没有Markdown标题、表格、代码块、空章节或机械固定四段，当前Prompt可以保留。
 - `scripts/evaluate_research_report_p4.py`现按新中文引用和纯文本契约检查；冻结案例事实预期未改变，新原始输出为Git忽略的`outputs/research_report_p4_results_plaintext.json`。不得再用旧`[A, p.3]`解析器误判新结果。
 
+## v0.16.0 报告后实时Follow-up Chat
+
+- 本版只改造研究报告完成后的第三阶段追问，不修改Planner、搜索、论文选择、下载、MinerU解析、Evidence Retrieval核心策略、`pack_research_context()`、LangGraph检查点或报告内容。
+- 新增`db.create_research_followup_messages()`：在一个`BEGIN IMMEDIATE`短事务中校验任务、报告与活动追问，先保存User消息和`pending` Assistant消息；实时链路不创建后台任务，也不更新`research_reports`。
+- 新增`model_service.stream_deepseek()`：向生产DeepSeek `/chat/completions`发送`stream=true`，解析SSE数据并只转发`delta.content`；禁止先生成完整答案再人工切片。
+- `research_conversation_service.prepare_research_followup_context()`复用原“当前问题 + 已有报告 + 所选论文新召回证据 + Access Limitations”上下文；`stream_research_followup()`发送`retrieving/generating/streaming/completed`状态及`delta/done/error`事件。
+- 新增`POST /research-tasks/{task_id}/chat`和`research_followup_chat.js`。前端使用`fetch POST + ReadableStream`消费SSE风格响应，立即追加User消息，只更新一个Assistant气泡，不调用`window.location.reload()`。
+- 成功时将完整Assistant回答、证据和实际模型保存为`completed`；中途失败或客户端断开时保存`failed`及已有部分内容，不能把半截回答标记为成功。手动刷新后服务端继续从`research_messages`恢复历史。
+- 旧`POST /message -> enqueue_research_followup_job() -> Worker`链路保留为无JavaScript回退，因此B1可靠队列能力没有被删除；网页正常启用JavaScript时使用实时链路。
+- 自动化覆盖真实API流解析、前端无刷新契约、成功持久化、失败状态和报告不变；完整离线测试`237 passed`。真实浏览器连续两次追问确认同URL、即时User消息、loading、正文逐段增长、完成后继续发送、刷新恢复和报告不变全部通过。
+- 当前仍不包含完整历史注入、对话摘要、长期记忆、跨任务用户画像、向量消息检索、WebSocket、复杂断线续传或报告自动更新。
+
+## v0.17.0 Recent Messages多轮追问
+
+- 新增`db.list_recent_research_conversation_messages()`：只查询指定`task_id`下`phase='followup'`、`role in (user, assistant)`且`status='completed'`的最近10条消息，先倒序截取窗口，再按`created_at/id`升序返回。
+- 实时入口把同事务创建的`user_message_id`和`assistant message_id`传给Service；历史查询明确排除这两个ID，因此当前问题只出现在`followup_question`一次，pending Assistant不会进入历史。
+- 无JavaScript Worker回退的队列payload同步保存`user_message_id`，确保两条路径使用同一排除规则；旧payload缺少该字段时仍以0兼容，不影响任务执行。
+- `prepare_research_followup_context()`新增`conversation_history`，`build_research_followup_prompt()`把它序列化进不可信JSON，不写入System Prompt。
+- 历史消息只用于解析“它、刚才那篇、第二种方法”等上下文指代；历史Assistant陈述不被视为论文证据，事实回答仍必须由本轮Evidence或报告支持。
+- Hybrid Retrieval、Evidence Top-K、`pack_research_context()`、报告生成、引用校验、DeepSeek真Streaming和前端ReadableStream均未修改；普通追问仍不更新Report。
+- 新增5项冻结行为测试，覆盖前一轮注入且当前问题不重复、pending排除、failed Assistant排除、任务隔离及最近10条时间顺序。
+
+## v0.17.0 Conversation Summary滚动摘要
+
+- `research_tasks`新增`conversation_summary`、`summary_up_to_message_id`、`conversation_summary_error`和`conversation_summary_updated_at`，由`init_db()`为旧SQLite增量补列；原始消息继续完整保存在`research_messages`。
+- `db.list_research_conversation_context_messages()`同时返回最近10条有效原文和“游标之后、最近窗口之前”的待摘要消息；pending/failed Assistant、本轮消息及其他任务消息均被排除。
+- `prepare_research_conversation_context()`把旧摘要与本次退出窗口的消息交给`ask_deepseek()`非流式合并，并通过预期旧游标CAS推进覆盖边界；已经覆盖的ID不会再次进入模型。
+- Summary Prompt只保留主题、明确结论、用户关注、比较关系、未决问题和指代实体，不得补充新事实，也不承担语言或范围等硬约束。
+- 摘要模型失败或返回空白时记录错误、保留旧摘要并继续当前Follow-up；摘要和近期历史仍是不可信数据而非Evidence。
+- 新增9项摘要测试，原Streaming和Report不变契约继续通过。
+
+## v0.17.0 Task Memory任务内持久要求
+
+- 新增`research_task_memories`，字段包含`research_task_id/category/content/status/created_from_message_id/updated_from_message_id/created_at/updated_at`；`research_tasks`补充`task_memory_error/task_memory_updated_at`。
+- Category固定为`preference/persistent_instruction/task_focus/task_decision`，内容保持自然语言；当前只读active项，取消后标记removed，完整历史仍由Raw Messages承担。
+- `TASK_MEMORY_EXTRACTOR_SYSTEM_PROMPT`输入只包含当前任务active Memory、最近4条有效消息和当前User Message；使用`ask_deepseek_json()`的temperature 0、thinking disabled与JSON Object模式。
+- 操作契约为ADD/UPDATE/REMOVE或空数组NOOP。Validator拒绝非法字段、过长内容、论文事实和数字、非active ID、跨任务ID及一次性要求；DB在`BEGIN IMMEDIATE`事务内再次校验来源消息和任务归属。
+- 当前User消息先更新Memory，再构造`research-followup-context-v4`；优先级为System > Current Explicit User Intent > Task Memory > Summary/Recent。Memory、Summary和Recent都不是Evidence。
+- Extractor/API/JSON/Validator/DB失败时记录错误并返回旧active Memory，当前DeepSeek Streaming继续；Evidence Retrieval、Citation与Research Report均不改变。
+- 新增17个测试实例，完整离线回归`268 passed`。真实浏览器验收验证持久语言偏好、UPDATE立即生效、一次性覆盖不持久、下一轮恢复和Report不变。
+- `_looks_like_paper_fact()`不再用“分析/研究/作为基线”等宽泛词豁免已命中的论文事实句；明确论文事实会被Validator拒绝，合法“比较各论文数据集”`task_focus`和“以Paper B为基线”`task_decision`仍可写入。
+- 2026-08-26定向验证：新增4个边界测试全部通过；真实DeepSeek共12次调用，论文事实、合法focus、合法decision各`3/3`，Recent越权仅`1/3`正确。生产链路因Current Message无持久性标记而在调用Extractor前NOOP，但Prompt单独稳定性仍是待修项。
+- 最终混合来源测试：Recent为“以后都用英文回答”、Current为“接下来重点比较各论文使用的数据集”时，三次均同时ADD英文`persistent_instruction`和当前`task_focus`，严格结果`0/3`；Validator没有来源校验并全部接受。该场景会绕过普通问题前置NOOP，因此Task Memory v1尚不能封版，下一步应解决操作必须由Current Message触发的可验证来源约束。
+- 当前边界：没有跨任务User Memory、长期用户画像、向量Memory、TTL、Semantic Dedup、Memory UI或Report Update。
+
+## v0.17.0 Unified Follow-up ContextBuilder
+
+- 新增`followup_context.build_followup_context()`纯装配组件，统一输出`research-followup-context-v4`；字段顺序固定为分类信息、Task Memory、Summary、Recent、Current Question、Existing Report、Evidence和Access Limitations。
+- 原`build_research_followup_prompt()`保留兼容签名，只委托ContextBuilder并序列化JSON；实时与Worker两条Follow-up路径无需改调用方式。
+- Builder不接收`task_id`，不查询数据库、不执行Retrieval、不更新Memory/Summary/Report、不调用DeepSeek或Citation Validation；上游已有结果只消费一次。
+- 当前User问题会从Recent中的同内容User消息去重，pending/failed消息被防御性过滤；各来源保持独立字段，Evidence仍是论文事实主要依据。
+- 新增15项专项测试，覆盖完整/空值装配、问题去重、状态过滤、任务隔离、字段边界、元数据、单次消费、兼容入口、Streaming和输入不变；完整离线回归`287 passed`。
+
+## v0.17.1 Context / Memory Eval v1
+
+- 在`E:\PaperHunterData\smolagent-tests\benchmarks\context_memory_eval_v1_cases.json`冻结29个场景；E盘本地脚本`scripts\evaluate_context_memory_v1.py`复用当前生产Prompt、ContextBuilder、Validator和DeepSeek模型，不进入生产请求链路，也不上传Git。
+- 真实DeepSeek调用56次，严格场景`26/29`、单次运行`37/43`。目标能力：Recent指代`5/5`、Summary`4/4`、Memory持续`2/2`、临时覆盖`2/2`、Evidence Grounding`8/8`、Task隔离`1/1`、恢复`1/1`、Injection`3/3`。
+- 8组消融中With Context=`8/8`、Without Context=`2/8`，目标能力净提高75个百分点；不得把该小规模结果描述成所有真实对话上的统计保证。
+- Task Memory混合输入来源隔离仍为`0/3`：Recent英文要求被错误复制为新Memory，Validator无法证明操作由Current Message触发。该问题同时属于Prompt遵守不足和代码来源校验缺口，v1暂不封版。
+- 英文回答引用格式有3/33次使用`[Paper A, p.4]`或半角逗号，Citation Contract=`90.91%`；Memory本身仍正确执行，报告必须分开描述能力与格式。
+- 生成结果位于`E:\PaperHunterData\smolagent-tests\outputs\context_memory_eval_v1_2026-08-27.{json,md}`。全部benchmark案例、历史未提交测评资产和pytest缓存均已迁至E盘，仓库原路径仅通过Junction保持兼容；未来Eval也必须使用该E盘根目录。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为`v0.15.0`：A1-A7与B1保持完成；生产PDF解析默认使用MinerU云端结构化结果，首页可明确选择论文来源，任务级多query共用一次论文搜索MCP Session，真实0.1.4返回结构已兼容，完整离线测试`233 passed`。高级会话压缩和长期记忆尚未开始。
+- 当前版本为`v0.17.1`：A1-A7与B1保持完成；报告后追问支持真实流式响应、最近10条原文、滚动摘要、任务级Task Memory和统一ContextBuilder。Context / Memory真实评测已完成，Task Memory因Recent来源越权暂未封版；跨任务长期用户画像、向量记忆和动态Token窗口尚未开始。
 - `pdf_service.parse_paper_pdf()`不传策略时使用MinerU；`extract_pdf_chunks()`及`chunk_size/overlap`只属于显式受控实验路径。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。

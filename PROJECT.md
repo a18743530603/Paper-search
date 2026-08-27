@@ -1,14 +1,20 @@
 # Paper Hunter 项目概述
 
-> 当前版本：`v0.15.0`
+> 当前版本：`v0.17.1`
 >
-> 更新日期：`2026-08-24`
+> 更新日期：`2026-08-27`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
 > 技术栈、架构和完整流程：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
 Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下载助手。用户输入关键词或论文标题后，可以从后端白名单提供的21个论文来源中多选，系统会通过统一论文搜索MCP检索任务所选来源，保存论文元数据、来源链接、出版商和下载状态，并在用户授权后由后台Worker下载明确可免费获取的 PDF。
+
+`v0.17.1`新增29场景Context / Memory真实评测与8场景消融。56次DeepSeek调用得到严格`26/29`、With Context `8/8`、Without Context `2/8`；未发现Evidence污染、跨任务污染或重启恢复问题。Task Memory仍会在混合输入中把Recent持久要求误当作Current来源，Validator也无法证明操作来源；英文回答另有3次引用格式波动。因此当前只归档评测与失败模式，不修改生产Prompt或架构。
+
+`v0.17.0`完成Recent Messages、Conversation Summary、Task Memory和Unified Follow-up ContextBuilder：最近10条有效消息保留原文，更早历史滚动压缩；任务内持久要求独立保存。`followup_context.py`只接收上游已准备数据并装配稳定v4不可信JSON，不查库、不检索、不调用模型，也不改变Streaming、Evidence、Citation或Report。Task Memory仍有Recent来源越权已知问题，暂不封版；完整离线测试`287 passed`。
+
+`v0.16.0`只改造报告完成后的Follow-up Chat：新增`POST /research-tasks/{task_id}/chat`流式接口，前端使用Fetch读取SSE事件并持续更新同一助手气泡；`stream_deepseek()`直接消费DeepSeek流式API，完成后将完整回答、证据和模型保存到`research_messages`。已有研究报告保持只读，旧`research_followup` Worker路径作为无JavaScript回退保留。完整离线测试`237 passed`，并完成真实浏览器连续追问与刷新恢复验收。
 
 `2026-08-24`多来源搜索MCP接入已完成四步：`research_tasks.sources_json`保存canonical来源配置，Checkpoint携带执行副本，Worker恢复前以任务表校准；同一任务的全部Planner queries共用一次stdio MCP Session。首页由后端白名单渲染来源多选，默认全部选中，支持全选、清空和零来源双层拦截。Planner Prompt、`PaperCandidate`、去重、下载和报告链路保持不变。完整离线测试`224 passed`。
 
@@ -45,7 +51,7 @@ Paper Hunter 是一个适合简历展示的学术文献检索与开放获取下�
 - 使用LangChain `StructuredTool`封装论文检索，白名单注册表限制可执行能力；`research_tool_calls`记录参数、来源结果、状态、错误和耗时，支持页面与API审计。
 - 论文选择后由用户显式启动跨论文报告：标准工具复用现有准备与RAG服务，逐篇返回物理页码证据；受限论文只保留合法链接，单篇失败不影响其余论文。
 - 使用`research_reports`保存报告状态、证据、访问限制、模型和错误；只有存在全文证据时才调用DeepSeek，全部无证据时确定性拒答。
-- 报告完成后可提交`research_followup`持久任务：按冻结论文重新召回页码证据并结合当前报告回答；当前不注入完整历史，也不宣称长期记忆。
+- 报告完成后可实时追问：按冻结论文重新召回页码证据，统一ContextBuilder把当前报告、Task Memory、任务滚动摘要、最近10条有效消息、当前问题、证据和访问限制装配为结构化JSON；这些状态可持久恢复，但不跨任务共享。
 - A4将报告确认、逐篇准备、逐篇证据检索、生成和引用检查纳入同一LangGraph线程；每篇论文形成检查点，重启或模型失败后从未完成节点继续。
 - A5-0/A5-1新增多论文Context Packer：保留原始证据，按6000估算Token预算和每篇最多2条的公平配额选择模型上下文，并持久化压缩率、论文覆盖和删除原因。
 - A5-2在公平分配前执行同论文保守去重：规范化精确重复直接合并，同页或相邻页且5-token shingle覆盖率不低于`0.85`的高重叠证据合并；跨论文内容始终保留，删除记录可审计。

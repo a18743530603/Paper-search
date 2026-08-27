@@ -1,8 +1,8 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.15.0`
+> 当前版本：`v0.17.1`
 >
-> 更新日期：`2026-08-24`
+> 更新日期：`2026-08-27`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -11,6 +11,12 @@
 > 项目全景：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，可以在首页从统一白名单提供的21个论文来源中多选，系统再通过统一论文搜索MCP检索相关论文并保存网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+
+`v0.17.1`完成Context / Memory Eval v1：冻结29个Recent、Summary、Task Memory、Evidence隔离、任务隔离、重启恢复和Prompt Injection场景，真实调用`deepseek-v4-pro` 56次。严格场景通过`26/29`；8组对照中With Context为`8/8`，Without Context为`2/8`。Evidence Grounding、指代、Summary、持续偏好、临时覆盖、任务隔离和恢复目标均为100%，但Task Memory混合输入的Recent来源隔离连续`0/3`，英文回答引用契约为`30/33`，因此Context组合可展示但Memory v1暂不封版。该轮案例、脚本、临时数据库和原始结果统一保存在`E:\PaperHunterData\smolagent-tests\`且不进入Git。
+
+`v0.17.0`完成任务内多轮上下文工程：最近10条有效消息保留原文，更早历史由DeepSeek滚动摘要；Task Memory独立保存后续仍应持续生效的任务内要求。新增纯装配`followup_context.build_followup_context()`，把上游已经准备好的Memory、Summary、Recent、Current Question、Report、Evidence和Access Limitations稳定组织为`research-followup-context-v4`，不重复查询数据库、检索证据或调用模型。当前已知Recent来源越权仍使Task Memory暂不封版；本版不实现跨任务长期用户画像或向量记忆，完整离线测试`287 passed`。
+
+`v0.16.0`把报告生成后的追问升级为同页实时流式对话。浏览器提交追问后立即追加用户消息和助手占位消息，后端重新召回已选论文证据并通过DeepSeek真实流式API逐段返回；完成后一次性保存完整回答、证据和模型信息，刷新页面仍可恢复。原跨论文报告不会被追问覆盖，旧持久Worker追问入口继续作为无JavaScript回退。本版不增加历史摘要、长期记忆或跨任务用户画像，完整离线测试`237 passed`。
 
 `2026-08-24`已完成多来源搜索MCP的四步接入：首页来源多选由后端白名单渲染，默认全部勾选并支持全选、清空和零来源提交拦截；任务来源列表保存于`research_tasks.sources_json`，LangGraph Checkpoint携带执行副本，Worker恢复时以任务表为准；同一任务的2至4条Planner queries共用一次stdio MCP Session。搜索层只调用第三方`search_papers`，没有调用其下载Tool，也没有修改现有`PaperCandidate`、下载与报告流程。完整离线测试`224 passed`。
 
@@ -91,7 +97,7 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 - 通过网页输入关键词或论文标题。
 - 首页只有一个研究工作台入口；输入主题、论文标题或问题后，LangGraph生成可调整的检索计划，经用户确认才执行搜索。
 - 在计划确认前可通过同一对话区补充范围并重新规划；选择论文后，报告问题与最初搜索主题分开保存。
-- 报告完成后可继续提问，Worker会根据所选论文重新召回页码证据，并结合当前报告调用DeepSeek回答。
+- 报告完成后可继续提问：网页主链路重新召回所选论文页码证据，并结合任务滚动摘要、最近10条消息和当前报告调用DeepSeek真实流式回答；Worker保留为无JavaScript回退。
 - 多路检索完成后由用户从候选结果中选择最多5篇论文，冻结后续解析和跨论文研究的输入范围。
 - 使用LangGraph原生SQLite Checkpointer保存图状态；两个审批点均由`interrupt()`暂停并通过`Command(resume=...)`恢复。
 - 用户确认论文集合后可显式启动跨论文报告；系统复用下载、解析、索引和RAG检索服务，输出带论文标题与物理页码的证据报告。
@@ -206,11 +212,11 @@ JSON与文本报告保存到`outputs/agent_evaluation/`。该目录由`.gitignor
 2. 在任务页补充研究范围可更新计划；只有点击确认后才执行arXiv/Crossref检索。
 3. 从本次任务的候选论文中选择1至5篇，冻结后续报告与追问的论文范围。
 4. 在对话区单独输入报告要回答的问题，再点击“生成研究报告”。Worker准备全文、检索页码证据并生成报告。
-5. 报告完成后继续在同一对话区提问；追问会持久入队，完成后自动刷新答案。
+5. 报告完成后继续在同一对话区提问；支持同页实时流式显示，完成后答案持久保存，刷新页面仍可恢复。
 
 候选论文仍可从历史页进入单篇详情。对明确可下载的论文点击“准备问答”后，Worker会按`download -> parse -> index`处理，页面每2秒刷新状态；进入`ready`后也可使用原有单篇RAG问答。
 
-当前会话边界：页面会保存和展示全部消息，但报告后追问暂时只把“当前问题 + 已完成报告 + 本次重新召回的证据”发送给模型，不会自动压缩全部聊天历史，也没有跨任务长期记忆。
+当前会话边界：页面保存并展示全部原始消息；上游先分别准备Active Memory、滚动摘要、最近10条有效消息、当前问题、报告、证据和访问限制，再由统一ContextBuilder一次性装配成不可信JSON交给模型。优先级为System规则、当前明确要求、Task Memory、Summary/Recent；论文事实优先级为Evidence、Existing Report、Conversation Context。当前没有动态Token窗口、跨任务用户画像、向量记忆或Memory UI。
 
 下载状态说明：
 

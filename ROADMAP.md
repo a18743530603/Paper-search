@@ -1,10 +1,10 @@
 # Paper Hunter 后续开发路线与实施日志
 
-> 当前项目版本：`v0.15.0`
+> 当前项目版本：`v0.17.1`
 >
 > 日志建立日期：`2026-08-16`
 >
-> 当前阶段：`B1可靠Worker阶段已完成，下一阶段待确认`
+> 当前阶段：`v0.17.1 Context / Memory Eval v1已完成，Task Memory来源校验待最小修复`
 
 本文件用于在后续 Codex 对话之间同步开发路线和实际进度。它记录“接下来为什么做、做到哪里、验证结果和下一步”，功能细节仍写入 `README.md`、`PROJECT.md`、`CHANGELOG.md` 和 `AGENTS.md`，实验数据仍写入 `EXPERIMENTS.md`。
 
@@ -647,3 +647,58 @@ MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒�
 - 指标：Unsupported Claim Cases=`0`、Cross-paper Attribution Error=`0`、Unsupported Generalization=`0`、Invalid Numerical Comparison=`0`、Citation Error Cases=`0`、Conflict Handling=`1/1`、Partial Evidence Handling=`1/1`、Prompt Injection=`2/2`。
 - 15份报告均未出现`# / ## / ###`标题、Markdown表格、代码块、空章节或机械补齐的固定四部分；多篇共同引用经人工核对，每个引用项均真实支持其相邻事实。
 - 结论：取消固定四段结构没有造成内容能力回归，当前P4 Prompt可以正式保留；后续修改必须继续复用同一冻结集，避免只优化格式却破坏证据边界。
+
+### 2026-08-25：v0.16.0报告后Realtime Chat v1
+
+- 范围严格限制为报告完成后的Follow-up Chat；Planner、搜索、论文选择、下载、解析、检索核心、上下文打包、引用校验、LangGraph前半段和Checkpoint均未修改。
+- 新增`stream_deepseek()`真实消费DeepSeek的`stream=true`响应；`prepare_research_followup_context()`从旧回答函数中提取并复用原证据准备逻辑，没有改变Evidence Context策略。
+- 新增`POST /research-tasks/{task_id}/chat`，先通过数据库短事务创建User与pending Assistant消息，再以`status/delta/done/error`事件持续响应。成功后保存完整回答、证据和模型，失败或断开保存明确失败状态。
+- 新增`research_followup_chat.js`，采用`fetch POST + ReadableStream`更新同一个助手气泡；不刷新页面，完成后立即恢复输入，手动刷新由SQLite历史恢复消息。
+- 普通追问不会修改已有报告。旧`research_followup`持久Worker链路继续作为无JavaScript回退，本版没有引入WebSocket、摘要、近期消息注入或长期记忆。
+- 完整离线回归`237 passed`，Python编译与JavaScript语法检查通过。真实浏览器在任务`#9`连续发送两次追问，观察到`retrieving -> generating -> streaming -> completed`、内容多次增长、URL不变、完成后可继续发送、刷新前后消息数一致且报告内容不变。
+- 后续独立问题：DeepSeek开启深度思考时，首个正文delta前可能停留在`generating`数秒至数十秒；这是真实模型推理等待，不是假流式。本版不改变模型配置或展示隐藏思考内容。
+
+### 2026-08-26：v0.17.0 Recent Messages v1
+
+- 固定窗口定义为当前研究任务最近10条`phase=followup/status=completed/role=user或assistant`消息，先截取最新记录再按`created_at/id`升序交给模型。
+- `create_research_followup_messages()`原User与pending Assistant同事务设计保持不变；实时路由显式传递两个消息ID，DB窗口查询排除本轮，当前问题只在`followup_question`出现一次。
+- Worker回退payload同步记录`user_message_id`，与实时路径复用同一Service规则；pending、retrieving、generating、streaming、retry_wait和failed Assistant均不进入历史窗口。
+- `conversation_history`进入原有不可信JSON，不进入System Prompt；历史只帮助指代消解，不作为论文证据。
+- Evidence Retrieval、`pack_research_context()`、Citation Validation、Report、`stream=true`和前端ReadableStream均未修改。
+- 新增5项定向测试，连同原实时流式、持久化和报告不变测试全部通过。
+
+### 2026-08-26：v0.17.0 Conversation Summary v1
+
+- 保持最近10条有效消息原文窗口，将刚退出窗口且尚未覆盖的旧消息与旧摘要交给DeepSeek非流式滚动合并；不重复处理整个历史。
+- `research_tasks`持久化摘要、覆盖游标、错误和更新时间，原始`research_messages`不删除；重启后从原游标继续。
+- 摘要更新使用预期旧游标的CAS写入，避免并发覆盖；模型返回空白或调用失败时保留旧摘要、记录错误并继续Follow-up Streaming。
+- Follow-up Context升级为不可信`research-followup-context-v3`，摘要和近期消息只提供对话语境，事实仍必须由报告或本轮Evidence支持。
+- 新增9项摘要专项测试，原Streaming与Report不变契约继续通过；完整离线回归`251 passed`。
+- 下一阶段可设计Active Constraints，把语言、范围、输出形式等硬约束从非权威摘要中独立提取；当前没有跨任务长期记忆。
+
+### 2026-08-26：v0.17.0 Task Memory v1
+
+- 新建任务级Memory表和四个粗粒度Category；完整Raw Messages继续保留，Memory只表示当前active状态，取消项标记removed。
+- Memory Extractor仅接收当前active Memory、最近4条有效消息和当前User Message，不接收Report、Evidence、Summary或完整历史；DeepSeek固定JSON、temperature 0、thinking disabled。
+- LLM只提出ADD/UPDATE/REMOVE，Validator与DB事务负责字段、长度、事实过滤、任务归属、active状态和幂等；普通问题与一次性要求快速NOOP。
+- 当前消息先更新Memory再构造`research-followup-context-v4`，语言和格式优先级为System > 当前明确要求 > Task Memory > Summary/Recent。
+- Memory失败不阻断Streaming，不改变Evidence、Citation或Report；17个新增测试实例使完整回归达到`268 passed`。
+- 真实浏览器验收发现并修复旧System Prompt强制中文冲突，最终验证英文持久偏好、中文UPDATE、一次性英文覆盖及下一轮恢复中文全部通过。
+- 收紧论文事实Validator：删除命中论文事实后基于宽泛任务词的豁免，定向离线边界测试`4 passed`；12次真实Extractor调用中论文事实、合法focus和合法decision各`3/3`，Recent来源越权仍有`2/3`错误原始输出，生产前置过滤可确定性跳过该普通问题。
+- 混合来源封版测试`0/3`：当Current含合法持久focus而必须调用Extractor时，模型三次都把Recent英文要求与当前focus一起输出，Validator也全部接受；这不是前置过滤可覆盖的场景，Task Memory v1暂不封版。
+- 当前明确不包含跨任务User Memory、向量记忆、TTL、Semantic Dedup、Memory UI或Report Update。
+
+### 2026-08-26：v0.17.0 Unified Follow-up ContextBuilder v1
+
+- 新增`followup_context.py`纯装配层，统一接收上游已经准备好的Memory、Summary、Recent、Current Question、Report、Evidence和Access Limitations，输出稳定v4不可信JSON。
+- 原Prompt入口保留兼容签名；Builder不接收task ID，不查库、不Retrieval、不调用DeepSeek，不更新四层Memory、Report或Citation状态。
+- 当前问题在结构中只出现一次，pending/failed Assistant被防御性过滤；各来源继续独立，事实优先级仍为Evidence > Existing Report > Conversation Context。
+- 新增15项专项测试并全部通过；完整离线回归`287 passed`。本阶段不实现Dynamic Token Budget、Context Ranking、Vector Memory或其他优化。
+
+### 2026-08-27：v0.17.1 Context / Memory Eval v1
+
+- 冻结29个场景并用当前`deepseek-v4-pro`、temperature 0完成56次真实调用；原始输入、最终Context、模型输出和判定保存到E盘`outputs/`。
+- 严格通过`26/29`；8场景With Context=`8/8`、Without Context=`2/8`，目标能力提高75个百分点。
+- Recent指代、Summary、Memory持续偏好、临时覆盖、Evidence隔离、Task隔离、重启恢复和Prompt Injection均达到本轮100%目标能力。
+- Task Memory混合输入Recent来源隔离连续`0/3`，Validator同样接受错误操作；英文引用契约为`30/33`。
+- 结论：ContextBuilder与四层上下文组合无需扩大重构；下一步只应先做Task Memory Current来源可验证的最小修复，再复用同一场景回归。Token Budget、向量记忆和跨任务Memory继续暂停。

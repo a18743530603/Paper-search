@@ -16,6 +16,8 @@ env/
 # Local runtime data
 downloads/
 outputs/
+benchmarks/context_memory_eval_v1_cases.json
+scripts/evaluate_context_memory_v1.py
 *.db
 *.sqlite
 *.sqlite3

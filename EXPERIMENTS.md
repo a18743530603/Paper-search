@@ -1,8 +1,8 @@
 # Paper Hunter 实验记录
 
-> 当前适用版本：`v0.8.3`
+> 当前适用版本：`v0.17.1`
 >
-> 更新日期：`2026-08-03`
+> 更新日期：`2026-08-27`
 
 本文件是项目的实验日志。`README.md` 负责使用说明，`CHANGELOG.md` 负责版本变化，本文专门记录每次实验为什么做、只改了什么、如何验证、结果是什么以及下一步是否继续。
 
@@ -1915,6 +1915,47 @@ M1缓存统计：布局命中`2452`、新增`1623`，论文索引命中`4`、重
 四条门槛必须同时满足，因此最终为`adopt_m1=false`。M1在开发集的Hit@3提升没有在新论文上复现，不能设为默认分块策略，也不能在简历中写成“稳定提升召回”。可以如实写成：建立冻结开发集/独立集、配对bootstrap和严格降级门禁，识别出候选策略的开发集过拟合，并保留完整可复现实验记录。
 
 `heldout_v2`从本轮结束起正式关闭。不得根据这40题修改M1块大小、RRF常数、候选池或查询后再次声称独立验证；普通解析默认继续使用`length_boundary`，M1代码只保留为实验选项。后续新策略需要新的预注册独立集、交叉验证或扩大后一次性冻结测试。版本收尾的完整离线测试为`78 passed`。
+
+## CM1：Context / Memory Eval v1
+
+> 实验日期：`2026-08-27`
+
+### 目标与边界
+
+本轮不开发新功能，只验证报告后Follow-up已经完成的Recent Messages、Conversation Summary、Task Memory、Evidence Isolation和Unified ContextBuilder组合是否真实有效。冻结29个固定场景，不访问真实论文或互联网，论文事实均来自构造的页码Evidence；生产Prompt、ContextBuilder、Streaming、Report和Memory写入逻辑没有修改。
+
+评测复用当前`CONVERSATION_SUMMARY_SYSTEM_PROMPT`、`TASK_MEMORY_EXTRACTOR_SYSTEM_PROMPT`、`RESEARCH_FOLLOWUP_SYSTEM_PROMPT`及`deepseek-v4-pro`，固定`temperature=0`。重复场景与Summary链路合计真实调用56次；每次保存原始输入、最终`research-followup-context-v4`、输出、Validator结果和PASS/FAIL。
+
+### 结果
+
+| 指标 | 结果 |
+| --- | ---: |
+| 场景严格通过 | `26/29`（89.66%） |
+| 单次运行通过 | `37/43`（86.05%） |
+| Reference Resolution | `5/5` |
+| Summary Recall | `4/4` |
+| Memory Persistence | `2/2` |
+| Temporary Override | `2/2` |
+| Memory Mutation | `3/4` |
+| Evidence Grounding | `8/8` |
+| Task Isolation | `1/1` |
+| Context Recovery | `1/1` |
+| Prompt Injection Isolation | `3/3` |
+| Citation Contract | `30/33`（90.91%） |
+
+8个依赖历史的消融场景按目标能力统计：With Context=`8/8`，Without Context=`2/8`，差值`+75`个百分点。两个无上下文仍通过的场景可直接从Evidence中的“第二种方法”或论文顺序推断，说明并非所有追问都需要会话上下文。
+
+### 失败模式
+
+1. Task Memory混合来源隔离`0/3`：Recent含“以后用英文”，Current只要求“接下来比较数据集”时，Extractor三次都输出英文`persistent_instruction + task_focus`两条操作，Validator也全部接受。Prompt已经声明只有Current可触发操作，但代码没有可验证来源。
+2. 英文回答的Memory持续与临时覆盖本身均正确，仍有3/33次引用写成`[Paper A, p.4]`或半角逗号，未满足中文`[论文标题，第N页]`契约。该问题按引用格式波动记录，不得误算为Memory能力失败。
+3. 旧错误值、错误方法和旧报告冲突均被模型明确否定并以当前Evidence纠正；评测器允许“引用旧错误并明确否定”的纠错表达，不把它误报为Evidence污染。
+
+### 结论
+
+Recent、Summary、Memory、Evidence和ContextBuilder的组合确实改善多轮Follow-up，且未发现跨任务污染、重启丢失或Conversation Memory覆盖Evidence。当前可以展示评测方法和上下文工程设计，但Task Memory v1暂不封版。下一步只修复Memory操作必须由Current Message触发的来源校验，并复用同一冻结场景定向回归；不进入Token Budget、Vector Memory或跨任务长期记忆。
+
+原始JSON/Markdown、运行SQLite、冻结案例和本地可复现脚本均保存在`E:\PaperHunterData\smolagent-tests\`，不进入Git。仓库中的`benchmarks/`只是指向E盘的目录联接，既有已跟踪基准仍可按原路径复现。
 
 ## 后续实验队列
 

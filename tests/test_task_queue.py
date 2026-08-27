@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -77,6 +78,24 @@ def _complete_research_report(task_id: int) -> None:
         content="Existing evidence-grounded report.",
         model="deepseek-test",
     )
+
+
+def _insert_followup_message(
+    task_id: int,
+    role: str,
+    content: str,
+    *,
+    status: str = "completed",
+) -> int:
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content, status)
+            VALUES (?, ?, 'followup', ?, ?)
+            """,
+            (task_id, role, content, status),
+        )
+    return int(cursor.lastrowid)
 
 
 def test_research_task_starts_with_conversation_and_separate_report_question(
@@ -531,8 +550,15 @@ def test_research_followup_enqueue_and_worker_complete_message(
     _complete_research_report(task_id)
     queued = db.enqueue_research_followup_job(task_id, "What evidence supports it?")
 
-    def fake_answer(message_id, question, *, raise_on_error=False):
+    def fake_answer(
+        message_id,
+        question,
+        *,
+        current_user_message_id=0,
+        raise_on_error=False,
+    ):
         assert question == "What evidence supports it?"
+        assert current_user_message_id == queued["user_message_id"]
         assert raise_on_error is True
         db.update_research_message(
             message_id,
@@ -591,6 +617,7 @@ def test_research_followup_without_evidence_completes_without_model(
     research_conversation_service.answer_research_followup(
         queued["message_id"],
         "Explain the missing result",
+        current_user_message_id=queued["user_message_id"],
         raise_on_error=True,
     )
     message = db.get_research_message(queued["message_id"])
@@ -598,6 +625,569 @@ def test_research_followup_without_evidence_completes_without_model(
     assert message["status"] == "completed"
     assert message["model"] == "deterministic-no-evidence"
     assert "不能可靠作答" in message["content"]
+
+
+def test_realtime_followup_stream_persists_complete_message_without_job(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    original_report = db.get_research_report(task_id)["content"]
+    created = db.create_research_followup_messages(task_id, "Compare the methods")
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "retrieve_report_paper_evidence",
+        lambda *_args, **_kwargs: {
+            "evidence": [
+                {
+                    "paper_id": paper_id,
+                    "paper_title": "Durable Queue Paper",
+                    "page_number": 2,
+                    "chunk_id": 7,
+                    "score": 0.9,
+                    "content": "The method uses evidence-grounded retrieval.",
+                }
+            ],
+            "access_limitation": None,
+        },
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "stream_deepseek",
+        lambda *_args, **_kwargs: iter(
+            ["From the evidence, ", "the method retrieves [Durable Queue Paper, p. 2]."]
+        ),
+    )
+
+    events = list(
+        research_conversation_service.stream_research_followup(
+            created["message_id"],
+            created["question"],
+            current_user_message_id=created["user_message_id"],
+        )
+    )
+    message = db.get_research_message(created["message_id"])
+    messages = db.list_research_messages(task_id)
+
+    assert [event for event, _payload in events] == [
+        "status",
+        "status",
+        "delta",
+        "delta",
+        "done",
+    ]
+    assert message["status"] == "completed"
+    assert [payload["content"] for event, payload in events if event == "delta"] == [
+        "From the evidence, ",
+        "the method retrieves [Durable Queue Paper, p. 2].",
+    ]
+    assert message["content"] == "From the evidence, the method retrieves [Durable Queue Paper，第2页]."
+    assert message["evidence"][0]["chunk_id"] == 7
+    assert messages[-2]["role"] == "user"
+    assert messages[-1]["role"] == "assistant"
+    assert db.list_background_jobs() == []
+    assert db.get_research_report(task_id)["content"] == original_report
+
+
+def test_realtime_followup_stream_failure_marks_message_failed(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    created = db.create_research_followup_messages(task_id, "Explain the result")
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "retrieve_report_paper_evidence",
+        lambda *_args, **_kwargs: {
+            "evidence": [
+                {
+                    "paper_id": paper_id,
+                    "paper_title": "Durable Queue Paper",
+                    "page_number": 3,
+                    "chunk_id": 8,
+                    "score": 0.8,
+                    "content": "The reported result is evidence grounded.",
+                }
+            ],
+            "access_limitation": None,
+        },
+    )
+
+    def failing_stream(*_args, **_kwargs):
+        yield "Partial answer"
+        raise RuntimeError("stream interrupted")
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "stream_deepseek",
+        failing_stream,
+    )
+
+    events = list(
+        research_conversation_service.stream_research_followup(
+            created["message_id"],
+            created["question"],
+            current_user_message_id=created["user_message_id"],
+        )
+    )
+    message = db.get_research_message(created["message_id"])
+
+    assert events[-1][0] == "error"
+    assert not any(event == "done" for event, _payload in events)
+    assert message["status"] == "failed"
+    assert message["content"] == "Partial answer"
+    assert "stream interrupted" in message["error"]
+
+
+def test_recent_messages_previous_turn_is_injected_without_current_duplicate(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    _insert_followup_message(task_id, "user", "Paper A 比 Paper B 好吗？")
+    _insert_followup_message(task_id, "assistant", "Paper A 更好。")
+    created = db.create_research_followup_messages(task_id, "那它为什么更好？")
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "retrieve_report_paper_evidence",
+        lambda *_args, **_kwargs: {
+            "evidence": [
+                {
+                    "paper_id": paper_id,
+                    "paper_title": "Durable Queue Paper",
+                    "page_number": 2,
+                    "chunk_id": 9,
+                    "score": 0.9,
+                    "content": "Paper A uses a more accurate retrieval method.",
+                }
+            ],
+            "access_limitation": None,
+        },
+    )
+    captured: list[dict] = []
+
+    def fake_stream(_system_prompt, user_prompt):
+        captured.append(json.loads(user_prompt.split("\n", 1)[1]))
+        yield "Because its retrieval method is more accurate."
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "stream_deepseek",
+        fake_stream,
+    )
+
+    events = list(
+        research_conversation_service.stream_research_followup(
+            created["message_id"],
+            created["question"],
+            current_user_message_id=created["user_message_id"],
+        )
+    )
+
+    assert captured[0]["schema_version"] == "research-followup-context-v4"
+    assert captured[0]["task_memory"] == []
+    assert captured[0]["conversation_summary"] == ""
+    assert [item["content"] for item in captured[0]["conversation_history"]] == [
+        "Paper A 比 Paper B 好吗？",
+        "Paper A 更好。",
+    ]
+    assert captured[0]["followup_question"] == "那它为什么更好？"
+    assert json.dumps(captured[0], ensure_ascii=False).count("那它为什么更好？") == 1
+    assert events[-1][0] == "done"
+
+
+def test_recent_messages_current_pending_is_not_injected(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    created = db.create_research_followup_messages(task_id, "Current question")
+
+    messages = db.list_recent_research_conversation_messages(
+        task_id,
+        exclude_message_ids=(
+            created["user_message_id"],
+            created["message_id"],
+        ),
+    )
+
+    assert messages == []
+
+
+def test_recent_messages_failed_assistant_is_not_injected(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    _insert_followup_message(task_id, "user", "Previous question")
+    _insert_followup_message(
+        task_id,
+        "assistant",
+        "Unreliable partial answer",
+        status="failed",
+    )
+
+    messages = db.list_recent_research_conversation_messages(task_id)
+
+    assert [item["content"] for item in messages] == ["Previous question"]
+
+
+def test_recent_messages_are_isolated_by_research_task(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_a = _create_selected_research_task(paper_id)
+    task_b = _create_selected_research_task(paper_id)
+    _insert_followup_message(task_a, "user", "Task A private context")
+    _insert_followup_message(task_b, "user", "Task B context")
+
+    messages = db.list_recent_research_conversation_messages(task_b)
+
+    assert [item["content"] for item in messages] == ["Task B context"]
+
+
+def test_recent_messages_window_keeps_latest_ten_in_chronological_order(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"message-{index:02d}")
+
+    messages = db.list_recent_research_conversation_messages(task_id, limit=10)
+
+    assert [item["content"] for item in messages] == [
+        f"message-{index:02d}" for index in range(2, 12)
+    ]
+
+
+def test_summary_01_short_history_no_summary(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    for index in range(10):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"short-{index:02d}")
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("short history must not call summary model")
+        ),
+    )
+
+    context = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+
+    assert context["conversation_summary"] == ""
+    assert context["summary_updated"] is False
+    assert [item["content"] for item in context["recent_messages"]] == [
+        f"short-{index:02d}" for index in range(10)
+    ]
+
+
+def test_summary_02_old_messages_are_summarized(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    message_ids = []
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        message_ids.append(
+            _insert_followup_message(task_id, role, f"history-{index:02d}")
+        )
+    captured = []
+
+    def fake_summary(_system_prompt, user_prompt):
+        captured.append(json.loads(user_prompt.split("\n", 1)[1]))
+        return "较早对话讨论了 history-00 和 history-01。", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+
+    context = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+    persisted = db.get_research_conversation_summary(task_id)
+
+    assert [item["content"] for item in captured[0]["messages_to_summarize"]] == [
+        "history-00",
+        "history-01",
+    ]
+    assert context["conversation_summary"].startswith("较早对话")
+    assert context["messages_summarized_count"] == 2
+    assert persisted["summary_up_to_message_id"] == message_ids[1]
+
+
+def test_summary_03_recent_messages_not_summarized_away(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    for index in range(13):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"window-{index:02d}")
+    captured = []
+
+    def fake_summary(_system_prompt, user_prompt):
+        captured.append(json.loads(user_prompt.split("\n", 1)[1]))
+        return "压缩了最早三条消息。", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+
+    context = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+
+    assert [item["content"] for item in captured[0]["messages_to_summarize"]] == [
+        f"window-{index:02d}" for index in range(3)
+    ]
+    assert [item["content"] for item in context["recent_messages"]] == [
+        f"window-{index:02d}" for index in range(3, 13)
+    ]
+
+
+def test_summary_04_no_duplicate_summary(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"turn-{index:02d}")
+    captured = []
+
+    def fake_summary(_system_prompt, user_prompt):
+        payload = json.loads(user_prompt.split("\n", 1)[1])
+        captured.append(payload)
+        return f"rolling-summary-{len(captured)}", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+    research_conversation_service.prepare_research_conversation_context(task_id)
+    _insert_followup_message(task_id, "user", "turn-12")
+    _insert_followup_message(task_id, "assistant", "turn-13")
+    research_conversation_service.prepare_research_conversation_context(task_id)
+
+    assert [item["content"] for item in captured[0]["messages_to_summarize"]] == [
+        "turn-00",
+        "turn-01",
+    ]
+    assert [item["content"] for item in captured[1]["messages_to_summarize"]] == [
+        "turn-02",
+        "turn-03",
+    ]
+
+
+def test_summary_05_summary_rolls_forward(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"rolling-{index:02d}")
+    captured = []
+
+    def fake_summary(_system_prompt, user_prompt):
+        payload = json.loads(user_prompt.split("\n", 1)[1])
+        captured.append(payload)
+        if len(captured) == 1:
+            return "第一版摘要", "deepseek-test"
+        return "第一版摘要，并加入后续比较。", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+    research_conversation_service.prepare_research_conversation_context(task_id)
+    _insert_followup_message(task_id, "user", "rolling-12")
+    _insert_followup_message(task_id, "assistant", "rolling-13")
+    context = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+
+    assert captured[1]["previous_summary"] == "第一版摘要"
+    assert context["conversation_summary"] == "第一版摘要，并加入后续比较。"
+
+
+def test_summary_06_task_isolation(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_a = _create_selected_research_task(paper_id)
+    task_b = _create_selected_research_task(paper_id)
+    for task_id, prefix in ((task_a, "A"), (task_b, "B")):
+        for index in range(12):
+            role = "user" if index % 2 == 0 else "assistant"
+            _insert_followup_message(task_id, role, f"{prefix}-{index:02d}")
+
+    def fake_summary(_system_prompt, user_prompt):
+        payload = json.loads(user_prompt.split("\n", 1)[1])
+        prefix = payload["messages_to_summarize"][0]["content"].split("-", 1)[0]
+        return f"Summary {prefix}", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+    context_a = research_conversation_service.prepare_research_conversation_context(
+        task_a
+    )
+    context_b = research_conversation_service.prepare_research_conversation_context(
+        task_b
+    )
+
+    assert context_a["conversation_summary"] == "Summary A"
+    assert context_b["conversation_summary"] == "Summary B"
+    assert db.get_research_conversation_summary(task_a)["conversation_summary"] != (
+        db.get_research_conversation_summary(task_b)["conversation_summary"]
+    )
+
+
+def test_summary_07_pending_failed_excluded(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    _insert_followup_message(task_id, "assistant", "pending-secret", status="pending")
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"valid-{index:02d}")
+    _insert_followup_message(task_id, "assistant", "failed-secret", status="failed")
+    captured = []
+
+    def fake_summary(_system_prompt, user_prompt):
+        captured.append(json.loads(user_prompt.split("\n", 1)[1]))
+        return "只包含有效消息。", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+    context = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+    serialized = json.dumps(captured[0], ensure_ascii=False) + json.dumps(
+        context["recent_messages"], ensure_ascii=False
+    )
+
+    assert "pending-secret" not in serialized
+    assert "failed-secret" not in serialized
+
+
+def test_summary_08_failure_does_not_break_streaming_chat(tmp_path, monkeypatch):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    db.start_research_report(task_id)
+    _complete_research_report(task_id)
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"failure-{index:02d}")
+    assert db.update_research_conversation_summary(
+        task_id,
+        "仍可使用的旧摘要",
+        0,
+        expected_previous_message_id=0,
+    )
+    created = db.create_research_followup_messages(task_id, "继续比较")
+    monkeypatch.setattr(
+        research_conversation_service,
+        "retrieve_report_paper_evidence",
+        lambda *_args, **_kwargs: {
+            "evidence": [
+                {
+                    "paper_id": paper_id,
+                    "paper_title": "Durable Queue Paper",
+                    "page_number": 2,
+                    "chunk_id": 10,
+                    "score": 0.9,
+                    "content": "The comparison is supported by evidence.",
+                }
+            ],
+            "access_limitation": None,
+        },
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("summary provider unavailable")
+        ),
+    )
+    captured = []
+
+    def fake_stream(_system_prompt, user_prompt):
+        captured.append(json.loads(user_prompt.split("\n", 1)[1]))
+        yield "Streaming still works."
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "stream_deepseek",
+        fake_stream,
+    )
+
+    events = list(
+        research_conversation_service.stream_research_followup(
+            created["message_id"],
+            created["question"],
+            current_user_message_id=created["user_message_id"],
+        )
+    )
+    summary_state = db.get_research_conversation_summary(task_id)
+
+    assert events[-1][0] == "done"
+    assert captured[0]["conversation_summary"] == "仍可使用的旧摘要"
+    assert "summary provider unavailable" in summary_state["conversation_summary_error"]
+
+
+def test_summary_09_restart_recovery_does_not_repeat_old_messages(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        _insert_followup_message(task_id, role, f"restart-{index:02d}")
+    calls = []
+
+    def fake_summary(_system_prompt, user_prompt):
+        calls.append(json.loads(user_prompt.split("\n", 1)[1]))
+        return "可持久恢复的摘要", "deepseek-test"
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "ask_deepseek",
+        fake_summary,
+    )
+    first = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+    persisted_before = db.get_research_conversation_summary(task_id)
+    second = research_conversation_service.prepare_research_conversation_context(
+        task_id
+    )
+    persisted_after = db.get_research_conversation_summary(task_id)
+
+    assert len(calls) == 1
+    assert first["conversation_summary"] == "可持久恢复的摘要"
+    assert second["conversation_summary"] == "可持久恢复的摘要"
+    assert persisted_after["summary_up_to_message_id"] == (
+        persisted_before["summary_up_to_message_id"]
+    )
 
 
 def test_download_enqueue_atomically_rejects_duplicate_requests(tmp_path, monkeypatch):

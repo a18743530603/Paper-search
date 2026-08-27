@@ -2256,6 +2256,25 @@ def test_research_task_page_renders_completed_report():
     assert "重复移除：精确 1 / 高重叠 0" in html
     assert "上下文门禁：passed" in html
     assert "估算Token：900 → 300" in html
+    assert 'data-followup-chat' in html
+    assert 'data-stream-url="/research-tasks/10/chat"' in html
+    assert "/static/research_followup_chat.js" in html
+
+
+def test_research_followup_chat_script_uses_post_stream_without_reload():
+    script = (
+        Path(__file__).parents[1]
+        / "my_agent_project"
+        / "static"
+        / "research_followup_chat.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'event.preventDefault()' in script
+    assert 'method: "POST"' in script
+    assert 'response.body.getReader()' in script
+    assert 'event === "delta"' in script
+    assert 'event === "done"' in script
+    assert "window.location.reload" not in script
 
 
 def test_build_origin_chart_tables_counts_key_fields():
@@ -3223,6 +3242,50 @@ def test_deepseek_request_uses_configured_api(monkeypatch):
     assert model == "deepseek-v4-pro"
     assert captured["url"].endswith("/chat/completions")
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer test-key"
+    assert captured["kwargs"]["json"]["messages"][1]["content"] == "question"
+
+
+def test_deepseek_stream_uses_api_streaming_and_yields_content(monkeypatch):
+    class FakeStreamResponse:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"reasoning_content":"分析"}}]}',
+                    'data: {"choices":[{"delta":{"content":"从当前"}}]}',
+                    'data: {"choices":[{"delta":{"content":"证据来看"}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+    captured = {}
+
+    def fake_stream(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return FakeStreamResponse()
+
+    monkeypatch.setattr(model_service, "DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(model_service, "DEEPSEEK_MODEL", "deepseek-v4-pro")
+    monkeypatch.setattr(model_service.httpx, "stream", fake_stream)
+
+    deltas = list(model_service.stream_deepseek("system", "question"))
+
+    assert deltas == ["从当前", "证据来看"]
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["kwargs"]["json"]["stream"] is True
     assert captured["kwargs"]["json"]["messages"][1]["content"] == "question"
 
 

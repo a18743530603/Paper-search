@@ -1,8 +1,8 @@
 # Paper Hunter 项目全景说明
 
-> 项目版本：`v0.15.0`
+> 项目版本：`v0.17.1`
 >
-> 文档更新日期：`2026-08-24`
+> 文档更新日期：`2026-08-27`
 >
 > 项目定位：可演示、可评测、可恢复的论文检索与研究 Agent
 
@@ -11,6 +11,8 @@
 ## 一句话介绍
 
 Paper Hunter 是一个基于 FastAPI、LangGraph、DeepSeek 和混合检索的论文研究助手。它通过统一论文搜索MCP检索元数据，首页允许从后端白名单提供的21个来源中多选并默认全部选中；在用户授权后下载开放获取 PDF，完成解析、索引和带页码证据的问答，也可以通过带人工审批的 Agent 工作流生成跨论文研究报告。
+
+`v0.17.1`建立独立Context / Memory评测层：冻结29个场景，复用生产Prompt、统一ContextBuilder、Validator和真实DeepSeek配置，但不进入生产请求。冻结案例、原始JSON/Markdown、临时SQLite与本地评测脚本统一存放在`E:\PaperHunterData\smolagent-tests\`且不进入Git；仓库路径通过目录联接保持既有代码兼容。
 
 ## 用户可以完成什么
 
@@ -21,7 +23,7 @@ Paper Hunter 是一个基于 FastAPI、LangGraph、DeepSeek 和混合检索的�
 | 单篇问答 | 点击准备问答并输入问题 | 下载、解析、索引后，依据论文原文给出带页码证据的回答 |
 | 计划协作 | 在同一任务中补充研究范围 | 重新生成计划并更新原LangGraph检查点 |
 | 跨论文报告 | 选择 1 至 5 篇论文并明确报告问题 | 整理多篇证据，在质量门禁通过后生成带引用报告 |
-| 报告后追问 | 在报告完成后继续提问 | 重新召回所选论文证据并异步生成带引用回答 |
+| 报告后追问 | 在报告完成后继续提问 | 重新召回所选论文证据并在当前页面实时流式生成带引用回答 |
 | 历史与导出 | 查看历史、详情或导出 | 查看任务进度、错误、论文链接，并导出 CSV/JSON |
 | 开发评测 | 运行检索或 Agent 评测 | 输出 Hit@K、MRR、覆盖率、场景通过率和运行指标 |
 
@@ -52,6 +54,7 @@ flowchart LR
 | 展示与接口层 | `main.py`、`templates/`、`static/` | 接收请求、渲染页面、提供状态 API，不执行长任务 |
 | Agent 编排层 | `research_agent.py`、`research_workflow.py`、`research_checkpoint.py` | 规划任务、条件路由、人工确认、中断与恢复 |
 | 业务服务层 | `search_service.py`、`download_service.py`、`mineru_service.py`、`pdf_service.py`、`rag_service.py`、`research_conversation_service.py` | 搜索、下载、云端解析、结构化分块、索引、召回、问答与报告后追问 |
+| 上下文装配层 | `followup_context.py` | 将上游已准备的Memory、Summary、Recent、Question、Report、Evidence和访问限制稳定装配为不可信JSON，不执行查询或模型调用 |
 | 可靠任务层 | `task_queue_service.py`、`worker.py`、`paper_workflow.py` | 持久入队、租约领取、心跳、重试、幂等与断点执行 |
 | 数据与评测层 | `db.py`、`evaluation_service.py`、`agent_*_service.py` | 持久化、缓存、检索评测、Trace、Metrics 与报告 |
 
@@ -73,7 +76,7 @@ flowchart LR
 | 本地检索 | TF-IDF、余弦相似度、RRF | 关键词召回、无 API 降级和多路排名融合 |
 | PDF 处理 | MinerU 云端精准解析 API | 生产环境提取章节、表格、公式、列表、物理页码和版面坐标 |
 | PDF 实验基线 | pypdf | 只用于冻结分块实验和历史结果复现，不作为生产降级 |
-| 上下文工程 | 证据去重、公平预算、质量门禁、引用校验 | 控制 Token、降低无证据生成和引用错误 |
+| 上下文工程 | 证据去重、公平预算、质量门禁、引用校验、滚动摘要、Task Memory、统一Follow-up ContextBuilder | 控制 Token、降低无证据生成和引用错误，并保持不同上下文来源边界清晰 |
 | 协议扩展 | MCP Python SDK | 对外提供受控的元数据、检索和证据 Tool |
 | 测试评测 | pytest、mock、JUnit XML | 离线测试、故障场景验证和 Agent 评测报告 |
 | 工程工具 | uv、Git、GitHub | 依赖管理、可复现运行和版本管理 |
@@ -142,11 +145,17 @@ flowchart TD
     O --> P[零 Token 引用校验]
     P --> Q[保存报告、证据和执行轨迹]
     Q --> R[用户继续提问]
-    R --> S[research_followup持久任务]
-    S --> T[重新召回所选论文证据并回答]
+    R --> S[POST chat创建用户与助手消息]
+    S --> T[Extractor提出Task Memory操作]
+    T --> U[代码校验并事务更新active Memory]
+    U --> V[重新召回所选论文证据]
+    V --> W[上游准备各类独立上下文]
+    W --> X[ContextBuilder装配v4不可信JSON]
+    X --> Y[DeepSeek真实流式生成]
+    Y --> Z[浏览器增量显示并在完成时持久化]
 ```
 
-这里使用 Agent 的原因不是单纯增加聊天框，而是任务存在动态规划、工具调用、人工决策、逐篇容错和可恢复状态。论文选择、下载授权和报告生成都保留人工边界。当前持续追问只使用当前问题、当前报告和新召回证据，完整历史压缩与长期记忆尚未实现。
+这里使用 Agent 的原因不是单纯增加聊天框，而是任务存在动态规划、工具调用、人工决策、逐篇容错和可恢复状态。论文选择、下载授权和报告生成都保留人工边界。当前持续追问先分别准备Task Memory、滚动摘要、最近10条原文、当前问题、报告、新召回证据和访问限制，再由纯ContextBuilder统一装配；各来源不混写，Memory和摘要都不能作为论文事实。网页主链路使用POST流式响应；旧`research_followup`持久任务只作为无JavaScript回退，不修改既有报告。
 
 ## 核心流程四：可靠后台任务
 
@@ -238,7 +247,8 @@ awaiting_confirmation
 | 研究任务 | `GET /research-tasks/{task_id}` | 查看计划、候选论文、报告和队列进度 |
 | 人工审批 | `POST /research-tasks/{task_id}/confirm` | 批准检索计划后才允许调用搜索 Tool |
 | 人工审批 | `POST /research-tasks/{task_id}/select` | 从本任务候选中冻结 1 至 5 篇论文 |
-| 研究会话 | `POST /research-tasks/{task_id}/message` | 调整计划、设置报告问题或提交报告后追问 |
+| 研究会话 | `POST /research-tasks/{task_id}/message` | 调整计划、设置报告问题或作为无JavaScript追问回退 |
+| 实时追问 | `POST /research-tasks/{task_id}/chat` | 创建追问消息并返回`status/delta/done/error`流式事件 |
 | 研究报告 | `POST /research-tasks/{task_id}/report` | 恢复同一 LangGraph 线程并持久生成报告 |
 | 运行状态 | `GET /api/papers/statuses` | 页面轻量轮询论文和任务状态 |
 | Agent Trace | `GET /api/research-tasks/{task_id}/traces` | 查看节点执行轨迹 |
@@ -247,9 +257,9 @@ awaiting_confirmation
 | 生成评测 | `GET /generation-evaluation` | 评估回答忠实性、相关性和引用正确性 |
 | 数据导出 | `GET /export.csv`、`GET /export.json` | 导出论文检索记录 |
 
-页面路由负责请求校验、提交任务和展示状态。下载、解析、索引、单篇问答、研究检索和研究报告都由独立 Worker 执行，不在 Web 请求中等待长任务完成。
+页面路由负责请求校验、提交任务和展示状态。下载、解析、索引、单篇问答、研究检索和研究报告都由独立 Worker 执行。报告后实时追问是明确的例外：Web请求保持HTTP流并直接转发模型增量，旧Worker追问入口仍可回退。
 
-研究任务页固定加载轻量轮询脚本；脚本仅在搜索、报告或追问运行时每2秒请求状态API。客户端使用`cache: "no-store"`，接口返回`Cache-Control: no-store`。进入完成/失败终态时，页面自动重载并展示完整结果。
+研究任务页固定加载轻量轮询脚本，用于搜索、报告和旧Worker回退状态；实时追问由`research_followup_chat.js`读取POST响应流，不触发整页刷新。流式完成后完整助手消息写入SQLite，因此手动刷新会由服务端历史恢复相同内容。
 
 ## 数据如何保存
 
@@ -259,7 +269,7 @@ awaiting_confirmation
 | 任务队列 | `background_jobs` | 任务类型、载荷、状态、重试次数、租约和错误 |
 | PDF 解析 | `paper_documents`、`paper_chunks` | 文档状态、页码文本块、向量和父子关系 |
 | RAG 问答 | `rag_queries` | 问题、回答、证据、模型、重排配置和错误 |
-| 研究 Agent | `research_tasks`、`research_messages`、`research_tool_calls`、`research_reports` | canonical来源列表、计划、任务内消息、工具轨迹、选择结果和跨论文报告 |
+| 研究 Agent | `research_tasks`、`research_messages`、`research_task_memories`、`research_tool_calls`、`research_reports` | canonical来源列表、计划、原始消息、任务级持久要求、工具轨迹、选择结果和跨论文报告 |
 | Agent 可观测性 | `agent_traces` | 节点状态、耗时、工具调用、重试和错误 |
 | 缓存 | `pdf_text_cache`、`embedding_cache`、`llm_response_cache` | 避免重复解析、Embedding 和受控实验调用 |
 | 检索与生成评测 | `evaluation_*`、`generation_evaluation_*` | 配置、逐题结果、聚合指标和实验历史 |
@@ -310,6 +320,8 @@ LangGraph Checkpoint 与业务数据库职责不同：Checkpoint 保存图执行
 | 文档索引复用 | 只修改 Top-K 或融合权重时直接重新排名 |
 | Evidence Quality Gate | 无证据或上下文不合法时不调用 DeepSeek |
 | 跨论文公平 Token 预算 | 限制上下文总量，同时避免某一篇论文占满预算 |
+| Conversation Summary滚动压缩 | 旧消息只增量总结一次，最近10条保留原文，避免Follow-up上下文随轮数线性增长 |
+| Task Memory操作式更新 | LLM只提出ADD/UPDATE/REMOVE，代码校验并事务落库；临时请求和论文事实不持久化 |
 | 确定性去重和引用检查 | 不额外增加模型调用 |
 | 可选 DeepSeek 重排 | 默认关闭，用户按质量需求决定是否增加成本 |
 | Worker 断点与幂等 | 重启后跳过已完成阶段，减少重复下载、解析和生成 |

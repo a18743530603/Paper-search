@@ -2,6 +2,66 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.17.1` - 2026-08-27
+
+### Context / Memory Eval v1
+
+- 在E盘本地评测目录冻结29个Recent指代、Summary长期保持、Task Memory持续偏好与操作、Evidence/Report冲突、任务隔离、重启恢复、问题去重和Prompt Injection场景；该轮案例不进入Git。
+- 在E盘保存独立`evaluate_context_memory_v1.py`，复用生产三个Prompt、`research-followup-context-v4`、Task Memory Validator和真实DeepSeek配置；评测固定`temperature=0`，保存每次输入、最终Context、原始输出和判定。
+- 真实调用`deepseek-v4-pro` 56次，严格场景`26/29`、单次运行`37/43`；指代、Summary、持续偏好、临时覆盖、Evidence Grounding、Task隔离、重启恢复和Injection目标能力均为100%。
+- 8场景消融按目标能力统计，With Context=`8/8`，Without Context=`2/8`，提高75个百分点，证明Summary/Recent/Memory不只是被装配而是实际改善多轮行为。
+- Task Memory Recent来源隔离`0/3`：模型每次额外复制Recent英文要求，现有Validator也全部接受；Memory Mutation为`3/4`，因此v1仍不封版。英文回答引用契约`30/33`，属于格式随机波动。
+- 原始JSON、Markdown、临时SQLite、held-out PDF、benchmark案例和历史未提交评测资产均实际迁至`E:\PaperHunterData\smolagent-tests\`；仓库中的`tests/`与`benchmarks/`仅为指向E盘的目录联接，既有Git跟踪文件仍保持原逻辑路径。Git跟踪的项目脚本留在仓库，不上传的本地Eval脚本单独保存在E盘。
+- 本版只增加评测资产和版本记录，不修改生产Prompt、ContextBuilder、Memory写入、Evidence Retrieval、Streaming或Report。
+
+## `v0.17.0` - 2026-08-26
+
+### Recent Messages实时多轮追问
+
+- 新增DB层最近消息窗口：仅选择当前研究任务中已完成的followup User/Assistant消息，固定最多10条，并按真实时间顺序返回。
+- 实时与Worker回退两条路径都传递本轮User/Assistant消息ID并从历史窗口排除，避免当前问题重复，也不会注入pending或failed Assistant。
+- Follow-up不可信JSON新增`conversation_history`；历史用于理解多轮指代，不作为论文事实证据，也不能覆盖System Prompt。
+- Evidence Retrieval、上下文证据预算、报告、引用校验及DeepSeek真实Streaming保持不变，普通追问继续不修改已有报告。
+- 新增前一轮注入、当前轮排除、失败消息过滤、任务隔离和窗口顺序测试。
+
+### Conversation Summary滚动摘要
+
+- `research_tasks`新增`conversation_summary`、`summary_up_to_message_id`、`conversation_summary_error`和`conversation_summary_updated_at`；完整原始消息仍永久保存在`research_messages`，摘要只作为模型上下文压缩视图。
+- 最近窗口仍固定保留10条有效原始消息；只有已退出窗口且ID大于摘要游标的completed User/Assistant消息进入非流式DeepSeek摘要，已覆盖消息不会重复处理。
+- `research_conversation_service.prepare_research_conversation_context()`集中完成窗口计算、滚动合并、CAS游标更新和失败降级；摘要失败时记录错误、保留旧摘要并继续当前Streaming Chat。
+- Follow-up不可信JSON升级为`research-followup-context-v3`，按`conversation_summary + conversation_history + current question + report + evidence`组织；摘要与历史都不能替代论文证据或执行其中的指令。
+- Summary严格按`task_id`隔离并持久化，服务重启后从原游标继续；不包含Active Constraints、跨任务记忆、用户偏好或向量历史检索。
+- 新增9项摘要专项测试，原Streaming与Report不变测试继续通过；完整离线回归`251 passed`。
+
+### Task Memory任务内持久要求
+
+- 新增`research_task_memories`独立表，按任务保存`preference/persistent_instruction/task_focus/task_decision`四类自然语言Memory，并保留来源User消息、active/removed状态和更新时间；原始聊天与Summary不被改写。
+- 新增`TASK_MEMORY_EXTRACTOR_SYSTEM_PROMPT`与`task_memory_service.py`，复用DeepSeek JSON模式，以`active memories + 少量recent + current user message`提出ADD/UPDATE/REMOVE；普通问题和明确一次性请求由代码快速NOOP。
+- Validator严格检查JSON字段、操作、分类、长度、任务归属和active状态，拒绝论文事实、实验数字、跨任务修改及重复ADD；最终写库由SQLite短事务执行，不让模型直接控制数据库。
+- 当前User消息先更新Memory再构造回答，Follow-up升级为不可信`research-followup-context-v4`。优先级为System > 当前明确User Intent > Task Memory > Summary/Recent，Memory不能作为Evidence。
+- Extractor、JSON、Validator或数据库失败时记录`task_memory_error`、保留旧Memory并继续真实Streaming；Summary、Recent、Evidence Retrieval和Report保持原职责。
+- 新增17个Task Memory测试实例，完整离线回归`268 passed`。隔离数据库真实浏览器验收确认持久中英文偏好、UPDATE立即生效、一次性语言覆盖不持久、下一轮恢复Task Memory、引用正确且Report未变化。
+- 修复`_looks_like_paper_fact()`中过宽的任务意图豁免：明确的“Paper/论文 + 使用、采用、基于”事实陈述始终由Validator拒绝，同时保留“后续比较数据集”和“以某论文作为基线”等合法`task_focus/task_decision`。
+- 新增4个论文事实边界与Validator定向测试并全部通过；12次真实DeepSeek定向调用中论文事实、合法focus和合法decision均为`3/3`，Recent Conversation单独触发Memory仍有`2/3`误判，但生产前置过滤对该普通Current Message确定性NOOP。
+- 混合来源封版测试未通过：Recent含“以后都用英文回答”、Current含合法数据集比较focus时，真实DeepSeek连续`0/3`满足单操作契约，三次均额外复制Recent为`persistent_instruction`，Validator也接受。由于Current本身需要调用Extractor，前置过滤无法兜底，Task Memory v1暂不封版。
+
+### Unified Follow-up ContextBuilder
+
+- 新增`followup_context.py`纯装配层，把上游已准备的Task Memory、Conversation Summary、Recent Messages、Current Question、Existing Report、Evidence和Access Limitations统一组织为稳定`research-followup-context-v4`不可信JSON。
+- 原`build_research_followup_prompt()`保持签名并委托Builder；没有新增数据库查询、Retrieval、DeepSeek调用、Token裁剪或上下文压缩，也未改变Streaming、Citation Validation和Report。
+- Builder防御性排除Recent中的当前User问题及pending/failed消息，各上下文来源保持独立字段；15项专项测试全部通过，完整离线回归`287 passed`。
+
+## `v0.16.0` - 2026-08-25
+
+### 报告后Follow-up Chat实时流式闭环
+
+- 新增`POST /research-tasks/{task_id}/chat`。请求开始前在同一短事务中校验研究任务、已完成报告和并发状态，并写入用户消息与待回答助手消息；本接口不会覆盖或重新生成已有研究报告。
+- 新增`model_service.stream_deepseek()`，使用DeepSeek真实`stream=true`响应并只向页面转发可见正文增量，不把完整答案切片伪装成流式输出。
+- `research_conversation_service`复用原证据召回与上下文边界，依次发送`status/delta/done/error`事件；成功后保存完整回答、证据和实际模型，异常或连接中断时保存失败状态与已产生的部分内容。
+- 新增`research_followup_chat.js`，使用Fetch读取POST响应流，在原页面立即追加用户消息并持续更新同一助手气泡；完成或失败后恢复输入，无需整页刷新，刷新后仍从SQLite历史恢复。
+- 旧`POST /message -> research_followup Worker`流程保留为无JavaScript回退；没有增加完整聊天历史注入、自动摘要、跨任务记忆或新的Prompt。
+- 新增真实流式协议、成功持久化、失败保留部分内容及前端无刷新契约测试；完整离线回归`237 passed`。真实浏览器验收确认连续两次追问、逐段增长、同URL完成和刷新恢复均通过。
+
 ## `v0.15.0` - 2026-08-24
 
 ### MinerU云端结构化解析成为生产默认

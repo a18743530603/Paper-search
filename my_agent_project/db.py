@@ -4,7 +4,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional, Sequence
 
 from .config import DATABASE_PATH, EXPORTS_DIR, ensure_runtime_dirs
 from .schemas import (
@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     selected_paper_ids_json TEXT NOT NULL DEFAULT '[]',
     selected_count INTEGER NOT NULL DEFAULT 0,
     report_question TEXT NOT NULL DEFAULT '',
+    conversation_summary TEXT NOT NULL DEFAULT '',
+    summary_up_to_message_id INTEGER NOT NULL DEFAULT 0,
+    conversation_summary_error TEXT,
+    conversation_summary_updated_at TEXT,
+    task_memory_error TEXT,
+    task_memory_updated_at TEXT,
     error TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -183,6 +189,22 @@ CREATE TABLE IF NOT EXISTS research_messages (
 
 CREATE INDEX IF NOT EXISTS idx_research_messages_task_id
 ON research_messages(task_id, id);
+
+CREATE TABLE IF NOT EXISTS research_task_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    research_task_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_from_message_id INTEGER NOT NULL,
+    updated_from_message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (research_task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_task_memories_task_status
+ON research_task_memories(research_task_id, status, id);
 
 CREATE TABLE IF NOT EXISTS paper_documents (
     paper_id INTEGER PRIMARY KEY,
@@ -526,6 +548,12 @@ def init_db() -> None:
             ("selected_count", "INTEGER NOT NULL DEFAULT 0"),
             ("selected_at", "TEXT"),
             ("report_question", "TEXT NOT NULL DEFAULT ''"),
+            ("conversation_summary", "TEXT NOT NULL DEFAULT ''"),
+            ("summary_up_to_message_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("conversation_summary_error", "TEXT"),
+            ("conversation_summary_updated_at", "TEXT"),
+            ("task_memory_error", "TEXT"),
+            ("task_memory_updated_at", "TEXT"),
         ):
             if name not in research_task_columns:
                 conn.execute(
@@ -1249,6 +1277,376 @@ def list_research_messages(task_id: int, limit: int = 100) -> list[dict]:
             (task_id, limit),
         ).fetchall()
     return [_research_message_from_row(row) for row in rows]
+
+
+def list_recent_research_conversation_messages(
+    task_id: int,
+    *,
+    limit: int = 10,
+    exclude_message_ids: Iterable[int] = (),
+) -> list[dict]:
+    if limit < 1:
+        return []
+
+    excluded_ids = list(
+        dict.fromkeys(
+            message_id
+            for value in exclude_message_ids
+            if (message_id := int(value)) > 0
+        )
+    )
+    exclusion_sql = ""
+    parameters: list[object] = [task_id]
+    if excluded_ids:
+        placeholders = ", ".join("?" for _ in excluded_ids)
+        exclusion_sql = f"AND id NOT IN ({placeholders})"
+        parameters.extend(excluded_ids)
+    parameters.append(limit)
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM (
+                SELECT *
+                FROM research_messages
+                WHERE task_id = ?
+                  AND phase = 'followup'
+                  AND role IN ('user', 'assistant')
+                  AND status = 'completed'
+                  {exclusion_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            ) AS recent_messages
+            ORDER BY created_at ASC, id ASC
+            """,
+            parameters,
+        ).fetchall()
+    return [_research_message_from_row(row) for row in rows]
+
+
+def get_research_conversation_summary(task_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id AS task_id, conversation_summary,
+                   summary_up_to_message_id, conversation_summary_error,
+                   conversation_summary_updated_at
+            FROM research_tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_research_conversation_context_messages(
+    task_id: int,
+    *,
+    recent_limit: int = 10,
+    summary_up_to_message_id: int = 0,
+    exclude_message_ids: Iterable[int] = (),
+) -> dict[str, list[dict]]:
+    if recent_limit < 1:
+        raise ValueError("recent_limit must be at least 1")
+
+    excluded_ids = list(
+        dict.fromkeys(
+            message_id
+            for value in exclude_message_ids
+            if (message_id := int(value)) > 0
+        )
+    )
+    exclusion_sql = ""
+    base_parameters: list[object] = [task_id]
+    if excluded_ids:
+        placeholders = ", ".join("?" for _ in excluded_ids)
+        exclusion_sql = f"AND id NOT IN ({placeholders})"
+        base_parameters.extend(excluded_ids)
+
+    with connect() as conn:
+        recent_rows = conn.execute(
+            f"""
+            SELECT *
+            FROM research_messages
+            WHERE task_id = ?
+              AND phase = 'followup'
+              AND role IN ('user', 'assistant')
+              AND status = 'completed'
+              {exclusion_sql}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            [*base_parameters, recent_limit],
+        ).fetchall()
+        recent_rows = list(reversed(recent_rows))
+
+        messages_to_summarize: list[sqlite3.Row] = []
+        if recent_rows:
+            oldest_recent_id = int(recent_rows[0]["id"])
+            messages_to_summarize = conn.execute(
+                f"""
+                SELECT *
+                FROM research_messages
+                WHERE task_id = ?
+                  AND phase = 'followup'
+                  AND role IN ('user', 'assistant')
+                  AND status = 'completed'
+                  {exclusion_sql}
+                  AND id > ?
+                  AND id < ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                [
+                    *base_parameters,
+                    max(0, int(summary_up_to_message_id)),
+                    oldest_recent_id,
+                ],
+            ).fetchall()
+
+    return {
+        "messages_to_summarize": [
+            _research_message_from_row(row) for row in messages_to_summarize
+        ],
+        "recent_messages": [
+            _research_message_from_row(row) for row in recent_rows
+        ],
+    }
+
+
+def update_research_conversation_summary(
+    task_id: int,
+    summary: str,
+    summary_up_to_message_id: int,
+    *,
+    expected_previous_message_id: int,
+) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET conversation_summary = ?,
+                summary_up_to_message_id = ?,
+                conversation_summary_error = NULL,
+                conversation_summary_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND summary_up_to_message_id = ?
+            """,
+            (
+                str(summary or "").strip(),
+                max(0, int(summary_up_to_message_id)),
+                task_id,
+                max(0, int(expected_previous_message_id)),
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def record_research_conversation_summary_error(task_id: int, error: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET conversation_summary_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (str(error or "Conversation summary failed")[:1000], task_id),
+        )
+    return cursor.rowcount == 1
+
+
+def list_research_task_memories(
+    task_id: int,
+    *,
+    status: str = "active",
+) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM research_task_memories
+            WHERE research_task_id = ? AND status = ?
+            ORDER BY id ASC
+            """,
+            (task_id, status),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_research_task_memory(memory_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM research_task_memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def apply_research_task_memory_operations(
+    task_id: int,
+    source_message_id: int,
+    operations: Sequence[Mapping[str, object]],
+) -> list[dict]:
+    applied: list[dict] = []
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT id FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise LookupError("研究任务不存在")
+        source_message = conn.execute(
+            """
+            SELECT id
+            FROM research_messages
+            WHERE id = ? AND task_id = ? AND role = 'user' AND phase = 'followup'
+            """,
+            (source_message_id, task_id),
+        ).fetchone()
+        if source_message is None:
+            raise ValueError("Task Memory来源消息无效")
+
+        for operation in operations:
+            action = str(operation["action"])
+            if action == "add":
+                category = str(operation["category"])
+                content = str(operation["content"])
+                duplicate = conn.execute(
+                    """
+                    SELECT id
+                    FROM research_task_memories
+                    WHERE research_task_id = ? AND status = 'active'
+                      AND category = ? AND content = ?
+                    LIMIT 1
+                    """,
+                    (task_id, category, content),
+                ).fetchone()
+                if duplicate is not None:
+                    applied.append(
+                        {
+                            "action": "noop_duplicate",
+                            "memory_id": int(duplicate["id"]),
+                        }
+                    )
+                    continue
+                cursor = conn.execute(
+                    """
+                    INSERT INTO research_task_memories (
+                        research_task_id, category, content, status,
+                        created_from_message_id, updated_from_message_id
+                    )
+                    VALUES (?, ?, ?, 'active', ?, ?)
+                    """,
+                    (
+                        task_id,
+                        category,
+                        content,
+                        source_message_id,
+                        source_message_id,
+                    ),
+                )
+                applied.append(
+                    {"action": "add", "memory_id": int(cursor.lastrowid)}
+                )
+                continue
+
+            memory_id = int(operation["memory_id"])
+            memory = conn.execute(
+                """
+                SELECT *
+                FROM research_task_memories
+                WHERE id = ? AND research_task_id = ? AND status = 'active'
+                """,
+                (memory_id, task_id),
+            ).fetchone()
+            if memory is None:
+                raise ValueError("Task Memory不存在、不属于当前任务或已失效")
+
+            if action == "update":
+                category = str(operation["category"])
+                content = str(operation["content"])
+                duplicate = conn.execute(
+                    """
+                    SELECT id
+                    FROM research_task_memories
+                    WHERE research_task_id = ? AND status = 'active'
+                      AND category = ? AND content = ? AND id <> ?
+                    LIMIT 1
+                    """,
+                    (task_id, category, content, memory_id),
+                ).fetchone()
+                if duplicate is not None:
+                    conn.execute(
+                        """
+                        UPDATE research_task_memories
+                        SET status = 'removed', updated_from_message_id = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (source_message_id, memory_id),
+                    )
+                    applied.append(
+                        {
+                            "action": "merge_duplicate",
+                            "memory_id": memory_id,
+                            "kept_memory_id": int(duplicate["id"]),
+                        }
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE research_task_memories
+                        SET category = ?, content = ?, updated_from_message_id = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (category, content, source_message_id, memory_id),
+                    )
+                    applied.append({"action": "update", "memory_id": memory_id})
+                continue
+
+            if action == "remove":
+                conn.execute(
+                    """
+                    UPDATE research_task_memories
+                    SET status = 'removed', updated_from_message_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (source_message_id, memory_id),
+                )
+                applied.append({"action": "remove", "memory_id": memory_id})
+                continue
+
+            raise ValueError("不支持的Task Memory操作")
+
+        conn.execute(
+            """
+            UPDATE research_tasks
+            SET task_memory_error = NULL,
+                task_memory_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+    return applied
+
+
+def record_research_task_memory_error(task_id: int, error: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_tasks
+            SET task_memory_error = ?,
+                task_memory_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (str(error or "Task Memory更新失败")[:1000], task_id),
+        )
+    return cursor.rowcount == 1
 
 
 def update_research_message(
@@ -2794,6 +3192,82 @@ def enqueue_research_report_job(
         }
 
 
+def create_research_followup_messages(task_id: int, question: str) -> dict:
+    question = " ".join(str(question or "").split())
+    if not question:
+        raise ValueError("追问内容不能为空")
+    if len(question) > 2000:
+        raise ValueError("追问内容不能超过2000个字符")
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise LookupError("研究任务不存在")
+        if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
+            raise RuntimeError("研究任务尚未冻结论文集合")
+        report = conn.execute(
+            "SELECT status FROM research_reports WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if report is None or report["status"] != "completed":
+            raise RuntimeError("研究报告完成后才能继续追问")
+        active_message = conn.execute(
+            """
+            SELECT id
+            FROM research_messages
+            WHERE task_id = ?
+              AND role = 'assistant'
+              AND phase = 'followup'
+              AND status IN (
+                  'pending', 'retrieving', 'generating', 'streaming', 'retry_wait'
+              )
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if active_message is not None:
+            raise RuntimeError("上一条研究追问仍在处理中")
+        active_job = conn.execute(
+            """
+            SELECT id
+            FROM background_jobs
+            WHERE dedupe_key = ?
+              AND status IN ('queued', 'running', 'retry_wait')
+            LIMIT 1
+            """,
+            (f"research_followup:{task_id}",),
+        ).fetchone()
+        if active_job is not None:
+            raise RuntimeError("上一条研究追问仍在处理中")
+
+        user_cursor = conn.execute(
+            """
+            INSERT INTO research_messages (task_id, role, phase, content)
+            VALUES (?, 'user', 'followup', ?)
+            """,
+            (task_id, question),
+        )
+        assistant_cursor = conn.execute(
+            """
+            INSERT INTO research_messages (
+                task_id, role, phase, content, status
+            )
+            VALUES (?, 'assistant', 'followup', '正在分析...', 'pending')
+            """,
+            (task_id,),
+        )
+        return {
+            "task_id": task_id,
+            "user_message_id": int(user_cursor.lastrowid),
+            "message_id": int(assistant_cursor.lastrowid),
+            "question": question,
+        }
+
+
 def enqueue_research_followup_job(
     task_id: int,
     question: str,
@@ -2840,7 +3314,7 @@ def enqueue_research_followup_job(
         if active is not None:
             raise RuntimeError("上一条研究追问仍在处理中")
 
-        conn.execute(
+        user_cursor = conn.execute(
             """
             INSERT INTO research_messages (task_id, role, phase, content)
             VALUES (?, 'user', 'followup', ?)
@@ -2869,6 +3343,7 @@ def enqueue_research_followup_job(
                 json.dumps(
                     {
                         "task_id": task_id,
+                        "user_message_id": int(user_cursor.lastrowid),
                         "message_id": message_id,
                         "question": question,
                     },
@@ -2885,6 +3360,7 @@ def enqueue_research_followup_job(
         return {
             "job_id": int(job_cursor.lastrowid),
             "task_id": task_id,
+            "user_message_id": int(user_cursor.lastrowid),
             "message_id": message_id,
             "created": True,
         }

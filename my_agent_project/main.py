@@ -2,12 +2,13 @@ import os
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
+import json
 import sys
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -19,6 +20,7 @@ from .db import (
     attach_agent_traces_to_task,
     cancel_research_task,
     clear_paper_history,
+    create_research_followup_messages,
     create_research_task,
     enqueue_research_followup_job,
     enqueue_download_job,
@@ -84,6 +86,7 @@ from .rag_service import (
 from .research_agent import (
     create_research_plan,
 )
+from .research_conversation_service import stream_research_followup
 from .research_checkpoint import (
     delete_research_checkpoint,
     research_checkpoint_info,
@@ -108,7 +111,7 @@ init_db()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.15.0")
+app = FastAPI(title="Paper Hunter", version="0.17.1")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
@@ -309,6 +312,39 @@ def post_research_message(
         raise HTTPException(status_code=409, detail="当前任务阶段暂不接受对话")
 
     return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.post("/research-tasks/{task_id}/chat")
+def stream_research_chat(
+    task_id: int,
+    message: str = Form(...),
+):
+    try:
+        created = create_research_followup_messages(task_id, message)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def event_stream():
+        for event, payload in stream_research_followup(
+            int(created["message_id"]),
+            str(created["question"]),
+            current_user_message_id=int(created["user_message_id"]),
+        ):
+            serialized = json.dumps(payload, ensure_ascii=False)
+            yield f"event: {event}\ndata: {serialized}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/research-tasks/{task_id}/cancel")

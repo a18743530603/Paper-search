@@ -1,6 +1,12 @@
 const taskRoot = document.querySelector("[data-research-task-id]");
 const runningReportStatuses = new Set(["preparing", "retrieving", "generating"]);
-const runningMessageStatuses = new Set(["pending", "retry_wait"]);
+const runningMessageStatuses = new Set([
+  "pending",
+  "retrieving",
+  "generating",
+  "streaming",
+  "retry_wait",
+]);
 
 if (
   taskRoot?.dataset.researchTaskStatus === "running" ||

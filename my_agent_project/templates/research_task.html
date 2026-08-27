@@ -17,17 +17,17 @@
       <p class="eyebrow">Conversation</p>
       <h2 id="research-conversation-title">研究对话</h2>
     </div>
-    <span class="selection-limit">{{ messages | length }} 条</span>
+    <span class="selection-limit" data-message-count>{{ messages | length }} 条</span>
   </div>
-  <div class="conversation-stream">
+  <div class="conversation-stream" data-conversation-stream aria-live="polite">
     {% for message in messages %}
-      <article class="conversation-message conversation-{{ message['role'] }}">
+      <article class="conversation-message conversation-{{ message['role'] }}" data-message-id="{{ message['id'] }}">
         <div class="conversation-meta">
           <strong>{{ "你" if message["role"] == "user" else "Paper Hunter" }}</strong>
           <span>{{ message["phase"] }}</span>
-          {% if message["status"] != "completed" %}<span class="status status-message-{{ message['status'] }}">{{ message["status"] }}</span>{% endif %}
+          {% if message["status"] != "completed" %}<span class="status status-message-{{ message['status'] }}" data-message-status>{{ message["status"] }}</span>{% endif %}
         </div>
-        <div class="conversation-content">{{ message["content"] }}</div>
+        <div class="conversation-content" data-message-content>{{ message["content"] }}</div>
         {% if message["model"] %}<small>模型：{{ message["model"] }}</small>{% endif %}
         {% if message["error"] %}<small class="tool-error">{{ message["error"] }}</small>{% endif %}
         {% if message["evidence"] %}<small>证据：{{ message["evidence"] | length }} 条</small>{% endif %}
@@ -48,10 +48,11 @@
       <button type="submit">设置报告问题</button>
     </form>
   {% elif task["status"] == "papers_selected" and report_status == "completed" %}
-    <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post">
+    <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post" data-followup-chat data-stream-url="/research-tasks/{{ task['id'] }}/chat">
       <label for="research-message">继续追问当前报告和所选论文</label>
-      <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：第二篇论文为什么选择这个评价指标？" required></textarea>
-      <button type="submit" {% if latest_message_status in ["pending", "retry_wait"] %}disabled{% endif %}>发送追问</button>
+      <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：第二篇论文为什么选择这个评价指标？" required data-chat-input></textarea>
+      <button type="submit" {% if latest_message_status in ["pending", "retrieving", "generating", "streaming", "retry_wait"] %}disabled{% endif %} data-chat-submit>发送追问</button>
+      <p class="chat-error" data-chat-error role="alert" hidden></p>
     </form>
   {% else %}
     <p class="conversation-waiting">当前阶段正在执行任务，完成后可以继续对话。</p>
@@ -320,4 +321,5 @@
 {% endblock %}
 {% block scripts %}
   <script src="{{ url_for('static', path='/research_task_poll.js') }}" defer></script>
+  <script src="{{ url_for('static', path='/research_followup_chat.js') }}" defer></script>
 {% endblock %}

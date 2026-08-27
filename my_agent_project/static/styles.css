@@ -314,9 +314,50 @@ button,
   color: var(--muted);
 }
 
+.conversation-message-streaming .conversation-content::after {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 4px;
+  background: var(--accent);
+  content: "";
+  vertical-align: -2px;
+  animation: chat-caret 0.9s steps(1) infinite;
+}
+
+@keyframes chat-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+.status-message-pending,
+.status-message-retrieving,
+.status-message-generating,
+.status-message-streaming {
+  color: #81520b;
+  background: #fff2d8;
+}
+
+.status-message-completed {
+  color: #1f6658;
+  background: #e4f4ef;
+}
+
+.status-message-failed {
+  color: #a2362f;
+  background: #fde8e5;
+}
+
 .conversation-composer {
   padding-top: 18px;
   border-top: 1px solid var(--line);
+}
+
+.chat-error {
+  margin: 10px 0 0;
+  color: #a2362f;
+  font-size: 13px;
 }
 
 .conversation-waiting,

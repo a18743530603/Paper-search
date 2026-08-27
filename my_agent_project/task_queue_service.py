@@ -171,6 +171,7 @@ def _research_followup_handler(payload: dict[str, Any]) -> None:
     answer_research_followup(
         message_id,
         question,
+        current_user_message_id=int(payload.get("user_message_id") or 0),
         raise_on_error=True,
     )
     message = db.get_research_message(message_id)
