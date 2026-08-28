@@ -186,6 +186,8 @@ def test_checkpoint_resume_keeps_sources_and_batches_queries_once(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setattr(db, "DATABASE_PATH", tmp_path / "metadata.db")
+    db.init_db()
     planner_calls = 0
     batch_calls = []
 

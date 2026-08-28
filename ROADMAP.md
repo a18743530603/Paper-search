@@ -4,7 +4,7 @@
 >
 > 日志建立日期：`2026-08-16`
 >
-> 当前阶段：`v0.17.1 Context / Memory Eval v1已完成，Task Memory来源校验待最小修复`
+> 当前阶段：`SQLite → MySQL Phase 6 Fresh MySQL Cutover已完成；Business Database正式使用MySQL，LangGraph Checkpoint继续使用SQLite SqliteSaver`
 
 本文件用于在后续 Codex 对话之间同步开发路线和实际进度。它记录“接下来为什么做、做到哪里、验证结果和下一步”，功能细节仍写入 `README.md`、`PROJECT.md`、`CHANGELOG.md` 和 `AGENTS.md`，实验数据仍写入 `EXPERIMENTS.md`。
 
@@ -702,3 +702,128 @@ MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒�
 - Recent指代、Summary、Memory持续偏好、临时覆盖、Evidence隔离、Task隔离、重启恢复和Prompt Injection均达到本轮100%目标能力。
 - Task Memory混合输入Recent来源隔离连续`0/3`，Validator同样接受错误操作；英文引用契约为`30/33`。
 - 结论：ContextBuilder与四层上下文组合无需扩大重构；下一步只应先做Task Memory Current来源可验证的最小修复，再复用同一场景回归。Token Budget、向量记忆和跨任务Memory继续暂停。
+
+### 2026-08-27：SQLite → MySQL Phase 1/2基础层
+
+- Phase 1引入PyMySQL、`BUSINESS_DB_BACKEND=sqlite/mysql`及独立Business Database连接配置；MySQL连接固定`utf8mb4`、UTC Session、InnoDB默认引擎、`autocommit=False`和`DictCursor`，新增`read_connection()`与显式`transaction()`，默认SQLite行为不变。
+- LangGraph `SqliteSaver`、`LANGGRAPH_CHECKPOINT_PATH`和`research_checkpoint.py`保持独立SQLite，未纳入Business Database迁移。
+- Phase 2新增`migrations/mysql/001_initial_schema.sql`，按真实FK依赖顺序覆盖20张业务表；全部表使用InnoDB和utf8mb4，运行时间字段使用UTC `DATETIME(6)`，ID/FK使用`BIGINT UNSIGNED`，指标浮点使用`DOUBLE`。
+- 哈希字段使用`CHAR(64)`；cache namespace、checkpoint thread和dedupe key使用受控`VARCHAR`；长问题、报告、消息、分块和现有JSON字符串保持`LONGTEXT`。`evaluation_cases`使用生成的SHA-256问题哈希维持长问题唯一约束。
+- `background_jobs`使用只在`queued/running/retry_wait`时返回dedupe key的stored generated column，并对该列建立UNIQUE，等价保留SQLite partial unique index的active job约束。
+- 新增独立migration runner、`schema_migrations`版本/checksum记录和手动CLI；FastAPI与Worker启动不会自动执行MySQL DDL，重复执行已应用版本会安全跳过，已应用文件被修改会拒绝。
+- MySQL真实集成测试使用随机临时数据库并在结束后删除，通过`PAPER_HUNTER_MYSQL_TEST=1`显式启用；未配置MySQL Server时离线测试自动跳过。
+- 本阶段未修改现有SQLite业务SQL、队列claim/lease/retry/recover、Task Memory事务、Conversation Summary CAS或任何业务服务。下一步Phase 3只做DB-API SQL参数、UPSERT和row/cursor兼容，不提前进入队列并发语义迁移。
+
+### 2026-08-27：SQLite → MySQL Phase 3 Business SQL Compatibility
+
+- `db.py`新增最小MySQL Connection/Cursor Adapter，集中处理qmark `?` 到PyMySQL `%s`的安全转换、dynamic IN占位符、`execute/executemany/fetchone/fetchall/rowcount/lastrowid`以及Dict row兼容；参数值继续独立传入driver。
+- 普通CRUD已覆盖papers、paper documents/chunks、research tasks/tool calls/reports/messages、traces、RAG、PDF/embedding/LLM caches和evaluation/generation evaluation。MySQL `DATETIME(6)`输入统一为UTC datetime，返回层保持既有ISO字符串API。
+- 审计11处SQLite `ON CONFLICT`，迁移9处普通UPSERT为MySQL 8.0 row-alias `ON DUPLICATE KEY UPDATE`；剩2处位于Report/Job并发锁流程，明确留Phase 4。审计3处`INSERT OR IGNORE`，普通document get-or-create改为仅忽略MySQL 1062 duplicate-key，FK/NOT NULL/invalid data仍抛出；其余2处enqueue流程留Phase 4。
+- 原16处`BEGIN IMMEDIATE`中，`revise_research_task_plan()`与`set_research_report_question()`只需普通原子性，已改用显式`transaction()`；余下14处依赖SQLite writer lock，MySQL路径以`PHASE_4_BLOCKED`失败关闭，未引入`FOR UPDATE`、`SKIP LOCKED`或deadlock retry。
+- Conversation Summary CAS保持原单条conditional UPDATE算法；MySQL连接使用`CLIENT.FOUND_ROWS`保持SQLite matched-row rowcount语义。Task Memory的读-判断-写串行事务未迁移。
+- 真实MySQL 8集成测试使用随机`paper_hunter_phase1/2/3_*`临时数据库并在结束后删除，结果`38 passed, 0 skipped`；数据库密集型SQLite回归`277 passed, 3 skipped`，完整canonical pytest `664 passed, 6 skipped`，`git diff --check`通过。
+- LangGraph `SqliteSaver`、`research_checkpoint.py`、`LANGGRAPH_CHECKPOINT_PATH`保持不变；未迁移`downloads/metadata.db`，未修改正式`paper_hunter`数据库，未进入Phase 4。
+
+### 2026-08-27：SQLite → MySQL Phase 4A Concurrent Worker Claim
+
+- 本步仅迁移`claim_next_background_job()`。SQLite路径保留原`BEGIN IMMEDIATE → candidate SELECT → conditional UPDATE → commit`逻辑，候选条件仍为`queued/retry_wait`、`available_at <= now`、可选`job_types`，排序仍为`priority DESC, id ASC`。
+- MySQL路径在一个短`READ COMMITTED`事务内执行相同candidate query，并在`LIMIT 1`后使用`FOR UPDATE SKIP LOCKED`；随后保留原status/available CAS，写入`running`、`worker_id`、`lease_expires_at`、`attempt_count + 1`、首次`started_at`和`updated_at`，在commit后才返回完整Job。真正Job执行期间不持有行锁。
+- 首次8 Worker/100 Job真实压测在MySQL默认`REPEATABLE READ`下暴露1213 deadlock；修复为仅Claim短事务使用`READ COMMITTED`以减少ready-range gap lock，未加deadlock retry，未改其他事务默认隔离级别。
+- 真实MySQL并发验证：2 Worker/1 Job只有1个成功Claim；8 Worker/100 Job全部Claim且duplicate claim=`0`；锁定最高优先级Job时另一Worker在2秒门限内跳过并领取下一Job；available/order/status/type过滤、lease/ownership/attempt与UPDATE后异常rollback均通过。
+- Worker Claim + Task Queue SQLite回归`63 passed, 7 skipped`；Phase 1–4A真实MySQL DB套件`46 passed`；完整canonical pytest `666 passed, 20 skipped`。
+- 本步未迁移renew lease、complete、fail/retry、expired recovery、enqueue active dedupe、Report/Follow-up enqueue、Task Memory或`claim_download`；未修改LangGraph Checkpoint、正式SQLite数据或正式`paper_hunter`数据库，未进入Phase 4B。
+
+### 2026-08-27：SQLite → MySQL Phase 4B-1 Lease Renew + Job Complete
+
+- 本步仅迁移`renew_background_job_lease()`与`complete_background_job()`；两者在MySQL均使用短单条conditional UPDATE/CAS，未使用`FOR UPDATE`、`SKIP LOCKED`、deadlock retry或全局isolation修改。
+- Renew保留`id + running + worker_id + lease IS NOT NULL + lease > now`所有权条件，成功以`rowcount == 1`返回；新lease和`updated_at`使用CASE取单调最大值，防止同一Worker并发heartbeat因请求乱序使lease倒退。已过期lease不允许重新续活。
+- 审计发现旧Complete只检查`id + running + worker_id`，没有验证lease是否有效，会允许已过期但尚未recovery的stale worker完成Job。按heartbeat/recovery的既有ownership定义，SQLite/MySQL Complete CAS均收紧为`id + running + worker_id + lease IS NOT NULL + lease > now`。
+- Complete成功仍写`status='succeeded'`，清空`lease_expires_at`和`last_error`，写`completed_at/updated_at`，保留`worker_id`和attempt等其他字段；wrong worker、expired lease、changed owner和重复complete均返回False。
+- Heartbeat架构保持原独立daemon thread + stop/join设计；Renew/Complete竞态依赖单行UPDATE串行化，最终稳定为`succeeded + lease NULL`，Complete后的Renew会因status失败。
+- Renew/Complete + Task Queue SQLite回归`64 passed, 17 skipped`；Phase 4A + 4B-1真实MySQL专项`19 passed`；Phase 1–4B-1真实MySQL DB回归`55 passed`；完整canonical pytest `664 passed, 40 skipped`。
+- 本步未迁移worker fail/retry、expired lease recovery、enqueue active dedupe、Report/Follow-up enqueue、Task Memory或`claim_download`；未改Phase 4A Claim算法、LangGraph Checkpoint、正式SQLite数据或正式`paper_hunter`数据库，未进入Phase 4B-2。
+
+### 2026-08-27：SQLite → MySQL Phase 4B-2 Worker Fail / Retry + Expired Lease Recovery
+
+- 本步仅迁移`fail_background_job()`与`recover_expired_background_jobs()`。Fail使用单条conditional UPDATE/CAS按数据库中的`attempt_count < max_attempts`原子选择`retry_wait/failed`，所有权条件统一为`running + worker_id + lease IS NOT NULL + lease > now`；状态写入后只在同一短事务内读取结果，不使用`FOR UPDATE`。
+- Fail继续由调用方传入既有指数backoff结果并写`available_at = now + retry_delay_seconds`，保存截断后的`last_error`、清空`worker_id/lease`，仅终态写`completed_at`；Fail和Recovery均不增加`attempt_count`，一次实际执行仍只在Claim时计数一次。wrong worker和expired owner的Fail返回`None`且不改当前状态。
+- MySQL Recovery在短`READ COMMITTED`事务中以`running + lease IS NOT NULL + lease <= recovery_now`选择全部过期Job，并使用`FOR UPDATE SKIP LOCKED`让多个recovery executor跳过彼此已锁行；每条UPDATE再次保留相同expired CAS，防止已续租或已完成的Job被旧选择结果覆盖。
+- Recovery保持原SQLite状态机：尚可尝试的过期Job回到`queued`并立即可用，达到max attempts时进入`failed`；两者都清空ownership/lease、记录固定lease-expired错误，仅failed写`completed_at`。SQLite仍保留`BEGIN IMMEDIATE`批量保护，并仅补齐统一ownership与UPDATE expired CAS。
+- 真实MySQL竞态验证覆盖heartbeat/recovery、complete/recovery、fail/recovery和两个recovery executor竞争同一Job；每组只出现一个合法转换，重复recovery为0，未出现1213 deadlock，也未加入deadlock retry。
+- SQLite Fail/Recovery + Task Queue专项`65 passed, 32 skipped`；Phase 1–4B-2真实MySQL DB回归`71 passed`；数据库密集型SQLite回归`278 passed, 35 skipped`；完整canonical pytest `666 passed, 70 skipped`。
+- 本步未修改enqueue active dedupe、research/report/follow-up enqueue、follow-up message原子创建、Task Memory事务、`claim_download`、Phase 4A Claim、Phase 4B-1 Renew/Complete、全局隔离级别、LangGraph Checkpoint、RAG、Streaming、ContextBuilder、Citation、MinerU、Prompt、正式SQLite数据或正式`paper_hunter`数据库，未进入Phase 4C。
+
+### 2026-08-28：SQLite → MySQL Phase 4C Enqueue Transaction + Active Dedupe
+
+- 本步迁移8个Background Job入口：research search/report/follow-up、download/prepare/parse/index和RAG answer；同时迁移实时流式路径的`create_research_followup_messages()`短事务，但不改变真实Streaming协议或创建Worker Job。
+- SQLite继续使用原`BEGIN IMMEDIATE`串行化。MySQL enqueue仅使用局部`READ COMMITTED`短事务，并用对应`research_tasks`或`papers`行的`SELECT ... FOR UPDATE`统一保护跨表状态读取、业务状态修改、消息/RAG记录创建和Job插入；Search仍保留`awaiting_confirmation`条件UPDATE/CAS，未锁Background Jobs表。
+- Phase 2已有generated `active_dedupe_key`与`UNIQUE idx_background_jobs_active_dedupe`作为并发重复入队最终防线。正常路径仍先查active Job；MySQL 1062只有在错误明确命中该索引，且原事务回滚后可重新读到同dedupe活动Job时，才转换为当前API既有的复用、`None`或业务RuntimeError结果。
+- 没有使用MySQL `INSERT IGNORE`，也没有吞掉其他IntegrityError。通用duplicate helper同步收紧为必须匹配指定unique key；FK、NOT NULL、DataError及unrelated 1062继续抛出并触发整笔事务回滚。
+- Report的SQLite `ON CONFLICT(task_id)`增加等价MySQL `ON DUPLICATE KEY UPDATE`；Prepare/Parse的SQLite document `INSERT OR IGNORE`在MySQL只精确忽略`paper_documents.PRIMARY`重复，不忽略其他约束错误。
+- Follow-up实时消息创建与fallback enqueue锁同一Task行；fallback新增现有active Assistant状态检查。两个入口竞争时只有一个创建User/pending Assistant，Worker Job若存在则payload关联同一对消息，不产生orphan pending或无消息Job。
+- 真实MySQL覆盖全部8种Job的2线程同key竞争、8线程Research Search竞争、实时/fallback Follow-up竞争、Report与Paper的succeeded/failed历史复入队、真实active-dedupe 1062 loser回读，以及Search/Follow-up/Paper非duplicate异常回滚；active Job始终为1，未出现1213 deadlock，未增加deadlock retry。
+- Phase 4C真实MySQL专项`17 passed`；Phase 1–4C真实MySQL DB回归`89 passed`；SQLite enqueue/task queue专项`74 passed, 18 skipped`；数据库密集型SQLite回归`279 passed, 52 skipped`；完整canonical pytest `668 passed, 104 skipped`。
+- 本步未修改Worker Claim、Lease Renew、Complete、Fail/Retry、Expired Recovery、Task Memory事务、`claim_download`、全局隔离级别、LangGraph Checkpoint/SqliteSaver、RAG算法、Streaming、ContextBuilder、Citation、MinerU、Prompt、正式SQLite数据或正式`paper_hunter`数据库，未进入下一Phase。
+
+### 2026-08-28：SQLite → MySQL Phase 4D-1 Task Memory Atomic Transaction
+
+- 本步仅迁移`apply_research_task_memory_operations()`的数据库事务。审计确认所有生产ADD/UPDATE/REMOVE都经过该入口；`record_research_task_memory_error()`只写父Task错误元数据，不绕过入口修改Memory。
+- SQLite继续保留`BEGIN IMMEDIATE`。MySQL使用显式短事务，第一条锁定`research_tasks.id = task_id FOR UPDATE`，随后按原顺序校验source follow-up User消息、读取锁后的最新active Memories、执行ADD查重、UPDATE/merge duplicate或REMOVE soft-delete，最后清空Task Memory错误并更新时间元数据后commit。
+- 选择父Task主键行作为同Task mutation mutex：同一Task的批量ADD/UPDATE/REMOVE和metadata写入统一串行；不同Task锁不同父行，可并发执行。未锁整张Memory表，未新增UNIQUE、SKIP LOCKED、全局isolation修改或deadlock retry。
+- 原业务语义保持：ADD按active `category + content`查重并返回`noop_duplicate`；UPDATE/REMOVE必须命中当前Task的active memory_id；UPDATE撞到等价active记录时soft-remove目标并返回`merge_duplicate`；REMOVE仍为soft-delete，失效或跨Task目标继续报错。
+- DeepSeek Extractor与Validator仍在事务外完成，数据库锁内只应用已经生成并验证的operations。Prompt、category、trigger、paper fact/recent source规则和operation schema均未改变。
+- 真实MySQL并发覆盖等价ADD、ADD/UPDATE、UPDATE/REMOVE、跨Task更新拒绝、父行锁阻塞同Task但不阻塞另一Task，以及Memory写入后metadata阶段异常的整体rollback；结果均等价于合法串行顺序，未出现lost update、removed Memory复活或1213 deadlock。
+- Task Memory SQLite基线`21 passed`；Phase 4D-1真实MySQL专项`6 passed`；Phase 1–4D-1真实MySQL DB回归`95 passed`；Context/Memory回归`36 passed, 6 skipped`；数据库密集型SQLite回归`279 passed, 58 skipped`；完整canonical pytest `668 passed, 116 skipped`。
+
+### 2026-08-28：SQLite → MySQL Phase 4D-2 claim_download + Phase 4 Concurrency Closeout
+
+- `claim_download()`经真实代码审计确认原本已经是单条条件`UPDATE papers ... WHERE id = ? AND status IN (...)`，通过`rowcount == 1`判断唯一成功者；本轮只移除MySQL `PHASE_4_BLOCKED`入口，保留`downloading`、清空旧error和刷新`updated_at`的既有语义，不增加`SELECT ... FOR UPDATE`。
+- 新增真实MySQL下载Claim并发测试：2 Worker/1 Paper与8 Worker/1 Paper均只有1次成功；非法`downloaded/link_only`状态保持不变；首次状态CAS成功后旧状态请求不能再次领取。
+- Phase 4全局扫描发现并关闭两个额外生产入口 blocker：`start_research_report()`的MySQL路径改为`READ COMMITTED`短事务、`research_tasks FOR UPDATE`和MySQL UPSERT；Web与Worker启动改用backend-aware初始化，MySQL继续要求通过现有手动migration runner管理DDL，启动时不执行隐式MySQL DDL。
+- 生产代码不再包含`PHASE_4_BLOCKED`或`Phase4BlockedError`。现有6处`BEGIN IMMEDIATE`全部只服务SQLite backend；对应MySQL路径分别使用parent row lock、短事务+CAS、`FOR UPDATE SKIP LOCKED`或单条ownership/lease CAS。
+- Phase 4最终并发边界：enqueue使用`READ COMMITTED + task/paper FOR UPDATE + CAS + active_dedupe UNIQUE`；Worker Claim与Expired Recovery使用`READ COMMITTED + FOR UPDATE SKIP LOCKED + CAS`；Renew/Complete/Fail使用ownership与有效lease CAS；Task Memory使用`research_tasks FOR UPDATE`；Conversation Summary使用expected message id CAS；Download Claim使用单条status CAS。
+- SQLite启动/Report/下载Claim专项`20 passed`；background_jobs SQLite回归`65 passed, 32 skipped`；Task Memory SQLite回归`21 passed, 6 skipped`；数据库密集型回归`253 passed, 64 skipped`；Phase 1–4D-2真实MySQL DB回归`100 passed`；完整canonical pytest `666 passed, 128 skipped`。真实并发运行未出现1213 deadlock，随机临时MySQL数据库全部清理。
+- Phase 4 Exit Criteria全部满足；本轮未进入性能优化、正式数据迁移或Phase 5，未修改LangGraph Checkpoint、SqliteSaver、RAG、Streaming、ContextBuilder、Citation、MinerU或Prompt。
+- 本步未修改Worker Claim、Renew、Complete、Fail/Retry、Recovery、Enqueue/Active Dedupe、`claim_download`、Conversation Summary CAS、LangGraph Checkpoint/SqliteSaver、RAG、Streaming、ContextBuilder、Citation、MinerU、Prompt、正式SQLite数据或正式`paper_hunter`数据库，未进入下一Phase。
+
+### 2026-08-28：SQLite → MySQL Phase 5 Performance / Index / Production Readiness
+
+- 按生产SQL逐项审计Worker Claim（含/不含job type）、active dedupe、Expired Recovery、Follow-up Recent Messages、Task Memory、papers/documents/chunks、RAG queries、reports、tool calls、traces、caches与evaluation；同时核对001已有主键、唯一键、外键索引和二级索引，未按表机械补索引。
+- 新增真实MySQL代表性EXPLAIN测试，随机临时库包含200个Task、300篇Paper/Document、约1万条Message、约1万条Background Job、近1万Chunk及分布式RAG/Tool Call数据；记录`type/key/rows/filtered/Extra`并在测试结束删除临时库。
+- 保持`001_initial_schema.sql`不变，新增可校验且幂等的`002_performance_indexes.sql`：Follow-up最近消息复合索引`(task_id, phase, status, created_at DESC, id DESC)`，Background Job按Task/Job Type和Paper/Job Type获取最近状态的两个复合索引。
+- Recent Messages由原`idx_research_messages_task_id + filesort`切换到新复合索引且不再filesort；Task最近Job估算行数由50降至7，Paper最近Job由33降至5，均消除额外过滤/反向扫描。MySQL active dedupe查询改为直接命中既有generated unique key，计划由ready range约330行降为`const/1 row`；SQLite查询保持原样。
+- Worker Claim继续使用既有`idx_background_jobs_ready`，代表性计划扫描约150行；Recovery仅约30个running候选。候选Recovery索引只把估算行数降到约15且仍filesort，生产Worker的job type过滤又覆盖全部handler类型，因此两者均不足以抵消队列高频写成本，本阶段拒绝新增Claim/Recovery索引。
+- 既有chunk、RAG、Task Memory、Report、Tool Call与主键CAS计划均命中当前索引；未给LONGTEXT/JSON/向量正文创建普通索引或FULLTEXT，未删除FK自动索引，也未增加连接池、通用重试或deadlock retry。
+- 事务扫描确认连接和事务内没有PDF下载、DeepSeek/Embedding调用、sleep或长轮询；Claim/Recovery短事务继续局部`READ COMMITTED`，其他CAS/parent-row lock继续保持Phase 4既有隔离与锁顺序。PyMySQL继续使用`utf8mb4`、UTC、InnoDB、`autocommit=False`、DictCursor、FOUND_ROWS和现有timeout，无生产阻断项。
+- Phase 1–5真实MySQL回归`104 passed`；完整SQLite canonical pytest `672 passed, 130 skipped`，全部skip均为未启用真实MySQL integration gate。未修改正式SQLite数据、正式`paper_hunter`数据库或LangGraph Checkpoint，未执行迁移/Cutover，也未进入Phase 6。
+
+### 2026-08-28：SQLite → MySQL Phase 6A Production Data Migration Rehearsal
+
+- 新增独立`mysql_data_migration.py`和CLI脚本，职责仅为只读SQLite Source到已完成001+002且为空的非正式MySQL Target；目标名精确为`paper_hunter`或包含不安全字符时主动拒绝，不创建正式库、不修改`.env`、不执行Cutover。
+- Source使用配置中的`downloads/metadata.db`并通过SQLite URI `mode=ro + query_only`打开；两次真实迁移演练各自前后SHA256均为`4140ac45c63ba8a7fee8346e1c2d57dafe6f807edff96b83accf2b9ff39d1207`，证明迁移工具本身只读。
+- 真实Inventory确认20张Business Table均存在；实际非空表为`agent_traces=420`、`pdf_text_cache=327`、`embedding_cache=10591`和`llm_response_cache=540`，其余16表为0。Embedding以原始JSON LONGTEXT保存，单值约35–36KB，不是BLOB。
+- Schema drift只有MySQL生成列`background_jobs.active_dedupe_key`、`evaluation_cases.question_hash`，以及SQLite旧`rag_queries`的`draft_answer/verification_*`五列；正式rag_queries当前为空。生成列不参与INSERT；任何没有Target映射但存在非NULL历史值的legacy列会fail-fast，不静默丢弃。
+- 迁移按真实FK DAG父表优先，不关闭`FOREIGN_KEY_CHECKS`；以PK升序keyset分页、默认500行一批，全部参数化`executemany`，每批显式commit/rollback，禁止IGNORE、UPSERT、duplicate吞错和失败后继续。
+- 时间转换覆盖带offset ISO、UTC Z、SQLite秒精度、微秒精度和NULL，统一写入UTC naive `DATETIME(6)`；失败会报告table/PK/column。严格拒绝空字符串数字、负UNSIGNED、字符串`None`、bool混用、NaN/Infinity和超长受限文本，不静默修复。
+- 每表验证source/target count、单列PK MIN/MAX、完整PK集合SHA256；关键业务与缓存表再按迁移后值计算流式内容hash。真实演练20表行数、PK集合及关键内容全部一致，Trace保留420行及历史ID空洞`60–550`。
+- Target保持19个InnoDB FK且全部启用、orphan均为0；active dedupe和question hash生成列错误为0，正式Source没有active dedupe冲突或同Paper重复question。全部15张AUTO_INCREMENT表均满足next ID > MAX(id)，临时Paper插入取得新ID后rollback。
+- Application-level只读演练将Business DB连接临时指向随机Target，验证papers/tasks/report/messages/memories/jobs/document/chunks、420条Trace、PDF/Embedding/LLM cache和Evaluation读取；未调用外部LLM、PDF下载或Embedding。
+- Failure injection在`embedding_cache`第2批INSERT后、commit前抛错：失败批完整rollback，已提交首批保持500行，后续`llm_response_cache`仍为0，工具立即停止且Source hash不变。非空Target重复迁移被拒绝，`validate-only`复验通过。
+- Phase 1–6A真实MySQL回归`120 passed`；SQLite数据库密集回归`245 passed, 2 skipped`；完整canonical pytest `702 passed, 132 skipped`，skip均为真实MySQL/迁移环境门控。随机临时MySQL库全部删除，未访问正式`paper_hunter`，未修改LangGraph Checkpoint/SqliteSaver，未进入Phase 6B。
+- canonical结束后的最终快照检查发现既有`test_checkpoint_resume_keeps_sources_and_batches_queries_once`缺少Business DB临时路径隔离；由于测试目录Junction被收集两次，它向正式`agent_traces`写入ID `551–562`共12条`checkpoint-source-resume`测试Trace，使Source由420行/哈希`4140ac...1207`变为432行/哈希`d85eec...f00b`。测试已补齐`tmp_path`隔离，单测前后正式哈希保持不变；但按“本轮不得写正式SQLite”约束，尚未自行删除这12条记录，Phase 6A Exit Criteria在用户明确授权恢复前不能标记全部满足。
+
+### 2026-08-28：SQLite → MySQL Phase 6 Fresh MySQL Cutover
+
+- 用户最终选择Fresh Cutover，历史SQLite Business Data明确不迁移。旧`downloads/metadata.db`以原尺寸509,149,184字节归档为`downloads/metadata_before_mysql.db`；Source与Archive SHA256均为`d85eec4f85f1b198817f2aafbe10cda0704f91127c01595ff700e7ca64cff00b`，归档未触碰`downloads/langgraph_checkpoints.db`。
+- 正式MySQL `paper_hunter`执行前存在且完全无表，字符集/排序规则为`utf8mb4/utf8mb4_unicode_ci`；使用既有migration runner顺序执行`001_initial_schema.sql`与`002_performance_indexes.sql`。验收确认20张Business Table、`schema_migrations`、19个InnoDB FK、两个stored generated column及全部关键索引存在，初始化后20张业务表均为0行。
+- 正式`.env`使用`BUSINESS_DB_BACKEND=mysql`与`BUSINESS_DB_NAME=paper_hunter`，secret只保存在gitignored `.env`；配置缺省backend改为MySQL，`.env.example`同步为MySQL且不包含密码。SQLite backend仅在显式`BUSINESS_DB_BACKEND=sqlite`时可用。
+- MySQL启动初始化新增只读fail-fast schema验收：FastAPI和Worker启动均连接正式库并核对001/002版本、checksum和20张表；连接、认证、库缺失、migration不匹配或表集合不匹配都会抛出诊断错误，不执行SQLite DDL，也不存在MySQL到SQLite的自动fallback。专项保护测试确认MySQL连接失败时`sqlite3.connect()`调用次数为0。
+- FastAPI正式配置启动成功并返回HTTP 200；Worker `--once`启动成功。真实Cutover E2E创建Task 1，DeepSeek Planner成功生成4条检索式，4次arXiv Tool Call全部成功并写入2篇Paper；选择Paper 2后完成PDF准备、MinerU 26页解析、80个Chunk索引、证据召回与DeepSeek报告。
+- Realtime Follow-up成功经历`retrieving → generating → delta → done`，用户/助手消息均为completed。最终正式库包含Task 1、Paper 2篇、Document 1、Chunk 80、Report 1、Message 8、Tool Call 4、Trace 15与Embedding Cache 83；未导入任何旧SQLite Business Data。
+- 正式Worker的`research_search`、`research_report`、`research_followup`三条Job均为`succeeded`、`attempt_count=1`、lease已释放且有worker/completed时间。active dedupe smoke首次创建1条queued follow-up，第二次立即被拒绝，active count保持1，随后Worker正常完成。
+- 正式运行和完整pytest前后`downloads/metadata.db` SHA256始终为`d85eec...f00b`，证明Business SQLite已退出正式运行路径。LangGraph Checkpoint仍由SQLite SqliteSaver管理，本次E2E thread在`langgraph_checkpoints.db`中保存16条checkpoint，未迁移到MySQL。
+- pytest根级隔离在任何项目模块导入前强制显式临时SQLite和临时DOWNLOAD_DIR，session结束时关闭测试SqliteSaver并清理目录；此前checkpoint recovery的`tmp_path`修复保留。正式`paper_hunter`在回归前后计数完全一致，`pytest/test-/checkpoint-source-resume`污染检查均为0，随机临时MySQL数据库残留为0。
+- Phase 1–5真实MySQL回归`120 passed, 1 skipped`；SQLite/DB-intensive compatibility回归`246 passed, 2 skipped`；完整canonical pytest `834 passed, 2 skipped`；`git diff --check`通过。
+- 当前MySQL用户仍拥有全局DDL、DML和管理权限，足以完成本地migration与运行，但权限明显宽于长期生产运行所需。后续生产化应拆分Migration User（DDL）与Runtime User（SELECT/INSERT/UPDATE/DELETE）；本轮不为权限重构阻塞Cutover。
+- 回滚方案仅记录、不主动执行：停止FastAPI/Worker，将`BUSINESS_DB_BACKEND`显式改回`sqlite`，使用`metadata_before_mysql.db`恢复Business SQLite，并保留`paper_hunter`现场用于诊断。长期正式架构仍为Business Data使用MySQL、LangGraph Checkpoint使用SQLite SqliteSaver。
+- Phase 1–6 Exit Criteria全部满足：Paper Hunter Business Database已完成SQLite → MySQL Fresh Cutover；Historical SQLite Business Data intentionally not migrated；不存在silent MySQL → SQLite fallback；未进入或修改LangGraph SqliteSaver迁移。

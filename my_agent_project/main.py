@@ -38,7 +38,7 @@ from .db import (
     get_paper,
     get_research_task,
     get_research_report,
-    init_db,
+    initialize_business_database,
     list_evaluation_cases,
     list_evaluation_results,
     list_evaluation_runs,
@@ -106,7 +106,7 @@ from .schemas import (
 )
 configure_utf8_stdio()
 ensure_runtime_dirs()
-init_db()
+initialize_business_database()
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))

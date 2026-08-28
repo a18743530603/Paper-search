@@ -1,12 +1,30 @@
 import csv
 import hashlib
 import json
+import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Any, Generator, Iterable, Iterator, Mapping, Optional, Sequence
 
-from .config import DATABASE_PATH, EXPORTS_DIR, ensure_runtime_dirs
+import pymysql
+from pymysql.constants import CLIENT
+
+from .config import (
+    BUSINESS_DB_BACKEND,
+    BUSINESS_DB_CONNECT_TIMEOUT,
+    BUSINESS_DB_HOST,
+    BUSINESS_DB_NAME,
+    BUSINESS_DB_PASSWORD,
+    BUSINESS_DB_PORT,
+    BUSINESS_DB_READ_TIMEOUT,
+    BUSINESS_DB_USER,
+    BUSINESS_DB_WRITE_TIMEOUT,
+    DATABASE_PATH,
+    EXPORTS_DIR,
+    ensure_runtime_dirs,
+)
 from .schemas import (
     INDEX_INDEXED,
     INDEX_INDEXING,
@@ -413,23 +431,319 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _db_timestamp(value: Optional[datetime] = None) -> str:
+def _db_timestamp(value: Optional[datetime] = None) -> str | datetime:
     current = value or _utc_now()
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    return current.astimezone(timezone.utc).isoformat(timespec="seconds")
+    utc_value = current.astimezone(timezone.utc)
+    if BUSINESS_DB_BACKEND == "mysql":
+        return utc_value.replace(tzinfo=None)
+    return utc_value.isoformat(timespec="seconds")
 
 
-def connect() -> sqlite3.Connection:
-    ensure_runtime_dirs()
-    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+def _db_time_parameter(value: str | datetime | None) -> str | datetime | None:
+    if BUSINESS_DB_BACKEND != "mysql" or value is None or isinstance(value, datetime):
+        return value
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def parameter_placeholder() -> str:
+    return "%s" if BUSINESS_DB_BACKEND == "mysql" else "?"
+
+
+def parameter_placeholders(count: int) -> str:
+    if count < 1:
+        raise ValueError("placeholder count must be at least 1")
+    return ", ".join(parameter_placeholder() for _ in range(count))
+
+
+def mysql_compatible_sql(sql: str) -> str:
+    """Convert qmark placeholders outside SQL literals/comments for PyMySQL."""
+    if BUSINESS_DB_BACKEND != "mysql" or "?" not in sql:
+        return sql
+    output: list[str] = []
+    quote: str | None = None
+    line_comment = False
+    block_comment = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+        if line_comment:
+            output.append(char)
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            output.append(char)
+            if char == "*" and next_char == "/":
+                output.append(next_char)
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote is not None:
+            output.append(char)
+            if char == "\\" and next_char:
+                output.append(next_char)
+                index += 2
+                continue
+            if char == quote:
+                if next_char == quote:
+                    output.append(next_char)
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if char == "-" and next_char == "-":
+            output.extend((char, next_char))
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            output.extend((char, next_char))
+            block_comment = True
+            index += 2
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            output.append(char)
+        elif char == "?":
+            output.append("%s")
+        else:
+            output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def backend_sql(*, sqlite_sql: str, mysql_sql: str) -> str:
+    return mysql_sql if BUSINESS_DB_BACKEND == "mysql" else sqlite_sql
+
+
+def execute_insert_ignoring_duplicate(
+    conn: "BusinessConnection",
+    *,
+    sqlite_sql: str,
+    mysql_sql: str,
+    params: Sequence[Any],
+    mysql_unique_key: str,
+):
+    """Ignore only duplicate-key conflicts, never unrelated integrity errors."""
+    if BUSINESS_DB_BACKEND == "sqlite":
+        return conn.execute(sqlite_sql, params)
+    try:
+        return conn.execute(mysql_sql, params)
+    except pymysql.err.IntegrityError as exc:
+        if _mysql_duplicate_key_name(exc) == mysql_unique_key:
+            return None
+        raise
+
+
+def _mysql_duplicate_key_name(exc: BaseException) -> str | None:
+    if not isinstance(exc, pymysql.err.IntegrityError):
+        return None
+    error_code = exc.args[0] if exc.args else None
+    if error_code != 1062 or len(exc.args) < 2:
+        return None
+    match = re.search(r"for key ['`](.+?)['`]", str(exc.args[1]), re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1).rsplit(".", 1)[-1]
+
+
+def _normalize_mysql_row(row):
+    if row is None:
+        return None
+    normalized = dict(row)
+    for key, value in normalized.items():
+        if isinstance(value, datetime):
+            normalized[key] = value.replace(tzinfo=timezone.utc).isoformat(
+                timespec="microseconds" if value.microsecond else "seconds"
+            )
+    return normalized
+
+
+class MySQLCursorAdapter:
+    def __init__(self, cursor) -> None:
+        self.raw_cursor = cursor
+
+    def execute(self, sql: str, params=None):
+        self.raw_cursor.execute(mysql_compatible_sql(sql), params)
+        return self
+
+    def executemany(self, sql: str, params):
+        self.raw_cursor.executemany(mysql_compatible_sql(sql), params)
+        return self
+
+    def fetchone(self):
+        return _normalize_mysql_row(self.raw_cursor.fetchone())
+
+    def fetchall(self):
+        return [_normalize_mysql_row(row) for row in self.raw_cursor.fetchall()]
+
+    @property
+    def rowcount(self) -> int:
+        return int(self.raw_cursor.rowcount)
+
+    @property
+    def lastrowid(self) -> int | None:
+        return self.raw_cursor.lastrowid
+
+    def close(self) -> None:
+        self.raw_cursor.close()
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for row in self.raw_cursor:
+            yield _normalize_mysql_row(row)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+class MySQLConnectionAdapter:
+    def __init__(self, connection) -> None:
+        self.raw_connection = connection
+
+    def cursor(self) -> MySQLCursorAdapter:
+        return MySQLCursorAdapter(self.raw_connection.cursor())
+
+    def execute(self, sql: str, params=None) -> MySQLCursorAdapter:
+        cursor = self.cursor()
+        return cursor.execute(sql, params)
+
+    def executemany(self, sql: str, params) -> MySQLCursorAdapter:
+        cursor = self.cursor()
+        return cursor.executemany(sql, params)
+
+    def begin(self) -> None:
+        self.raw_connection.begin()
+
+    def commit(self) -> None:
+        self.raw_connection.commit()
+
+    def rollback(self) -> None:
+        self.raw_connection.rollback()
+
+    def close(self) -> None:
+        self.raw_connection.close()
+
+    def __enter__(self):
+        self.begin()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+        return False
+
+
+BusinessConnection = sqlite3.Connection | MySQLConnectionAdapter
+
+
+def connect() -> BusinessConnection:
+    """Open one Business Database connection without managing its lifecycle."""
+    if BUSINESS_DB_BACKEND == "sqlite":
+        ensure_runtime_dirs()
+        conn = sqlite3.connect(DATABASE_PATH, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn
+    if BUSINESS_DB_BACKEND == "mysql":
+        if not BUSINESS_DB_HOST:
+            raise ValueError("BUSINESS_DB_HOST is required for the MySQL backend")
+        if not BUSINESS_DB_NAME:
+            raise ValueError("BUSINESS_DB_NAME is required for the MySQL backend")
+        if not BUSINESS_DB_USER:
+            raise ValueError("BUSINESS_DB_USER is required for the MySQL backend")
+        conn = pymysql.connect(
+            host=BUSINESS_DB_HOST,
+            port=BUSINESS_DB_PORT,
+            user=BUSINESS_DB_USER,
+            password=BUSINESS_DB_PASSWORD,
+            database=BUSINESS_DB_NAME,
+            charset="utf8mb4",
+            autocommit=False,
+            cursorclass=pymysql.cursors.DictCursor,
+            client_flag=CLIENT.FOUND_ROWS,
+            connect_timeout=BUSINESS_DB_CONNECT_TIMEOUT,
+            read_timeout=BUSINESS_DB_READ_TIMEOUT,
+            write_timeout=BUSINESS_DB_WRITE_TIMEOUT,
+        )
+        with conn.cursor() as cursor:
+            cursor.execute("SET SESSION time_zone = '+00:00'")
+            cursor.execute("SET SESSION default_storage_engine = 'InnoDB'")
+        return MySQLConnectionAdapter(conn)
+    raise ValueError(f"Unsupported Business Database backend: {BUSINESS_DB_BACKEND}")
+
+
+@contextmanager
+def read_connection() -> Generator[BusinessConnection, None, None]:
+    """Yield a read-oriented connection and close it without committing writes."""
+    conn = connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def transaction(
+    *,
+    mysql_isolation_level: str | None = None,
+) -> Generator[BusinessConnection, None, None]:
+    """Run one explicit Business Database transaction and close the connection."""
+    conn = connect()
+    transaction_started = False
+    try:
+        if BUSINESS_DB_BACKEND == "mysql":
+            if mysql_isolation_level is not None:
+                normalized_isolation = " ".join(
+                    mysql_isolation_level.upper().split()
+                )
+                if normalized_isolation not in {"READ COMMITTED"}:
+                    raise ValueError("unsupported MySQL transaction isolation level")
+                conn.execute(
+                    f"SET TRANSACTION ISOLATION LEVEL {normalized_isolation}"
+                )
+            conn.begin()
+        elif mysql_isolation_level is not None:
+            raise ValueError("MySQL isolation level requires the MySQL backend")
+        else:
+            conn.execute("BEGIN")
+        transaction_started = True
+        yield conn
+        conn.commit()
+    except BaseException:
+        if transaction_started:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
+    if BUSINESS_DB_BACKEND != "sqlite":
+        raise RuntimeError(
+            "MySQL Business Database schema must be managed by migrations/mysql"
+        )
     with connect() as conn:
         conn.executescript(SCHEMA)
         columns = {
@@ -690,6 +1004,100 @@ def init_db() -> None:
         )
 
 
+def initialize_business_database() -> None:
+    """Run backend-appropriate startup initialization without implicit MySQL DDL."""
+    if BUSINESS_DB_BACKEND == "sqlite":
+        init_db()
+        return
+    if BUSINESS_DB_BACKEND == "mysql":
+        validate_mysql_business_schema()
+        return
+    raise ValueError(f"Unsupported Business Database backend: {BUSINESS_DB_BACKEND}")
+
+
+def validate_mysql_business_schema() -> None:
+    """Fail fast unless the configured MySQL database has the current schema."""
+    from .mysql_migrations import discover_mysql_migrations
+
+    expected_migrations = {
+        migration.version: migration.checksum
+        for migration in discover_mysql_migrations()
+    }
+    expected_tables = {
+        "papers",
+        "paper_documents",
+        "paper_parent_chunks",
+        "paper_chunks",
+        "background_jobs",
+        "research_tasks",
+        "research_tool_calls",
+        "research_reports",
+        "research_messages",
+        "research_task_memories",
+        "agent_traces",
+        "rag_queries",
+        "pdf_text_cache",
+        "embedding_cache",
+        "llm_response_cache",
+        "evaluation_cases",
+        "evaluation_runs",
+        "evaluation_results",
+        "generation_evaluation_runs",
+        "generation_evaluation_results",
+    }
+    try:
+        connection = connect()
+    except Exception as exc:
+        raise RuntimeError(
+            "MySQL Business Database connection failed for "
+            f"{BUSINESS_DB_HOST}:{BUSINESS_DB_PORT}/{BUSINESS_DB_NAME}: {exc}"
+        ) from exc
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT version, checksum FROM schema_migrations ORDER BY version"
+            )
+            applied_migrations = {
+                str(row["version"]): str(row["checksum"])
+                for row in cursor.fetchall()
+            }
+            cursor.execute(
+                """
+                SELECT TABLE_NAME AS table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                """,
+                (BUSINESS_DB_NAME,),
+            )
+            actual_tables = {
+                str(row["table_name"])
+                for row in cursor.fetchall()
+                if row["table_name"] != "schema_migrations"
+            }
+    except Exception as exc:
+        raise RuntimeError(
+            "MySQL Business Database schema validation failed for "
+            f"{BUSINESS_DB_NAME}: {exc}. Run the MySQL migration runner."
+        ) from exc
+    finally:
+        connection.close()
+
+    if applied_migrations != expected_migrations:
+        raise RuntimeError(
+            "MySQL Business Database migration version/checksum mismatch for "
+            f"{BUSINESS_DB_NAME}: expected {sorted(expected_migrations)}, "
+            f"found {sorted(applied_migrations)}"
+        )
+    missing_tables = sorted(expected_tables - actual_tables)
+    unexpected_tables = sorted(actual_tables - expected_tables)
+    if missing_tables or unexpected_tables:
+        raise RuntimeError(
+            "MySQL Business Database table set mismatch for "
+            f"{BUSINESS_DB_NAME}: missing={missing_tables}, "
+            f"unexpected={unexpected_tables}"
+        )
+
+
 def insert_papers(query: str, papers: Iterable[PaperCandidate]) -> list[int]:
     ids: list[int] = []
     with connect() as conn:
@@ -830,8 +1238,7 @@ def revise_research_task_plan(
     planner_error: str,
     user_message: str,
 ) -> bool:
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with transaction() as conn:
         cursor = conn.execute(
             """
             UPDATE research_tasks
@@ -885,8 +1292,7 @@ def set_research_report_question(
     task_id: int,
     question: str,
 ) -> bool:
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with transaction() as conn:
         cursor = conn.execute(
             """
             UPDATE research_tasks
@@ -1072,12 +1478,12 @@ def create_agent_trace(
         retry_count = int(
             conn.execute(
                 """
-                SELECT COUNT(*)
+                SELECT COUNT(*) AS count
                 FROM agent_traces
                 WHERE thread_id = ? AND node_name = ?
                 """,
                 (thread_id, node_name),
-            ).fetchone()[0]
+            ).fetchone()["count"]
         )
         cursor = conn.execute(
             """
@@ -1086,7 +1492,13 @@ def create_agent_trace(
             )
             VALUES (?, ?, ?, 'running', ?, ?)
             """,
-            (task_id, thread_id, node_name, start_time, retry_count),
+            (
+                task_id,
+                thread_id,
+                node_name,
+                _db_time_parameter(start_time),
+                retry_count,
+            ),
         )
         return int(cursor.lastrowid)
 
@@ -1113,7 +1525,7 @@ def finish_agent_trace(
             """,
             (
                 status,
-                end_time,
+                _db_time_parameter(end_time),
                 max(0, int(duration_ms)),
                 json.dumps(tool_calls or [], ensure_ascii=False),
                 model_calls,
@@ -1298,7 +1710,7 @@ def list_recent_research_conversation_messages(
     exclusion_sql = ""
     parameters: list[object] = [task_id]
     if excluded_ids:
-        placeholders = ", ".join("?" for _ in excluded_ids)
+        placeholders = parameter_placeholders(len(excluded_ids))
         exclusion_sql = f"AND id NOT IN ({placeholders})"
         parameters.extend(excluded_ids)
     parameters.append(limit)
@@ -1360,7 +1772,7 @@ def list_research_conversation_context_messages(
     exclusion_sql = ""
     base_parameters: list[object] = [task_id]
     if excluded_ids:
-        placeholders = ", ".join("?" for _ in excluded_ids)
+        placeholders = parameter_placeholders(len(excluded_ids))
         exclusion_sql = f"AND id NOT IN ({placeholders})"
         base_parameters.extend(excluded_ids)
 
@@ -1488,10 +1900,17 @@ def apply_research_task_memory_operations(
     operations: Sequence[Mapping[str, object]],
 ) -> list[dict]:
     applied: list[dict] = []
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    connection_context = (
+        transaction() if BUSINESS_DB_BACKEND == "mysql" else connect()
+    )
+    with connection_context as conn:
+        if BUSINESS_DB_BACKEND == "sqlite":
+            conn.execute("BEGIN IMMEDIATE")
+        task_lock_clause = (
+            " FOR UPDATE" if BUSINESS_DB_BACKEND == "mysql" else ""
+        )
         task = conn.execute(
-            "SELECT id FROM research_tasks WHERE id = ?",
+            "SELECT id FROM research_tasks WHERE id = ?" + task_lock_clause,
             (task_id,),
         ).fetchone()
         if task is None:
@@ -1695,10 +2114,18 @@ def mark_research_message_retry_pending(message_id: int, error: str) -> bool:
 
 
 def start_research_report(task_id: int) -> bool:
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    connection_context = (
+        transaction(mysql_isolation_level="READ COMMITTED")
+        if BUSINESS_DB_BACKEND == "mysql"
+        else connect()
+    )
+    with connection_context as conn:
+        if BUSINESS_DB_BACKEND == "sqlite":
+            conn.execute("BEGIN IMMEDIATE")
+        lock_clause = " FOR UPDATE" if BUSINESS_DB_BACKEND == "mysql" else ""
         task = conn.execute(
-            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
+            "SELECT status, selected_count FROM research_tasks WHERE id = ?"
+            + lock_clause,
             (task_id,),
         ).fetchone()
         if (
@@ -1714,17 +2141,37 @@ def start_research_report(task_id: int) -> bool:
         if existing is not None and existing["status"] in RESEARCH_REPORT_RUNNING:
             return False
         conn.execute(
-            """
-            INSERT INTO research_reports (
-                task_id, status, content, details_json, model, error,
-                started_at, completed_at
-            )
-            VALUES (?, 'preparing', NULL, '{}', NULL, NULL, CURRENT_TIMESTAMP, NULL)
-            ON CONFLICT(task_id) DO UPDATE SET
-                status = 'preparing', content = NULL, details_json = '{}',
-                model = NULL, error = NULL, started_at = CURRENT_TIMESTAMP,
-                completed_at = NULL, updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                    INSERT INTO research_reports (
+                        task_id, status, content, details_json, model, error,
+                        started_at, completed_at
+                    )
+                    VALUES (
+                        ?, 'preparing', NULL, '{}', NULL, NULL,
+                        CURRENT_TIMESTAMP, NULL
+                    )
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        status = 'preparing', content = NULL, details_json = '{}',
+                        model = NULL, error = NULL, started_at = CURRENT_TIMESTAMP,
+                        completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                    INSERT INTO research_reports (
+                        task_id, status, content, details_json, model, error,
+                        started_at, completed_at
+                    )
+                    VALUES (
+                        ?, 'preparing', NULL, '{}', NULL, NULL,
+                        CURRENT_TIMESTAMP(6), NULL
+                    ) AS incoming
+                    ON DUPLICATE KEY UPDATE
+                        status = incoming.status, content = NULL,
+                        details_json = '{}', model = NULL, error = NULL,
+                        started_at = incoming.started_at, completed_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (task_id,),
         )
         return True
@@ -1904,7 +2351,9 @@ def fail_research_task(task_id: int, error: str) -> None:
 
 def clear_paper_history() -> int:
     with connect() as conn:
-        count = int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
+        count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM papers").fetchone()["count"]
+        )
         conn.execute("DELETE FROM evaluation_runs")
         conn.execute("DELETE FROM papers")
     return count
@@ -1914,9 +2363,9 @@ def register_local_paper(title: str, local_path: Path) -> int:
     resolved_path = local_path.resolve()
     if not resolved_path.is_file():
         raise FileNotFoundError(f"本地 PDF 不存在：{resolved_path}")
-    downloaded_at = datetime.fromtimestamp(
-        resolved_path.stat().st_mtime
-    ).astimezone().isoformat(timespec="seconds")
+    downloaded_at = _db_timestamp(
+        datetime.fromtimestamp(resolved_path.stat().st_mtime, tz=timezone.utc)
+    )
     with connect() as conn:
         existing = conn.execute(
             "SELECT id FROM papers WHERE title = ? ORDER BY id LIMIT 1",
@@ -2083,12 +2532,18 @@ def get_document(paper_id: int) -> Optional[sqlite3.Row]:
 
 def get_or_create_document(paper_id: int) -> sqlite3.Row:
     with connect() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
-            VALUES (?, ?)
+        execute_insert_ignoring_duplicate(
+            conn,
+            sqlite_sql="""
+                INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
+                VALUES (?, ?)
             """,
-            (paper_id, PARSE_NOT_STARTED),
+            mysql_sql="""
+                INSERT INTO paper_documents (paper_id, parse_status)
+                VALUES (?, ?)
+            """,
+            params=(paper_id, PARSE_NOT_STARTED),
+            mysql_unique_key="PRIMARY",
         )
         return conn.execute(
             "SELECT * FROM paper_documents WHERE paper_id = ?",
@@ -2134,10 +2589,10 @@ def list_indexed_chunks(paper_id: int) -> list[sqlite3.Row]:
 def count_paper_parent_chunks(paper_id: int) -> int:
     with connect() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM paper_parent_chunks WHERE paper_id = ?",
+            "SELECT COUNT(*) AS count FROM paper_parent_chunks WHERE paper_id = ?",
             (paper_id,),
         ).fetchone()
-    return int(row[0])
+    return int(row["count"])
 
 
 def get_cached_pdf_pages(source_hash: str) -> list[str]:
@@ -2177,7 +2632,7 @@ def get_cached_embeddings(
     hashes = list(dict.fromkeys(content_hashes))
     if not hashes:
         return {}
-    placeholders = ", ".join("?" for _ in hashes)
+    placeholders = parameter_placeholders(len(hashes))
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -2205,15 +2660,26 @@ def upsert_cached_embeddings(
         return 0
     with connect() as conn:
         conn.executemany(
-            """
-            INSERT INTO embedding_cache (
-                cache_namespace, content_hash, vector_json
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(cache_namespace, content_hash) DO UPDATE SET
-                vector_json = excluded.vector_json,
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO embedding_cache (
+                    cache_namespace, content_hash, vector_json
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_namespace, content_hash) DO UPDATE SET
+                    vector_json = excluded.vector_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO embedding_cache (
+                    cache_namespace, content_hash, vector_json
+                )
+                VALUES (?, ?, ?) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    vector_json = incoming.vector_json,
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             [
                 (cache_namespace, content_hash, json.dumps(vector))
                 for content_hash, vector in vectors.items()
@@ -2250,15 +2716,26 @@ def upsert_cached_llm_response(
 ) -> None:
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO llm_response_cache (
-                cache_namespace, input_hash, response_json
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(cache_namespace, input_hash) DO UPDATE SET
-                response_json = excluded.response_json,
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO llm_response_cache (
+                    cache_namespace, input_hash, response_json
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_namespace, input_hash) DO UPDATE SET
+                    response_json = excluded.response_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO llm_response_cache (
+                    cache_namespace, input_hash, response_json
+                )
+                VALUES (?, ?, ?) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    response_json = incoming.response_json,
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (
                 cache_namespace,
                 input_hash,
@@ -2277,18 +2754,32 @@ def update_parse_status(
 ) -> None:
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO paper_documents (
-                paper_id, parse_status, page_count, chunk_count, error
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(paper_id) DO UPDATE SET
-                parse_status = excluded.parse_status,
-                page_count = excluded.page_count,
-                chunk_count = excluded.chunk_count,
-                error = excluded.error,
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, page_count, chunk_count, error
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(paper_id) DO UPDATE SET
+                    parse_status = excluded.parse_status,
+                    page_count = excluded.page_count,
+                    chunk_count = excluded.chunk_count,
+                    error = excluded.error,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, page_count, chunk_count, error
+                )
+                VALUES (?, ?, ?, ?, ?) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    parse_status = incoming.parse_status,
+                    page_count = incoming.page_count,
+                    chunk_count = incoming.chunk_count,
+                    error = incoming.error,
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (paper_id, status, page_count, chunk_count, error),
         )
 
@@ -2304,22 +2795,43 @@ def update_remote_parse_state(
 ) -> None:
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO paper_documents (
-                paper_id, parse_status, source_hash, parser_backend,
-                parser_model, parser_job_id, parse_stage, error
-            )
-            VALUES (?, 'parsing', ?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(paper_id) DO UPDATE SET
-                parse_status = 'parsing',
-                source_hash = excluded.source_hash,
-                parser_backend = excluded.parser_backend,
-                parser_model = excluded.parser_model,
-                parser_job_id = COALESCE(excluded.parser_job_id, parser_job_id),
-                parse_stage = excluded.parse_stage,
-                error = NULL,
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, source_hash, parser_backend,
+                    parser_model, parser_job_id, parse_stage, error
+                )
+                VALUES (?, 'parsing', ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(paper_id) DO UPDATE SET
+                    parse_status = 'parsing',
+                    source_hash = excluded.source_hash,
+                    parser_backend = excluded.parser_backend,
+                    parser_model = excluded.parser_model,
+                    parser_job_id = COALESCE(excluded.parser_job_id, parser_job_id),
+                    parse_stage = excluded.parse_stage,
+                    error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, source_hash, parser_backend,
+                    parser_model, parser_job_id, parse_stage, error
+                )
+                VALUES (?, 'parsing', ?, ?, ?, ?, ?, NULL) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    parse_status = 'parsing',
+                    source_hash = incoming.source_hash,
+                    parser_backend = incoming.parser_backend,
+                    parser_model = incoming.parser_model,
+                    parser_job_id = COALESCE(
+                        incoming.parser_job_id,
+                        paper_documents.parser_job_id
+                    ),
+                    parse_stage = incoming.parse_stage,
+                    error = NULL,
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (
                 paper_id,
                 source_hash,
@@ -2410,42 +2922,80 @@ def replace_paper_chunks(
             ],
         )
         conn.execute(
-            """
-            INSERT INTO paper_documents (
-                paper_id, parse_status, page_count, chunk_count, error,
-                source_hash, chunk_strategy, chunk_size, chunk_overlap,
-                layout_stats_json, parser_backend, parser_model,
-                parser_job_id, parse_stage, parsed_at,
-                index_status, index_error, vectorizer, embedding_namespace,
-                indexed_at
-            )
-            VALUES (
-                ?, 'parsed', ?, ?, NULL, ?, ?, ?, ?,
-                ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP,
-                'not_indexed', NULL, NULL, NULL, NULL
-            )
-            ON CONFLICT(paper_id) DO UPDATE SET
-                parse_status = excluded.parse_status,
-                page_count = excluded.page_count,
-                chunk_count = excluded.chunk_count,
-                error = NULL,
-                source_hash = excluded.source_hash,
-                chunk_strategy = excluded.chunk_strategy,
-                chunk_size = excluded.chunk_size,
-                chunk_overlap = excluded.chunk_overlap,
-                layout_stats_json = excluded.layout_stats_json,
-                parser_backend = excluded.parser_backend,
-                parser_model = excluded.parser_model,
-                parser_job_id = excluded.parser_job_id,
-                parse_stage = 'completed',
-                parsed_at = CURRENT_TIMESTAMP,
-                index_status = 'not_indexed',
-                index_error = NULL,
-                vectorizer = NULL,
-                embedding_namespace = NULL,
-                indexed_at = NULL,
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, page_count, chunk_count, error,
+                    source_hash, chunk_strategy, chunk_size, chunk_overlap,
+                    layout_stats_json, parser_backend, parser_model,
+                    parser_job_id, parse_stage, parsed_at,
+                    index_status, index_error, vectorizer, embedding_namespace,
+                    indexed_at
+                )
+                VALUES (
+                    ?, 'parsed', ?, ?, NULL, ?, ?, ?, ?,
+                    ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP,
+                    'not_indexed', NULL, NULL, NULL, NULL
+                )
+                ON CONFLICT(paper_id) DO UPDATE SET
+                    parse_status = excluded.parse_status,
+                    page_count = excluded.page_count,
+                    chunk_count = excluded.chunk_count,
+                    error = NULL,
+                    source_hash = excluded.source_hash,
+                    chunk_strategy = excluded.chunk_strategy,
+                    chunk_size = excluded.chunk_size,
+                    chunk_overlap = excluded.chunk_overlap,
+                    layout_stats_json = excluded.layout_stats_json,
+                    parser_backend = excluded.parser_backend,
+                    parser_model = excluded.parser_model,
+                    parser_job_id = excluded.parser_job_id,
+                    parse_stage = 'completed',
+                    parsed_at = CURRENT_TIMESTAMP,
+                    index_status = 'not_indexed',
+                    index_error = NULL,
+                    vectorizer = NULL,
+                    embedding_namespace = NULL,
+                    indexed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, page_count, chunk_count, error,
+                    source_hash, chunk_strategy, chunk_size, chunk_overlap,
+                    layout_stats_json, parser_backend, parser_model,
+                    parser_job_id, parse_stage, parsed_at,
+                    index_status, index_error, vectorizer, embedding_namespace,
+                    indexed_at
+                )
+                VALUES (
+                    ?, 'parsed', ?, ?, NULL, ?, ?, ?, ?,
+                    ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP(6),
+                    'not_indexed', NULL, NULL, NULL, NULL
+                ) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    parse_status = incoming.parse_status,
+                    page_count = incoming.page_count,
+                    chunk_count = incoming.chunk_count,
+                    error = NULL,
+                    source_hash = incoming.source_hash,
+                    chunk_strategy = incoming.chunk_strategy,
+                    chunk_size = incoming.chunk_size,
+                    chunk_overlap = incoming.chunk_overlap,
+                    layout_stats_json = incoming.layout_stats_json,
+                    parser_backend = incoming.parser_backend,
+                    parser_model = incoming.parser_model,
+                    parser_job_id = incoming.parser_job_id,
+                    parse_stage = 'completed',
+                    parsed_at = CURRENT_TIMESTAMP(6),
+                    index_status = 'not_indexed',
+                    index_error = NULL,
+                    vectorizer = NULL,
+                    embedding_namespace = NULL,
+                    indexed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (
                 paper_id,
                 page_count,
@@ -2470,26 +3020,43 @@ def update_index_status(
     error: Optional[str] = None,
     vectorizer: Optional[str] = None,
 ) -> None:
-    indexed_at = (
-        datetime.now().astimezone().isoformat(timespec="seconds")
-        if status == "indexed"
-        else None
-    )
+    indexed_at = _db_timestamp() if status == "indexed" else None
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO paper_documents (
-                paper_id, parse_status, index_status, index_error,
-                vectorizer, indexed_at
-            )
-            VALUES (?, 'not_started', ?, ?, ?, ?)
-            ON CONFLICT(paper_id) DO UPDATE SET
-                index_status = excluded.index_status,
-                index_error = excluded.index_error,
-                vectorizer = COALESCE(excluded.vectorizer, vectorizer),
-                indexed_at = COALESCE(excluded.indexed_at, indexed_at),
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, index_status, index_error,
+                    vectorizer, indexed_at
+                )
+                VALUES (?, 'not_started', ?, ?, ?, ?)
+                ON CONFLICT(paper_id) DO UPDATE SET
+                    index_status = excluded.index_status,
+                    index_error = excluded.index_error,
+                    vectorizer = COALESCE(excluded.vectorizer, vectorizer),
+                    indexed_at = COALESCE(excluded.indexed_at, indexed_at),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO paper_documents (
+                    paper_id, parse_status, index_status, index_error,
+                    vectorizer, indexed_at
+                )
+                VALUES (?, 'not_started', ?, ?, ?, ?) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    index_status = incoming.index_status,
+                    index_error = incoming.index_error,
+                    vectorizer = COALESCE(
+                        incoming.vectorizer,
+                        paper_documents.vectorizer
+                    ),
+                    indexed_at = COALESCE(
+                        incoming.indexed_at,
+                        paper_documents.indexed_at
+                    ),
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (paper_id, status, error, vectorizer, indexed_at),
         )
 
@@ -2503,7 +3070,7 @@ def replace_chunk_vectors(
     warning: Optional[str] = None,
     embedding_namespace: Optional[str] = None,
 ) -> None:
-    indexed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    indexed_at = _db_timestamp()
     with connect() as conn:
         conn.execute(
             """
@@ -2635,19 +3202,34 @@ def upsert_evaluation_case(
 ) -> int:
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO evaluation_cases (
-                paper_id, question_type, question, reference_answer,
-                evidence_page, evidence_text
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(paper_id, question) DO UPDATE SET
-                question_type = excluded.question_type,
-                reference_answer = excluded.reference_answer,
-                evidence_page = excluded.evidence_page,
-                evidence_text = excluded.evidence_text,
-                updated_at = CURRENT_TIMESTAMP
-            """,
+            backend_sql(
+                sqlite_sql="""
+                INSERT INTO evaluation_cases (
+                    paper_id, question_type, question, reference_answer,
+                    evidence_page, evidence_text
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(paper_id, question) DO UPDATE SET
+                    question_type = excluded.question_type,
+                    reference_answer = excluded.reference_answer,
+                    evidence_page = excluded.evidence_page,
+                    evidence_text = excluded.evidence_text,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                mysql_sql="""
+                INSERT INTO evaluation_cases (
+                    paper_id, question_type, question, reference_answer,
+                    evidence_page, evidence_text
+                )
+                VALUES (?, ?, ?, ?, ?, ?) AS incoming
+                ON DUPLICATE KEY UPDATE
+                    question_type = incoming.question_type,
+                    reference_answer = incoming.reference_answer,
+                    evidence_page = incoming.evidence_page,
+                    evidence_text = incoming.evidence_text,
+                    updated_at = CURRENT_TIMESTAMP(6)
+                """,
+            ),
             (
                 paper_id,
                 question_type,
@@ -2737,19 +3319,34 @@ def save_evaluation_result(
 ) -> None:
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO evaluation_results (
-                run_id, case_id, hit_rank, reciprocal_rank, best_coverage,
-                retrieved_json, error
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id, case_id) DO UPDATE SET
-                hit_rank = excluded.hit_rank,
-                reciprocal_rank = excluded.reciprocal_rank,
-                best_coverage = excluded.best_coverage,
-                retrieved_json = excluded.retrieved_json,
-                error = excluded.error
-            """,
+            backend_sql(
+                sqlite_sql="""
+                    INSERT INTO evaluation_results (
+                        run_id, case_id, hit_rank, reciprocal_rank, best_coverage,
+                        retrieved_json, error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, case_id) DO UPDATE SET
+                        hit_rank = excluded.hit_rank,
+                        reciprocal_rank = excluded.reciprocal_rank,
+                        best_coverage = excluded.best_coverage,
+                        retrieved_json = excluded.retrieved_json,
+                        error = excluded.error
+                """,
+                mysql_sql="""
+                    INSERT INTO evaluation_results (
+                        run_id, case_id, hit_rank, reciprocal_rank, best_coverage,
+                        retrieved_json, error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?) AS incoming
+                    ON DUPLICATE KEY UPDATE
+                        hit_rank = incoming.hit_rank,
+                        reciprocal_rank = incoming.reciprocal_rank,
+                        best_coverage = incoming.best_coverage,
+                        retrieved_json = incoming.retrieved_json,
+                        error = incoming.error
+                """,
+            ),
             (
                 run_id,
                 case_id,
@@ -2769,7 +3366,7 @@ def finish_evaluation_run(
     metrics: Optional[dict] = None,
     error: Optional[str] = None,
 ) -> None:
-    completed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    completed_at = _db_timestamp()
     with connect() as conn:
         conn.execute(
             """
@@ -2892,26 +3489,48 @@ def save_generation_evaluation_result(
 ) -> None:
     with connect() as conn:
         conn.execute(
-            """
-            INSERT INTO generation_evaluation_results (
-                run_id, case_id, answer, evidence_json, faithfulness,
-                answer_relevance, reference_correctness,
-                citation_correctness, judge_json, generation_seconds,
-                judge_seconds, error
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id, case_id) DO UPDATE SET
-                answer = excluded.answer,
-                evidence_json = excluded.evidence_json,
-                faithfulness = excluded.faithfulness,
-                answer_relevance = excluded.answer_relevance,
-                reference_correctness = excluded.reference_correctness,
-                citation_correctness = excluded.citation_correctness,
-                judge_json = excluded.judge_json,
-                generation_seconds = excluded.generation_seconds,
-                judge_seconds = excluded.judge_seconds,
-                error = excluded.error
-            """,
+            backend_sql(
+                sqlite_sql="""
+                    INSERT INTO generation_evaluation_results (
+                        run_id, case_id, answer, evidence_json, faithfulness,
+                        answer_relevance, reference_correctness,
+                        citation_correctness, judge_json, generation_seconds,
+                        judge_seconds, error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, case_id) DO UPDATE SET
+                        answer = excluded.answer,
+                        evidence_json = excluded.evidence_json,
+                        faithfulness = excluded.faithfulness,
+                        answer_relevance = excluded.answer_relevance,
+                        reference_correctness = excluded.reference_correctness,
+                        citation_correctness = excluded.citation_correctness,
+                        judge_json = excluded.judge_json,
+                        generation_seconds = excluded.generation_seconds,
+                        judge_seconds = excluded.judge_seconds,
+                        error = excluded.error
+                """,
+                mysql_sql="""
+                    INSERT INTO generation_evaluation_results (
+                        run_id, case_id, answer, evidence_json, faithfulness,
+                        answer_relevance, reference_correctness,
+                        citation_correctness, judge_json, generation_seconds,
+                        judge_seconds, error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS incoming
+                    ON DUPLICATE KEY UPDATE
+                        answer = incoming.answer,
+                        evidence_json = incoming.evidence_json,
+                        faithfulness = incoming.faithfulness,
+                        answer_relevance = incoming.answer_relevance,
+                        reference_correctness = incoming.reference_correctness,
+                        citation_correctness = incoming.citation_correctness,
+                        judge_json = incoming.judge_json,
+                        generation_seconds = incoming.generation_seconds,
+                        judge_seconds = incoming.judge_seconds,
+                        error = incoming.error
+                """,
+            ),
             (
                 run_id,
                 case_id,
@@ -2936,7 +3555,7 @@ def finish_generation_evaluation_run(
     metrics: Optional[dict] = None,
     error: Optional[str] = None,
 ) -> None:
-    completed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    completed_at = _db_timestamp()
     with connect() as conn:
         conn.execute(
             """
@@ -3030,6 +3649,82 @@ def _background_job_from_row(row: sqlite3.Row) -> dict:
     return job
 
 
+MYSQL_ACTIVE_DEDUPE_UNIQUE_KEY = "idx_background_jobs_active_dedupe"
+
+
+@contextmanager
+def _enqueue_transaction() -> Generator[BusinessConnection, None, None]:
+    """Serialize one enqueue around its task/paper row and commit atomically."""
+    if BUSINESS_DB_BACKEND == "mysql":
+        with transaction(mysql_isolation_level="READ COMMITTED") as conn:
+            yield conn
+        return
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+
+
+def _enqueue_lock_clause() -> str:
+    return " FOR UPDATE" if BUSINESS_DB_BACKEND == "mysql" else ""
+
+
+def _active_job_by_dedupe_key(
+    conn: BusinessConnection,
+    dedupe_key: str,
+):
+    return conn.execute(
+        backend_sql(
+            sqlite_sql="""
+                SELECT id, job_type, paper_id, rag_query_id, research_task_id
+                FROM background_jobs
+                WHERE dedupe_key = ?
+                  AND status IN ('queued', 'running', 'retry_wait')
+                LIMIT 1
+            """,
+            mysql_sql="""
+                SELECT id, job_type, paper_id, rag_query_id, research_task_id
+                FROM background_jobs
+                WHERE active_dedupe_key = ?
+                LIMIT 1
+            """,
+        ),
+        (dedupe_key,),
+    ).fetchone()
+
+
+def _active_job_after_expected_dedupe_conflict(
+    exc: BaseException,
+    dedupe_key: str,
+):
+    """Re-read the winner only after an exact active-dedupe 1062 conflict."""
+    if (
+        BUSINESS_DB_BACKEND != "mysql"
+        or _mysql_duplicate_key_name(exc) != MYSQL_ACTIVE_DEDUPE_UNIQUE_KEY
+    ):
+        return None
+    with read_connection() as conn:
+        return _active_job_by_dedupe_key(conn, dedupe_key)
+
+
+def _insert_paper_document_if_missing(
+    conn: BusinessConnection,
+    paper_id: int,
+) -> None:
+    execute_insert_ignoring_duplicate(
+        conn,
+        sqlite_sql="""
+            INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
+            VALUES (?, ?)
+        """,
+        mysql_sql="""
+            INSERT INTO paper_documents (paper_id, parse_status)
+            VALUES (?, ?)
+        """,
+        params=(paper_id, PARSE_NOT_STARTED),
+        mysql_unique_key="PRIMARY",
+    )
+
+
 def enqueue_research_search_job(
     task_id: int,
     *,
@@ -3041,68 +3736,69 @@ def enqueue_research_search_job(
 
     timestamp = _db_timestamp(now)
     dedupe_key = f"research_search:{task_id}"
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        task = conn.execute(
-            "SELECT id, status FROM research_tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if task is None:
-            raise LookupError("研究任务不存在")
+    try:
+        with _enqueue_transaction() as conn:
+            task = conn.execute(
+                "SELECT id, status FROM research_tasks WHERE id = ?"
+                + _enqueue_lock_clause(),
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise LookupError("研究任务不存在")
 
-        active = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE dedupe_key = ?
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (dedupe_key,),
-        ).fetchone()
-        if active is not None:
-            if task["status"] != "running":
-                raise RuntimeError("研究检索队列与任务状态不一致")
-            return {
-                "job_id": int(active["id"]),
-                "task_id": task_id,
-                "created": False,
-            }
+            active = _active_job_by_dedupe_key(conn, dedupe_key)
+            if active is not None:
+                if task["status"] != "running":
+                    raise RuntimeError("研究检索队列与任务状态不一致")
+                return {
+                    "job_id": int(active["id"]),
+                    "task_id": task_id,
+                    "created": False,
+                }
 
-        cursor = conn.execute(
-            """
-            UPDATE research_tasks
-            SET status = 'running', error = NULL, completed_at = NULL,
-                confirmed_at = COALESCE(confirmed_at, ?), updated_at = ?
-            WHERE id = ? AND status = 'awaiting_confirmation'
-            """,
-            (timestamp, timestamp, task_id),
-        )
-        if cursor.rowcount != 1:
-            raise RuntimeError("研究任务当前状态不允许确认")
-
-        job_cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, research_task_id, status,
-                max_attempts, available_at, created_at, updated_at
+            cursor = conn.execute(
+                """
+                UPDATE research_tasks
+                SET status = 'running', error = NULL, completed_at = NULL,
+                    confirmed_at = COALESCE(confirmed_at, ?), updated_at = ?
+                WHERE id = ? AND status = 'awaiting_confirmation'
+                """,
+                (timestamp, timestamp, task_id),
             )
-            VALUES ('research_search', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps({"task_id": task_id}, ensure_ascii=False),
-                dedupe_key,
-                task_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
+            if cursor.rowcount != 1:
+                raise RuntimeError("研究任务当前状态不允许确认")
+
+            job_cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, research_task_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('research_search', ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps({"task_id": task_id}, ensure_ascii=False),
+                    dedupe_key,
+                    task_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return {
+                "job_id": int(job_cursor.lastrowid),
+                "task_id": task_id,
+                "created": True,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
         return {
-            "job_id": int(job_cursor.lastrowid),
+            "job_id": int(active["id"]),
             "task_id": task_id,
-            "created": True,
+            "created": False,
         }
 
 
@@ -3117,78 +3813,95 @@ def enqueue_research_report_job(
 
     timestamp = _db_timestamp(now)
     dedupe_key = f"research_report:{task_id}"
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        task = conn.execute(
-            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if task is None:
-            raise LookupError("研究任务不存在")
-        if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
-            raise RuntimeError("研究任务尚未冻结可用于报告的论文")
+    try:
+        with _enqueue_transaction() as conn:
+            task = conn.execute(
+                "SELECT status, selected_count FROM research_tasks WHERE id = ?"
+                + _enqueue_lock_clause(),
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise LookupError("研究任务不存在")
+            if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
+                raise RuntimeError("研究任务尚未冻结可用于报告的论文")
 
-        active = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE dedupe_key = ?
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (dedupe_key,),
-        ).fetchone()
-        report = conn.execute(
-            "SELECT status FROM research_reports WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if active is not None:
-            if report is None or report["status"] not in RESEARCH_REPORT_RUNNING:
-                raise RuntimeError("研究报告队列与业务状态不一致")
+            active = _active_job_by_dedupe_key(conn, dedupe_key)
+            report = conn.execute(
+                "SELECT status FROM research_reports WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if active is not None:
+                if report is None or report["status"] not in RESEARCH_REPORT_RUNNING:
+                    raise RuntimeError("研究报告队列与业务状态不一致")
+                return {
+                    "job_id": int(active["id"]),
+                    "task_id": task_id,
+                    "created": False,
+                }
+            if report is not None and report["status"] in RESEARCH_REPORT_RUNNING:
+                raise RuntimeError("研究报告已经在执行")
+
+            conn.execute(
+                backend_sql(
+                    sqlite_sql="""
+                        INSERT INTO research_reports (
+                            task_id, status, content, details_json, model, error,
+                            started_at, completed_at, updated_at
+                        )
+                        VALUES (?, 'preparing', NULL, '{}', NULL, NULL, ?, NULL, ?)
+                        ON CONFLICT(task_id) DO UPDATE SET
+                            status = 'preparing', content = NULL, details_json = '{}',
+                            model = NULL, error = NULL,
+                            started_at = excluded.started_at,
+                            completed_at = NULL, updated_at = excluded.updated_at
+                    """,
+                    mysql_sql="""
+                        INSERT INTO research_reports (
+                            task_id, status, content, details_json, model, error,
+                            started_at, completed_at, updated_at
+                        )
+                        VALUES (?, 'preparing', NULL, '{}', NULL, NULL, ?, NULL, ?)
+                            AS incoming
+                        ON DUPLICATE KEY UPDATE
+                            status = 'preparing', content = NULL, details_json = '{}',
+                            model = NULL, error = NULL,
+                            started_at = incoming.started_at,
+                            completed_at = NULL, updated_at = incoming.updated_at
+                    """,
+                ),
+                (task_id, timestamp, timestamp),
+            )
+            job_cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, research_task_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('research_report', ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps({"task_id": task_id}, ensure_ascii=False),
+                    dedupe_key,
+                    task_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
             return {
-                "job_id": int(active["id"]),
+                "job_id": int(job_cursor.lastrowid),
                 "task_id": task_id,
-                "created": False,
+                "created": True,
             }
-        if report is not None and report["status"] in RESEARCH_REPORT_RUNNING:
-            raise RuntimeError("研究报告已经在执行")
-
-        conn.execute(
-            """
-            INSERT INTO research_reports (
-                task_id, status, content, details_json, model, error,
-                started_at, completed_at, updated_at
-            )
-            VALUES (?, 'preparing', NULL, '{}', NULL, NULL, ?, NULL, ?)
-            ON CONFLICT(task_id) DO UPDATE SET
-                status = 'preparing', content = NULL, details_json = '{}',
-                model = NULL, error = NULL, started_at = excluded.started_at,
-                completed_at = NULL, updated_at = excluded.updated_at
-            """,
-            (task_id, timestamp, timestamp),
-        )
-        job_cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, research_task_id, status,
-                max_attempts, available_at, created_at, updated_at
-            )
-            VALUES ('research_report', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps({"task_id": task_id}, ensure_ascii=False),
-                dedupe_key,
-                task_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
         return {
-            "job_id": int(job_cursor.lastrowid),
+            "job_id": int(active["id"]),
             "task_id": task_id,
-            "created": True,
+            "created": False,
         }
 
 
@@ -3199,10 +3912,10 @@ def create_research_followup_messages(task_id: int, question: str) -> dict:
     if len(question) > 2000:
         raise ValueError("追问内容不能超过2000个字符")
 
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _enqueue_transaction() as conn:
         task = conn.execute(
-            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
+            "SELECT status, selected_count FROM research_tasks WHERE id = ?"
+            + _enqueue_lock_clause(),
             (task_id,),
         ).fetchone()
         if task is None:
@@ -3285,85 +3998,103 @@ def enqueue_research_followup_job(
 
     timestamp = _db_timestamp(now)
     dedupe_key = f"research_followup:{task_id}"
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        task = conn.execute(
-            "SELECT status, selected_count FROM research_tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if task is None:
-            raise LookupError("研究任务不存在")
-        if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
-            raise RuntimeError("研究任务尚未冻结论文集合")
-        report = conn.execute(
-            "SELECT status FROM research_reports WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if report is None or report["status"] != "completed":
-            raise RuntimeError("研究报告完成后才能继续追问")
-        active = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE dedupe_key = ?
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (dedupe_key,),
-        ).fetchone()
-        if active is not None:
-            raise RuntimeError("上一条研究追问仍在处理中")
+    try:
+        with _enqueue_transaction() as conn:
+            task = conn.execute(
+                "SELECT status, selected_count FROM research_tasks WHERE id = ?"
+                + _enqueue_lock_clause(),
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise LookupError("研究任务不存在")
+            if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
+                raise RuntimeError("研究任务尚未冻结论文集合")
+            report = conn.execute(
+                "SELECT status FROM research_reports WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if report is None or report["status"] != "completed":
+                raise RuntimeError("研究报告完成后才能继续追问")
+            active_message = conn.execute(
+                """
+                SELECT id
+                FROM research_messages
+                WHERE task_id = ?
+                  AND role = 'assistant'
+                  AND phase = 'followup'
+                  AND status IN (
+                      'pending', 'retrieving', 'generating',
+                      'streaming', 'retry_wait'
+                  )
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active_message is not None:
+                raise RuntimeError("上一条研究追问仍在处理中")
+            active = _active_job_by_dedupe_key(conn, dedupe_key)
+            if active is not None:
+                raise RuntimeError("上一条研究追问仍在处理中")
 
-        user_cursor = conn.execute(
-            """
-            INSERT INTO research_messages (task_id, role, phase, content)
-            VALUES (?, 'user', 'followup', ?)
-            """,
-            (task_id, question),
-        )
-        assistant_cursor = conn.execute(
-            """
-            INSERT INTO research_messages (
-                task_id, role, phase, content, status
+            user_cursor = conn.execute(
+                """
+                INSERT INTO research_messages (task_id, role, phase, content)
+                VALUES (?, 'user', 'followup', ?)
+                """,
+                (task_id, question),
             )
-            VALUES (?, 'assistant', 'followup', '正在检索所选论文证据...', 'pending')
-            """,
-            (task_id,),
-        )
-        message_id = int(assistant_cursor.lastrowid)
-        job_cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, research_task_id, status,
-                max_attempts, available_at, created_at, updated_at
+            assistant_cursor = conn.execute(
+                """
+                INSERT INTO research_messages (
+                    task_id, role, phase, content, status
+                )
+                VALUES (
+                    ?, 'assistant', 'followup',
+                    '正在检索所选论文证据...', 'pending'
+                )
+                """,
+                (task_id,),
             )
-            VALUES ('research_followup', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps(
-                    {
-                        "task_id": task_id,
-                        "user_message_id": int(user_cursor.lastrowid),
-                        "message_id": message_id,
-                        "question": question,
-                    },
-                    ensure_ascii=False,
+            user_message_id = int(user_cursor.lastrowid)
+            message_id = int(assistant_cursor.lastrowid)
+            job_cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, research_task_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('research_followup', ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps(
+                        {
+                            "task_id": task_id,
+                            "user_message_id": user_message_id,
+                            "message_id": message_id,
+                            "question": question,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    dedupe_key,
+                    task_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
                 ),
-                dedupe_key,
-                task_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
-        return {
-            "job_id": int(job_cursor.lastrowid),
-            "task_id": task_id,
-            "user_message_id": int(user_cursor.lastrowid),
-            "message_id": message_id,
-            "created": True,
-        }
+            )
+            return {
+                "job_id": int(job_cursor.lastrowid),
+                "task_id": task_id,
+                "user_message_id": user_message_id,
+                "message_id": message_id,
+                "created": True,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        raise RuntimeError("上一条研究追问仍在处理中") from None
 
 
 def enqueue_download_job(
@@ -3381,50 +4112,51 @@ def enqueue_download_job(
 
     timestamp = _db_timestamp(now)
     dedupe_key = f"download_paper:{paper_id}"
-    placeholders = ", ".join("?" for _ in statuses)
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        active = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE paper_id = ?
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (paper_id,),
-        ).fetchone()
-        if active is not None:
-            return None
-        cursor = conn.execute(
-            f"""
-            UPDATE papers
-            SET status = ?, error = NULL, updated_at = ?
-            WHERE id = ? AND status IN ({placeholders})
-            """,
-            (STATUS_DOWNLOADING, timestamp, paper_id, *statuses),
-        )
-        if cursor.rowcount != 1:
-            return None
-        job_cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, paper_id, status,
-                max_attempts, available_at, created_at, updated_at
+    placeholders = parameter_placeholders(len(statuses))
+    try:
+        with _enqueue_transaction() as conn:
+            paper = conn.execute(
+                "SELECT id FROM papers WHERE id = ?" + _enqueue_lock_clause(),
+                (paper_id,),
+            ).fetchone()
+            if paper is None:
+                return None
+            if _active_paper_job(conn, paper_id) is not None:
+                return None
+            cursor = conn.execute(
+                f"""
+                UPDATE papers
+                SET status = ?, error = NULL, updated_at = ?
+                WHERE id = ? AND status IN ({placeholders})
+                """,
+                (STATUS_DOWNLOADING, timestamp, paper_id, *statuses),
             )
-            VALUES ('download_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps({"paper_id": paper_id}, ensure_ascii=False),
-                dedupe_key,
-                paper_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
-        return int(job_cursor.lastrowid)
+            if cursor.rowcount != 1:
+                return None
+            job_cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, paper_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('download_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps({"paper_id": paper_id}, ensure_ascii=False),
+                    dedupe_key,
+                    paper_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return int(job_cursor.lastrowid)
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        return None
 
 
 def enqueue_paper_preparation_job(
@@ -3438,111 +4170,99 @@ def enqueue_paper_preparation_job(
 
     timestamp = _db_timestamp(now)
     dedupe_key = f"prepare_paper:{paper_id}"
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        paper = conn.execute(
-            "SELECT * FROM papers WHERE id = ?",
-            (paper_id,),
-        ).fetchone()
-        if paper is None:
-            raise LookupError("论文记录不存在")
-
-        active = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE paper_id = ?
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (paper_id,),
-        ).fetchone()
-        if active is not None:
-            raise RuntimeError("论文下载或准备任务已经在执行")
-
-        download_claimed = False
-        if not paper["local_path"]:
-            if paper["status"] not in ("available", "failed"):
-                raise RuntimeError("论文当前状态不允许启动准备任务")
-            cursor = conn.execute(
-                """
-                UPDATE papers
-                SET status = ?, error = NULL, updated_at = ?
-                WHERE id = ? AND status IN ('available', 'failed')
-                """,
-                (STATUS_DOWNLOADING, timestamp, paper_id),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("论文准备状态已由其他请求改变")
-            preparation_status = STATUS_DOWNLOADING
-            download_claimed = True
-        else:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
-                VALUES (?, ?)
-                """,
-                (paper_id, PARSE_NOT_STARTED),
-            )
-            document = conn.execute(
-                "SELECT * FROM paper_documents WHERE paper_id = ?",
+    try:
+        with _enqueue_transaction() as conn:
+            paper = conn.execute(
+                "SELECT * FROM papers WHERE id = ?" + _enqueue_lock_clause(),
                 (paper_id,),
             ).fetchone()
-            if document["parse_status"] == PARSE_PARSING:
-                raise RuntimeError("论文解析任务已经在执行")
-            if document["parse_status"] != PARSE_PARSED:
-                conn.execute(
-                    """
-                    UPDATE paper_documents
-                    SET parse_status = ?, error = NULL, updated_at = ?
-                    WHERE paper_id = ?
-                    """,
-                    (PARSE_PARSING, timestamp, paper_id),
-                )
-                preparation_status = PARSE_PARSING
-            elif document["index_status"] == INDEX_INDEXED:
-                return {"job_id": None, "preparation_status": "ready"}
-            else:
-                if document["index_status"] == INDEX_INDEXING:
-                    raise RuntimeError("论文索引任务已经在执行")
-                conn.execute(
-                    """
-                    UPDATE paper_documents
-                    SET index_status = ?, index_error = NULL, updated_at = ?
-                    WHERE paper_id = ?
-                    """,
-                    (INDEX_INDEXING, timestamp, paper_id),
-                )
-                preparation_status = INDEX_INDEXING
+            if paper is None:
+                raise LookupError("论文记录不存在")
+            if _active_paper_job(conn, paper_id) is not None:
+                raise RuntimeError("论文下载或准备任务已经在执行")
 
-        cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, paper_id, status,
-                max_attempts, available_at, created_at, updated_at
-            )
-            VALUES ('prepare_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps(
-                    {
-                        "paper_id": paper_id,
-                        "download_claimed": download_claimed,
-                    },
-                    ensure_ascii=False,
+            download_claimed = False
+            if not paper["local_path"]:
+                if paper["status"] not in ("available", "failed"):
+                    raise RuntimeError("论文当前状态不允许启动准备任务")
+                cursor = conn.execute(
+                    """
+                    UPDATE papers
+                    SET status = ?, error = NULL, updated_at = ?
+                    WHERE id = ? AND status IN ('available', 'failed')
+                    """,
+                    (STATUS_DOWNLOADING, timestamp, paper_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("论文准备状态已由其他请求改变")
+                preparation_status = STATUS_DOWNLOADING
+                download_claimed = True
+            else:
+                _insert_paper_document_if_missing(conn, paper_id)
+                document = conn.execute(
+                    "SELECT * FROM paper_documents WHERE paper_id = ?",
+                    (paper_id,),
+                ).fetchone()
+                if document["parse_status"] == PARSE_PARSING:
+                    raise RuntimeError("论文解析任务已经在执行")
+                if document["parse_status"] != PARSE_PARSED:
+                    conn.execute(
+                        """
+                        UPDATE paper_documents
+                        SET parse_status = ?, error = NULL, updated_at = ?
+                        WHERE paper_id = ?
+                        """,
+                        (PARSE_PARSING, timestamp, paper_id),
+                    )
+                    preparation_status = PARSE_PARSING
+                elif document["index_status"] == INDEX_INDEXED:
+                    return {"job_id": None, "preparation_status": "ready"}
+                else:
+                    if document["index_status"] == INDEX_INDEXING:
+                        raise RuntimeError("论文索引任务已经在执行")
+                    conn.execute(
+                        """
+                        UPDATE paper_documents
+                        SET index_status = ?, index_error = NULL, updated_at = ?
+                        WHERE paper_id = ?
+                        """,
+                        (INDEX_INDEXING, timestamp, paper_id),
+                    )
+                    preparation_status = INDEX_INDEXING
+
+            cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, paper_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('prepare_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps(
+                        {
+                            "paper_id": paper_id,
+                            "download_claimed": download_claimed,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    dedupe_key,
+                    paper_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
                 ),
-                dedupe_key,
-                paper_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
-        return {
-            "job_id": int(cursor.lastrowid),
-            "preparation_status": preparation_status,
-        }
+            )
+            return {
+                "job_id": int(cursor.lastrowid),
+                "preparation_status": preparation_status,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        raise RuntimeError("论文下载或准备任务已经在执行") from None
 
 
 def _active_paper_job(conn: sqlite3.Connection, paper_id: int) -> Optional[sqlite3.Row]:
@@ -3568,65 +4288,66 @@ def enqueue_parse_job(
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     timestamp = _db_timestamp(now)
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        paper = conn.execute(
-            "SELECT id, local_path FROM papers WHERE id = ?",
-            (paper_id,),
-        ).fetchone()
-        if paper is None:
-            raise LookupError("论文记录不存在")
-        if not paper["local_path"]:
-            raise RuntimeError("论文PDF尚未下载")
-        if _active_paper_job(conn, paper_id) is not None:
-            raise RuntimeError("论文已有后台任务正在执行")
+    dedupe_key = f"parse_paper:{paper_id}"
+    try:
+        with _enqueue_transaction() as conn:
+            paper = conn.execute(
+                "SELECT id, local_path FROM papers WHERE id = ?"
+                + _enqueue_lock_clause(),
+                (paper_id,),
+            ).fetchone()
+            if paper is None:
+                raise LookupError("论文记录不存在")
+            if not paper["local_path"]:
+                raise RuntimeError("论文PDF尚未下载")
+            if _active_paper_job(conn, paper_id) is not None:
+                raise RuntimeError("论文已有后台任务正在执行")
 
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO paper_documents (paper_id, parse_status)
-            VALUES (?, ?)
-            """,
-            (paper_id, PARSE_NOT_STARTED),
-        )
-        document = conn.execute(
-            "SELECT parse_status FROM paper_documents WHERE paper_id = ?",
-            (paper_id,),
-        ).fetchone()
-        if document["parse_status"] == PARSE_PARSING:
-            raise RuntimeError("论文解析任务已经在执行")
-        queued_parse_status = document["parse_status"]
-        if document["parse_status"] != PARSE_PARSED:
-            conn.execute(
+            _insert_paper_document_if_missing(conn, paper_id)
+            document = conn.execute(
+                "SELECT parse_status FROM paper_documents WHERE paper_id = ?",
+                (paper_id,),
+            ).fetchone()
+            if document["parse_status"] == PARSE_PARSING:
+                raise RuntimeError("论文解析任务已经在执行")
+            queued_parse_status = document["parse_status"]
+            if document["parse_status"] != PARSE_PARSED:
+                conn.execute(
+                    """
+                    UPDATE paper_documents
+                    SET parse_status = ?, error = NULL, updated_at = ?
+                    WHERE paper_id = ?
+                    """,
+                    (PARSE_PARSING, timestamp, paper_id),
+                )
+                queued_parse_status = PARSE_PARSING
+            cursor = conn.execute(
                 """
-                UPDATE paper_documents
-                SET parse_status = ?, error = NULL, updated_at = ?
-                WHERE paper_id = ?
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, paper_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('parse_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
                 """,
-                (PARSE_PARSING, timestamp, paper_id),
+                (
+                    json.dumps({"paper_id": paper_id}, ensure_ascii=False),
+                    dedupe_key,
+                    paper_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
             )
-            queued_parse_status = PARSE_PARSING
-        cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, paper_id, status,
-                max_attempts, available_at, created_at, updated_at
-            )
-            VALUES ('parse_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps({"paper_id": paper_id}, ensure_ascii=False),
-                f"parse_paper:{paper_id}",
-                paper_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
-        return {
-            "job_id": int(cursor.lastrowid),
-            "parse_status": queued_parse_status,
-        }
+            return {
+                "job_id": int(cursor.lastrowid),
+                "parse_status": queued_parse_status,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        raise RuntimeError("论文已有后台任务正在执行") from None
 
 
 def enqueue_index_job(
@@ -3638,51 +4359,64 @@ def enqueue_index_job(
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     timestamp = _db_timestamp(now)
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        paper = conn.execute(
-            "SELECT id FROM papers WHERE id = ?",
-            (paper_id,),
-        ).fetchone()
-        if paper is None:
-            raise LookupError("论文记录不存在")
-        if _active_paper_job(conn, paper_id) is not None:
-            raise RuntimeError("论文已有后台任务正在执行")
-        document = conn.execute(
-            "SELECT parse_status, index_status FROM paper_documents WHERE paper_id = ?",
-            (paper_id,),
-        ).fetchone()
-        if document is None or document["parse_status"] != PARSE_PARSED:
-            raise RuntimeError("论文尚未完成解析")
-        if document["index_status"] == INDEX_INDEXING:
-            raise RuntimeError("论文索引任务已经在执行")
-        conn.execute(
-            """
-            UPDATE paper_documents
-            SET index_status = ?, index_error = NULL, updated_at = ?
-            WHERE paper_id = ?
-            """,
-            (INDEX_INDEXING, timestamp, paper_id),
-        )
-        cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, paper_id, status,
-                max_attempts, available_at, created_at, updated_at
+    dedupe_key = f"index_paper:{paper_id}"
+    try:
+        with _enqueue_transaction() as conn:
+            paper = conn.execute(
+                "SELECT id FROM papers WHERE id = ?" + _enqueue_lock_clause(),
+                (paper_id,),
+            ).fetchone()
+            if paper is None:
+                raise LookupError("论文记录不存在")
+            if _active_paper_job(conn, paper_id) is not None:
+                raise RuntimeError("论文已有后台任务正在执行")
+            document = conn.execute(
+                """
+                SELECT parse_status, index_status
+                FROM paper_documents
+                WHERE paper_id = ?
+                """,
+                (paper_id,),
+            ).fetchone()
+            if document is None or document["parse_status"] != PARSE_PARSED:
+                raise RuntimeError("论文尚未完成解析")
+            if document["index_status"] == INDEX_INDEXING:
+                raise RuntimeError("论文索引任务已经在执行")
+            conn.execute(
+                """
+                UPDATE paper_documents
+                SET index_status = ?, index_error = NULL, updated_at = ?
+                WHERE paper_id = ?
+                """,
+                (INDEX_INDEXING, timestamp, paper_id),
             )
-            VALUES ('index_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps({"paper_id": paper_id}, ensure_ascii=False),
-                f"index_paper:{paper_id}",
-                paper_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
-        return {"job_id": int(cursor.lastrowid), "index_status": INDEX_INDEXING}
+            cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, paper_id, status,
+                    max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('index_paper', ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps({"paper_id": paper_id}, ensure_ascii=False),
+                    dedupe_key,
+                    paper_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return {
+                "job_id": int(cursor.lastrowid),
+                "index_status": INDEX_INDEXING,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        raise RuntimeError("论文已有后台任务正在执行") from None
 
 
 def enqueue_rag_answer_job(
@@ -3704,85 +4438,87 @@ def enqueue_rag_answer_job(
         f"{reranker}\0{question}".encode("utf-8")
     ).hexdigest()[:32]
     dedupe_key = f"answer_rag_query:{paper_id}:{fingerprint}"
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        paper = conn.execute(
-            "SELECT id FROM papers WHERE id = ?",
-            (paper_id,),
-        ).fetchone()
-        if paper is None:
-            raise LookupError("论文记录不存在")
-        document = conn.execute(
-            "SELECT index_status FROM paper_documents WHERE paper_id = ?",
-            (paper_id,),
-        ).fetchone()
-        if document is None or document["index_status"] != INDEX_INDEXED:
-            raise RuntimeError("论文尚未完成索引")
+    try:
+        with _enqueue_transaction() as conn:
+            paper = conn.execute(
+                "SELECT id FROM papers WHERE id = ?" + _enqueue_lock_clause(),
+                (paper_id,),
+            ).fetchone()
+            if paper is None:
+                raise LookupError("论文记录不存在")
+            document = conn.execute(
+                "SELECT index_status FROM paper_documents WHERE paper_id = ?",
+                (paper_id,),
+            ).fetchone()
+            if document is None or document["index_status"] != INDEX_INDEXED:
+                raise RuntimeError("论文尚未完成索引")
 
-        blocking_job = conn.execute(
-            """
-            SELECT id
-            FROM background_jobs
-            WHERE paper_id = ?
-              AND job_type != 'answer_rag_query'
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (paper_id,),
-        ).fetchone()
-        if blocking_job is not None:
-            raise RuntimeError("论文已有准备任务正在执行")
+            blocking_job = conn.execute(
+                """
+                SELECT id
+                FROM background_jobs
+                WHERE paper_id = ?
+                  AND job_type != 'answer_rag_query'
+                  AND status IN ('queued', 'running', 'retry_wait')
+                LIMIT 1
+                """,
+                (paper_id,),
+            ).fetchone()
+            if blocking_job is not None:
+                raise RuntimeError("论文已有准备任务正在执行")
 
-        active = conn.execute(
-            """
-            SELECT id, rag_query_id
-            FROM background_jobs
-            WHERE dedupe_key = ?
-              AND status IN ('queued', 'running', 'retry_wait')
-            LIMIT 1
-            """,
-            (dedupe_key,),
-        ).fetchone()
-        if active is not None:
-            if active["rag_query_id"] is None:
-                raise RuntimeError("活动问答任务缺少关联记录")
-            return {
-                "job_id": int(active["id"]),
-                "query_id": int(active["rag_query_id"]),
-                "created": False,
-            }
+            active = _active_job_by_dedupe_key(conn, dedupe_key)
+            if active is not None:
+                if active["rag_query_id"] is None:
+                    raise RuntimeError("活动问答任务缺少关联记录")
+                return {
+                    "job_id": int(active["id"]),
+                    "query_id": int(active["rag_query_id"]),
+                    "created": False,
+                }
 
-        query_cursor = conn.execute(
-            """
-            INSERT INTO rag_queries (paper_id, question, reranker, status)
-            VALUES (?, ?, ?, ?)
-            """,
-            (paper_id, question, reranker, RAG_ANSWERING),
-        )
-        query_id = int(query_cursor.lastrowid)
-        job_cursor = conn.execute(
-            """
-            INSERT INTO background_jobs (
-                job_type, payload_json, dedupe_key, paper_id, rag_query_id,
-                status, max_attempts, available_at, created_at, updated_at
+            query_cursor = conn.execute(
+                """
+                INSERT INTO rag_queries (paper_id, question, reranker, status)
+                VALUES (?, ?, ?, ?)
+                """,
+                (paper_id, question, reranker, RAG_ANSWERING),
             )
-            VALUES ('answer_rag_query', ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-            """,
-            (
-                json.dumps({"query_id": query_id}, ensure_ascii=False),
-                dedupe_key,
-                paper_id,
-                query_id,
-                max_attempts,
-                timestamp,
-                timestamp,
-                timestamp,
-            ),
-        )
+            query_id = int(query_cursor.lastrowid)
+            job_cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, paper_id, rag_query_id,
+                    status, max_attempts, available_at, created_at, updated_at
+                )
+                VALUES ('answer_rag_query', ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    json.dumps({"query_id": query_id}, ensure_ascii=False),
+                    dedupe_key,
+                    paper_id,
+                    query_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return {
+                "job_id": int(job_cursor.lastrowid),
+                "query_id": query_id,
+                "created": True,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        if active["rag_query_id"] is None:
+            raise RuntimeError("活动问答任务缺少关联记录") from None
         return {
-            "job_id": int(job_cursor.lastrowid),
-            "query_id": query_id,
-            "created": True,
+            "job_id": int(active["id"]),
+            "query_id": int(active["rag_query_id"]),
+            "created": False,
         }
 
 
@@ -3829,9 +4565,58 @@ def claim_next_background_job(
     type_clause = ""
     parameters: list[object] = [timestamp]
     if types:
-        placeholders = ", ".join("?" for _ in types)
+        placeholders = parameter_placeholders(len(types))
         type_clause = f" AND job_type IN ({placeholders})"
         parameters.extend(types)
+
+    if BUSINESS_DB_BACKEND == "mysql":
+        claimed = None
+        with transaction(mysql_isolation_level="READ COMMITTED") as conn:
+            row = conn.execute(
+                f"""
+                SELECT id
+                FROM background_jobs
+                WHERE status IN ('queued', 'retry_wait')
+                  AND available_at <= ?
+                  {type_clause}
+                ORDER BY priority DESC, id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """,
+                tuple(parameters),
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = int(row["id"])
+            cursor = conn.execute(
+                """
+                UPDATE background_jobs
+                SET status = 'running',
+                    worker_id = ?,
+                    lease_expires_at = ?,
+                    attempt_count = attempt_count + 1,
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'retry_wait')
+                  AND available_at <= ?
+                """,
+                (
+                    worker_id,
+                    lease_expires_at,
+                    timestamp,
+                    timestamp,
+                    job_id,
+                    timestamp,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM background_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return _background_job_from_row(claimed)
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -3900,14 +4685,29 @@ def renew_background_job_lease(
         cursor = conn.execute(
             """
             UPDATE background_jobs
-            SET lease_expires_at = ?, updated_at = ?
+            SET lease_expires_at = CASE
+                    WHEN lease_expires_at > ? THEN lease_expires_at
+                    ELSE ?
+                END,
+                updated_at = CASE
+                    WHEN updated_at > ? THEN updated_at
+                    ELSE ?
+                END
             WHERE id = ?
               AND status = 'running'
               AND worker_id = ?
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > ?
             """,
-            (lease_expires_at, timestamp, job_id, worker_id, timestamp),
+            (
+                lease_expires_at,
+                lease_expires_at,
+                timestamp,
+                timestamp,
+                job_id,
+                worker_id,
+                timestamp,
+            ),
         )
     return cursor.rowcount == 1
 
@@ -3928,9 +4728,13 @@ def complete_background_job(
                 last_error = NULL,
                 completed_at = ?,
                 updated_at = ?
-            WHERE id = ? AND status = 'running' AND worker_id = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND worker_id = ?
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > ?
             """,
-            (timestamp, timestamp, job_id, worker_id),
+            (timestamp, timestamp, job_id, worker_id, timestamp),
         )
     return cursor.rowcount == 1
 
@@ -3947,24 +4751,70 @@ def fail_background_job(
         raise ValueError("retry_delay_seconds cannot be negative")
     current = now or _utc_now()
     timestamp = _db_timestamp(current)
+    available_at = _db_timestamp(
+        current + timedelta(seconds=retry_delay_seconds)
+    )
+    if BUSINESS_DB_BACKEND == "mysql":
+        with transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_jobs
+                SET status = CASE
+                        WHEN attempt_count < max_attempts THEN 'retry_wait'
+                        ELSE 'failed'
+                    END,
+                    available_at = ?,
+                    lease_expires_at = NULL,
+                    worker_id = NULL,
+                    last_error = ?,
+                    completed_at = CASE
+                        WHEN attempt_count < max_attempts THEN NULL
+                        ELSE ?
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND worker_id = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                """,
+                (
+                    available_at,
+                    error[:1000],
+                    timestamp,
+                    timestamp,
+                    job_id,
+                    worker_id,
+                    timestamp,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT status FROM background_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return str(row["status"])
+
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
             SELECT attempt_count, max_attempts
             FROM background_jobs
-            WHERE id = ? AND status = 'running' AND worker_id = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND worker_id = ?
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > ?
             """,
-            (job_id, worker_id),
+            (job_id, worker_id, timestamp),
         ).fetchone()
         if row is None:
             return None
         should_retry = int(row["attempt_count"]) < int(row["max_attempts"])
         next_status = "retry_wait" if should_retry else "failed"
-        available_at = _db_timestamp(
-            current + timedelta(seconds=retry_delay_seconds)
-        )
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE background_jobs
             SET status = ?,
@@ -3975,6 +4825,10 @@ def fail_background_job(
                 completed_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END,
                 updated_at = ?
             WHERE id = ?
+              AND status = 'running'
+              AND worker_id = ?
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > ?
             """,
             (
                 next_status,
@@ -3984,8 +4838,12 @@ def fail_background_job(
                 timestamp,
                 timestamp,
                 job_id,
+                worker_id,
+                timestamp,
             ),
         )
+        if cursor.rowcount != 1:
+            return None
     return next_status
 
 
@@ -3995,16 +4853,28 @@ def recover_expired_background_jobs(
 ) -> list[dict]:
     timestamp = _db_timestamp(now)
     recovered: list[dict] = []
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    connection_context = (
+        transaction(mysql_isolation_level="READ COMMITTED")
+        if BUSINESS_DB_BACKEND == "mysql"
+        else connect()
+    )
+    with connection_context as conn:
+        if BUSINESS_DB_BACKEND == "sqlite":
+            conn.execute("BEGIN IMMEDIATE")
+        lock_clause = (
+            "FOR UPDATE SKIP LOCKED"
+            if BUSINESS_DB_BACKEND == "mysql"
+            else ""
+        )
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM background_jobs
             WHERE status = 'running'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at <= ?
             ORDER BY id
+            {lock_clause}
             """,
             (timestamp,),
         ).fetchall()
@@ -4015,7 +4885,7 @@ def recover_expired_background_jobs(
                 else "failed"
             )
             error = "Worker lease expired before the task completed"
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE background_jobs
                 SET status = ?,
@@ -4025,7 +4895,10 @@ def recover_expired_background_jobs(
                     last_error = ?,
                     completed_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END,
                     updated_at = ?
-                WHERE id = ? AND status = 'running'
+                WHERE id = ?
+                  AND status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
                 """,
                 (
                     next_status,
@@ -4035,8 +4908,11 @@ def recover_expired_background_jobs(
                     timestamp,
                     timestamp,
                     int(row["id"]),
+                    timestamp,
                 ),
             )
+            if cursor.rowcount != 1:
+                continue
             item = _background_job_from_row(row)
             item["status"] = next_status
             item["last_error"] = error
@@ -4049,7 +4925,7 @@ def claim_download(paper_id: int, allowed_statuses: Iterable[str]) -> bool:
     if not statuses:
         return False
 
-    placeholders = ", ".join("?" for _ in statuses)
+    placeholders = parameter_placeholders(len(statuses))
     with connect() as conn:
         cursor = conn.execute(
             f"""
@@ -4069,11 +4945,7 @@ def update_download_status(
     local_path: Optional[str] = None,
     error: Optional[str] = None,
 ) -> None:
-    downloaded_at = (
-        datetime.now().astimezone().isoformat(timespec="seconds")
-        if status == "downloaded"
-        else None
-    )
+    downloaded_at = _db_timestamp() if status == "downloaded" else None
     with connect() as conn:
         conn.execute(
             """

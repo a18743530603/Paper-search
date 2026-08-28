@@ -2,7 +2,7 @@ import argparse
 import time
 
 from .config import configure_utf8_stdio, ensure_runtime_dirs
-from .db import init_db
+from .db import initialize_business_database
 from .task_queue_service import (
     DEFAULT_JOB_LEASE_SECONDS,
     default_worker_id,
@@ -59,7 +59,7 @@ def main() -> int:
 
     configure_utf8_stdio()
     ensure_runtime_dirs()
-    init_db()
+    initialize_business_database()
     try:
         return run_worker(
             once=args.once,
