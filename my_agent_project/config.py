@@ -49,6 +49,21 @@ def _positive_int_setting(
     return value
 
 
+def _unit_interval_float_setting(
+    environ: Mapping[str, str],
+    name: str,
+    default: float,
+) -> float:
+    raw_value = environ.get(name, str(default)).strip()
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between zero and one")
+    return value
+
+
 def load_business_database_config(
     environ: Mapping[str, str] | None = None,
 ) -> BusinessDatabaseConfig:
@@ -95,6 +110,45 @@ DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "true").lower() in {
     "on",
 }
 DEEPSEEK_TIMEOUT = float(os.getenv("DEEPSEEK_TIMEOUT", "120"))
+RESEARCH_QUERY_ROUTING_ENABLED = os.getenv(
+    "RESEARCH_QUERY_ROUTING_ENABLED",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
+RESEARCH_PRF_ENABLED = os.getenv(
+    "RESEARCH_PRF_ENABLED",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
+RESEARCH_CANDIDATE_POOL_SIZE = _positive_int_setting(
+    os.environ,
+    "RESEARCH_CANDIDATE_POOL_SIZE",
+    50,
+)
+RESEARCH_FINAL_SEED_COUNT = _positive_int_setting(
+    os.environ,
+    "RESEARCH_FINAL_SEED_COUNT",
+    5,
+)
+RESEARCH_RERANKER_ENABLED = os.getenv(
+    "RESEARCH_RERANKER_ENABLED",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
+RESEARCH_RERANKER_MODEL = os.getenv(
+    "RESEARCH_RERANKER_MODEL",
+    "BAAI/bge-reranker-v2-m3",
+).strip() or "BAAI/bge-reranker-v2-m3"
+RESEARCH_MMR_ENABLED = os.getenv(
+    "RESEARCH_MMR_ENABLED",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
+RESEARCH_MMR_LAMBDA = _unit_interval_float_setting(
+    os.environ,
+    "RESEARCH_MMR_LAMBDA",
+    0.5,
+)
+RESEARCH_PARENT_EXPANSION_ENABLED = os.getenv(
+    "RESEARCH_PARENT_EXPANSION_ENABLED",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
 SEED_API_KEY = os.getenv("SEED_API_KEY", "").strip()
 SEED_BASE_URL = os.getenv(
     "SEED_BASE_URL",

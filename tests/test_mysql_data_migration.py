@@ -162,7 +162,7 @@ def _temporary_migration_database():
         )
         with connection.cursor() as cursor:
             cursor.execute("SET time_zone = '+00:00'")
-        assert apply_mysql_migrations(connection) == ["001", "002"]
+        assert apply_mysql_migrations(connection) == ["001", "002", "003"]
         yield database_name, connection
     finally:
         if connection is not None:

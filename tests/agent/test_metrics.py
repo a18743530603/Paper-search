@@ -7,6 +7,7 @@ def _task(
     planner_status: str = "planned",
     task_status: str = "papers_selected",
     report_status: str | None = None,
+    selected_at: str | None = None,
     task_completed_at: str | None = None,
     report_completed_at: str | None = None,
 ) -> dict:
@@ -17,6 +18,15 @@ def _task(
         "task_status": task_status,
         "created_at": "2026-08-16 10:00:00",
         "confirmed_at": "2026-08-16 10:00:01",
+        "selected_at": (
+            selected_at
+            if selected_at is not None
+            else (
+                "2026-08-16 10:00:10"
+                if task_status == "papers_selected"
+                else None
+            )
+        ),
         "task_completed_at": task_completed_at,
         "report_status": report_status,
         "report_started_at": "2026-08-16 10:00:02" if report_status else None,
@@ -151,6 +161,20 @@ def test_agent_metrics_use_explicit_denominators_and_real_usage_only():
     assert metrics["usage"]["input_tokens"]["total"] == 100
     assert metrics["usage"]["output_tokens"]["total"] == 50
     assert metrics["usage"]["input_tokens"]["observed_trace_count"] == 1
+
+
+def test_optional_report_failure_does_not_fail_workspace_task():
+    metrics = agent_metrics_service.build_agent_metrics(
+        tasks=[_task(1, report_status="failed")],
+        traces=[],
+    )
+
+    rate = metrics["rates"]["task_completion_rate"]
+    assert (rate["numerator"], rate["denominator"], rate["excluded"]) == (
+        1,
+        1,
+        0,
+    )
 
 
 def test_agent_metrics_load_runtime_rows_from_temporary_sqlite(tmp_path, monkeypatch):

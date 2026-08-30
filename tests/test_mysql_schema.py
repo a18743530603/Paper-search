@@ -23,6 +23,7 @@ BUSINESS_TABLES = {
     "research_tasks",
     "research_tool_calls",
     "research_reports",
+    "paper_summaries",
     "research_messages",
     "research_task_memories",
     "agent_traces",
@@ -40,14 +41,20 @@ BUSINESS_TABLES = {
 
 def _initial_schema():
     migrations = discover_mysql_migrations()
-    assert [migration.version for migration in migrations] == ["001", "002"]
+    assert [migration.version for migration in migrations] == ["001", "002", "003"]
     return migrations[0]
 
 
 def _performance_indexes():
     migrations = discover_mysql_migrations()
-    assert [migration.version for migration in migrations] == ["001", "002"]
+    assert [migration.version for migration in migrations] == ["001", "002", "003"]
     return migrations[1]
+
+
+def _paper_summaries():
+    migrations = discover_mysql_migrations()
+    assert [migration.version for migration in migrations] == ["001", "002", "003"]
+    return migrations[2]
 
 
 def _table_statements(sql: str) -> list[tuple[str, str]]:
@@ -69,7 +76,7 @@ def test_mysql_initial_schema_contains_all_business_tables_in_fk_order() -> None
     table_names = [name for name, _ in tables]
 
     assert len(table_names) == 20
-    assert set(table_names) == BUSINESS_TABLES
+    assert set(table_names) == BUSINESS_TABLES - {"paper_summaries"}
     assert "schema_migrations" not in table_names
     positions = {name: index for index, name in enumerate(table_names)}
     for table_name, statement in tables:
@@ -221,6 +228,21 @@ def test_mysql_performance_indexes_are_additive_and_bounded() -> None:
     assert "CREATE TABLE" not in normalized
 
 
+def test_mysql_paper_summary_migration_is_an_independent_artifact_table() -> None:
+    migration = _paper_summaries()
+    tables = _table_statements(migration.sql)
+    normalized = migration.sql.upper()
+
+    assert [name for name, _statement in tables] == ["paper_summaries"]
+    assert "UNIQUE KEY UQ_PAPER_SUMMARIES_TASK_PAPER (TASK_ID, PAPER_ID)" in normalized
+    assert "FOREIGN KEY (TASK_ID) REFERENCES RESEARCH_TASKS(ID) ON DELETE CASCADE" in normalized
+    assert "FOREIGN KEY (PAPER_ID) REFERENCES PAPERS(ID) ON DELETE CASCADE" in normalized
+    assert "CONTENT LONGTEXT" in normalized
+    assert "EVIDENCE_JSON LONGTEXT" in normalized
+    assert "ENGINE=INNODB" in normalized
+    assert "RESEARCH_MESSAGES" not in normalized
+
+
 def test_mysql_statement_splitter_preserves_semicolons_in_strings() -> None:
     statements = split_mysql_statements(
         """
@@ -287,15 +309,16 @@ class FakeMigrationConnection:
 def test_mysql_migration_runner_records_version_and_is_idempotent() -> None:
     connection = FakeMigrationConnection()
 
-    assert apply_mysql_migrations(connection) == ["001", "002"]
+    assert apply_mysql_migrations(connection) == ["001", "002", "003"]
     statement_count = len(connection.statements)
     assert connection.applied == {
         "001": _initial_schema().checksum,
         "002": _performance_indexes().checksum,
+        "003": _paper_summaries().checksum,
     }
     assert apply_mysql_migrations(connection) == []
     assert len(connection.statements) == statement_count + 2
-    assert connection.begin_count == 2
+    assert connection.begin_count == 3
     assert connection.rollback_count == 0
 
 
@@ -355,7 +378,7 @@ def test_mysql_initial_schema_in_isolated_database(monkeypatch) -> None:
         monkeypatch.setattr(db, "BUSINESS_DB_NAME", database_name)
         connection = db.connect()
 
-        assert apply_mysql_migrations(connection) == ["001", "002"]
+        assert apply_mysql_migrations(connection) == ["001", "002", "003"]
         assert apply_mysql_migrations(connection) == []
 
         with connection.cursor() as cursor:
@@ -412,7 +435,7 @@ def test_mysql_initial_schema_in_isolated_database(monkeypatch) -> None:
                 for row in cursor.fetchall()
             }
         assert primary_key_tables == BUSINESS_TABLES | {"schema_migrations"}
-        assert len(foreign_keys) == 19
+        assert len(foreign_keys) == 21
         assert ("background_jobs", "idx_background_jobs_active_dedupe") in indexes
         assert ("background_jobs", "idx_background_jobs_ready") in indexes
         assert (

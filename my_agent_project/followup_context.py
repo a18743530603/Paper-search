@@ -59,8 +59,23 @@ def build_followup_context(
         "evidence": [
             {
                 "paper_title": str(item.get("paper_title") or "未知论文"),
+                **(
+                    {"section_title": str(item.get("section_title"))}
+                    if item.get("section_title")
+                    else {}
+                ),
+                **(
+                    {"section_path": str(item.get("section_path"))}
+                    if item.get("section_path")
+                    else {}
+                ),
                 "physical_page": _integer_or_zero(item.get("page_number")),
                 "chunk_id": item.get("chunk_id"),
+                **(
+                    {"section_alignment": dict(item["section_alignment"])}
+                    if isinstance(item.get("section_alignment"), Mapping)
+                    else {}
+                ),
                 "excerpt": str(item.get("content") or ""),
             }
             for item in evidence

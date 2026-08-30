@@ -2,7 +2,7 @@
 
 > 项目版本：`v0.17.1`
 >
-> 文档更新日期：`2026-08-27`
+> 文档更新日期：`2026-08-28`
 >
 > 项目定位：可演示、可评测、可恢复的论文检索与研究 Agent
 
@@ -22,8 +22,10 @@ Paper Hunter 是一个基于 FastAPI、LangGraph、DeepSeek 和混合检索的�
 | 合法下载 | 点击明确可下载论文的下载按钮 | Worker 下载 PDF，记录状态、路径和下载日期 |
 | 单篇问答 | 点击准备问答并输入问题 | 下载、解析、索引后，依据论文原文给出带页码证据的回答 |
 | 计划协作 | 在同一任务中补充研究范围 | 重新生成计划并更新原LangGraph检查点 |
-| 跨论文报告 | 选择 1 至 5 篇论文并明确报告问题 | 整理多篇证据，在质量门禁通过后生成带引用报告 |
-| 报告后追问 | 在报告完成后继续提问 | 重新召回所选论文证据并在当前页面实时流式生成带引用回答 |
+| Research Workspace | 选择 1 至 5 篇论文 | Worker逐篇独立下载、解析和索引，准备完成后直接进入研究对话 |
+| 单篇论文解读 | 当前任务内一篇已选且完成索引的论文 | 按章节与页序覆盖Original Paper Evidence，异步生成独立Paper Summary Artifact |
+| Research Chat | 围绕所选论文持续提问 | 重新召回原论文证据并在当前页面实时流式生成带引用回答，不要求先生成Report |
+| 可选跨论文报告 | 明确报告问题后主动生成 | 整理多篇证据，在质量门禁通过后生成带引用报告 |
 | 历史与导出 | 查看历史、详情或导出 | 查看任务进度、错误、论文链接，并导出 CSV/JSON |
 | 开发评测 | 运行检索或 Agent 评测 | 输出 Hit@K、MRR、覆盖率、场景通过率和运行指标 |
 
@@ -53,7 +55,7 @@ flowchart LR
 | --- | --- | --- |
 | 展示与接口层 | `main.py`、`templates/`、`static/` | 接收请求、渲染页面、提供状态 API，不执行长任务 |
 | Agent 编排层 | `research_agent.py`、`research_workflow.py`、`research_checkpoint.py` | 规划任务、条件路由、人工确认、中断与恢复 |
-| 业务服务层 | `search_service.py`、`download_service.py`、`mineru_service.py`、`pdf_service.py`、`rag_service.py`、`research_conversation_service.py` | 搜索、下载、云端解析、结构化分块、索引、召回、问答与报告后追问 |
+| 业务服务层 | `search_service.py`、`download_service.py`、`mineru_service.py`、`pdf_service.py`、`rag_service.py`、`paper_summary_service.py`、`research_conversation_service.py` | 搜索、下载、云端解析、结构化分块、索引、单篇解读、召回与研究对话 |
 | 上下文装配层 | `followup_context.py` | 将上游已准备的Memory、Summary、Recent、Question、Report、Evidence和访问限制稳定装配为不可信JSON，不执行查询或模型调用 |
 | 可靠任务层 | `task_queue_service.py`、`worker.py`、`paper_workflow.py` | 持久入队、租约领取、心跳、重试、幂等与断点执行 |
 | 数据与评测层 | `db.py`、`evaluation_service.py`、`agent_*_service.py` | 持久化、缓存、检索评测、Trace、Metrics 与报告 |
@@ -123,7 +125,7 @@ flowchart TD
 
 没有本地全文时，系统不会假装读过论文，而是提示可能需要购买或机构订阅并提供合法访问链接。Seed 不可用时可以降级为本地 TF-IDF；DeepSeek 不可用时只影响生成能力，不影响基础检索与归档。
 
-## 核心流程三：研究报告与持续追问
+## 核心流程三：Research Workspace 与可选报告
 
 ```mermaid
 flowchart TD
@@ -134,17 +136,16 @@ flowchart TD
     D --> E[批量搜索服务用一个MCP Session调用所选来源]
     E --> F[候选论文去重并入库]
     F --> G[interrupt: 等待用户选择 1 至 5 篇]
-    G --> H[用户单独填写报告问题]
-    H --> I[interrupt: 等待报告生成确认]
-    I --> J[Worker 恢复同一 LangGraph thread_id]
-    J --> K[逐篇准备与证据检索]
-    K --> L[证据去重与跨论文公平预算]
-    L --> M{Evidence Quality Gate}
-    M -->|失败| N[代码拒答，不调用报告模型]
-    M -->|通过| O[DeepSeek 生成跨论文报告]
-    O --> P[零 Token 引用校验]
-    P --> Q[保存报告、证据和执行轨迹]
-    Q --> R[用户继续提问]
+    G --> H[主LangGraph结束并冻结论文集合]
+    H --> I[逐篇写入prepare_paper持久任务]
+    I --> J[Worker独立Download / MinerU Parse / Index]
+    J --> K[Workspace可用]
+    K --> P{用户是否需要单篇Paper Summary}
+    P -->|是| Q[为一篇selected且indexed论文入队paper_summary]
+    Q --> QA[按章节与物理页序覆盖选择Original Paper Evidence]
+    QA --> QB[Worker生成并保存独立paper_summaries Artifact]
+    QB --> K
+    K --> R[用户直接提问]
     R --> S[POST chat创建用户与助手消息]
     S --> T[Extractor提出Task Memory操作]
     T --> U[代码校验并事务更新active Memory]
@@ -153,9 +154,14 @@ flowchart TD
     W --> X[ContextBuilder装配v4不可信JSON]
     X --> Y[DeepSeek真实流式生成]
     Y --> Z[浏览器增量显示并在完成时持久化]
+    K --> L{用户是否需要跨论文Report}
+    L -->|是| M[提交独立report_question与Report Job]
+    M --> N[复用准备、证据打包、生成与引用校验]
+    N --> O[保存可选research_reports]
+    O --> R
 ```
 
-这里使用 Agent 的原因不是单纯增加聊天框，而是任务存在动态规划、工具调用、人工决策、逐篇容错和可恢复状态。论文选择、下载授权和报告生成都保留人工边界。当前持续追问先分别准备Task Memory、滚动摘要、最近10条原文、当前问题、报告、新召回证据和访问限制，再由纯ContextBuilder统一装配；各来源不混写，Memory和摘要都不能作为论文事实。网页主链路使用POST流式响应；旧`research_followup`持久任务只作为无JavaScript回退，不修改既有报告。
+这里使用 Agent 的原因不是单纯增加聊天框，而是任务存在动态规划、工具调用、人工决策、逐篇容错和可恢复状态。论文选择本身构成对所选开放论文准备的授权，耗时工作全部进入既有持久Worker；Report退为可选产物。当前持续追问先分别准备Task Memory、滚动摘要、最近10条原文、当前问题、可选Report、新召回证据和访问限制，再由纯ContextBuilder统一装配；各来源不混写，Memory、摘要和Report都不能作为论文事实。网页主链路使用POST流式响应；旧`research_followup`持久任务只作为无JavaScript回退，不修改既有报告。
 
 ## 核心流程四：可靠后台任务
 
@@ -167,7 +173,7 @@ sequenceDiagram
     participant K as Worker
     participant S as 业务服务
 
-    U->>W: 点击下载、准备、问答或生成报告
+    U->>W: 点击下载、准备、问答、Paper Summary或生成报告
     W->>D: 短事务更新业务状态并插入 background_jobs
     W-->>U: 立即返回任务已受理
     K->>D: 使用租约原子领取任务
@@ -215,7 +221,7 @@ queued -> running -> completed
                   -> failed
 ```
 
-`background_jobs` 表示 Worker 是否成功执行任务，`papers`、`paper_documents` 和 `research_reports` 表示用户业务进行到了哪一步。入队时，两者在同一个短事务中创建；执行期间分别更新，因为网络请求、文件写入和模型调用不能被 SQLite 事务回滚，也不能让数据库写锁一直占用几分钟。
+`background_jobs`表示Worker是否成功执行任务，`papers`、`paper_documents`、`paper_summaries`和`research_reports`表示用户业务进行到了哪一步。入队时，Job与对应Artifact在同一个短事务中创建；执行期间分别更新，因为网络请求、文件写入和模型调用不能被数据库事务回滚，也不能让锁一直占用几分钟。
 
 ### 研究任务状态
 
@@ -269,7 +275,7 @@ awaiting_confirmation
 | 任务队列 | `background_jobs` | 任务类型、载荷、状态、重试次数、租约和错误 |
 | PDF 解析 | `paper_documents`、`paper_chunks` | 文档状态、页码文本块、向量和父子关系 |
 | RAG 问答 | `rag_queries` | 问题、回答、证据、模型、重排配置和错误 |
-| 研究 Agent | `research_tasks`、`research_messages`、`research_task_memories`、`research_tool_calls`、`research_reports` | canonical来源列表、计划、原始消息、任务级持久要求、工具轨迹、选择结果和跨论文报告 |
+| 研究 Agent | `research_tasks`、`research_messages`、`research_task_memories`、`research_tool_calls`、`paper_summaries`、`research_reports` | canonical来源列表、计划、原始消息、任务级持久要求、工具轨迹、选择结果、单篇论文解读和可选跨论文报告 |
 | Agent 可观测性 | `agent_traces` | 节点状态、耗时、工具调用、重试和错误 |
 | 缓存 | `pdf_text_cache`、`embedding_cache`、`llm_response_cache` | 避免重复解析、Embedding 和受控实验调用 |
 | 检索与生成评测 | `evaluation_*`、`generation_evaluation_*` | 配置、逐题结果、聚合指标和实验历史 |

@@ -14,6 +14,7 @@ from my_agent_project import context_service
 from my_agent_project import db
 from my_agent_project import evaluation_service
 from my_agent_project import generation_evaluation_service
+from my_agent_project import main
 from my_agent_project import model_service
 from my_agent_project import paper_workflow
 from my_agent_project import pdf_service
@@ -122,7 +123,7 @@ def test_context_token_estimator_handles_chinese_and_english():
     assert context_service.estimate_text_tokens("中文abcd") == 3
 
 
-def test_context_packer_applies_equal_per_paper_quota():
+def test_context_packer_keeps_all_per_paper_evidence_that_fits_budget():
     evidence = [
         _context_evidence(paper_id, rank)
         for paper_id in (1, 2, 3)
@@ -134,22 +135,19 @@ def test_context_packer_applies_equal_per_paper_quota():
         config=context_service.ContextConfig(
             max_estimated_tokens=10000,
             min_chunks_per_paper=1,
-            max_chunks_per_paper=2,
         ),
     )
 
-    assert len(packed["evidence"]) == 6
+    assert len(packed["evidence"]) == 9
     assert Counter(item["paper_id"] for item in packed["evidence"]) == {
-        1: 2,
-        2: 2,
-        3: 2,
+        1: 3,
+        2: 3,
+        3: 3,
     }
     assert packed["stats"]["paper_coverage_percent"] == 100.0
     assert packed["stats"]["minimum_quota_satisfied"] is True
-    assert packed["stats"]["dropped_evidence_count"] == 3
-    assert {item["reason"] for item in packed["stats"]["dropped"]} == {
-        "paper_quota"
-    }
+    assert packed["stats"]["dropped_evidence_count"] == 0
+    assert packed["stats"]["allocation_strategy"] == "dynamic_v1"
 
 
 def test_context_packer_uses_first_round_for_cross_paper_coverage():
@@ -176,7 +174,6 @@ def test_context_packer_uses_first_round_for_cross_paper_coverage():
         config=context_service.ContextConfig(
             max_estimated_tokens=first_round_budget,
             min_chunks_per_paper=1,
-            max_chunks_per_paper=2,
         ),
     )
 
@@ -202,7 +199,7 @@ def test_context_packer_reports_when_budget_cannot_meet_minimum_quota():
     assert packed["quality_gate"]["model_call_allowed"] is False
 
 
-def test_context_dedup_keeps_higher_scored_exact_duplicate():
+def test_context_dedup_keeps_first_priority_exact_duplicate():
     lower = _context_evidence(
         1,
         2,
@@ -216,7 +213,7 @@ def test_context_dedup_keeps_higher_scored_exact_duplicate():
         score=0.9,
     )
 
-    kept, dropped = context_service.deduplicate_paper_evidence([lower, higher])
+    kept, dropped = context_service.deduplicate_paper_evidence([higher, lower])
 
     assert [item["chunk_id"] for item in kept] == [higher["chunk_id"]]
     assert dropped[0]["reason"] == "exact_duplicate"
@@ -234,7 +231,7 @@ def test_context_dedup_removes_high_overlap_on_adjacent_pages():
         score=0.8,
     )
 
-    kept, dropped = context_service.deduplicate_paper_evidence([lower, higher])
+    kept, dropped = context_service.deduplicate_paper_evidence([higher, lower])
 
     assert [item["chunk_id"] for item in kept] == [higher["chunk_id"]]
     assert dropped[0]["reason"] == "overlap_duplicate"
@@ -301,7 +298,6 @@ def test_context_packer_reports_exact_and_overlap_duplicate_counts():
         evidence,
         config=context_service.ContextConfig(
             max_estimated_tokens=10000,
-            max_chunks_per_paper=4,
         ),
     )
 
@@ -800,7 +796,7 @@ def test_research_report_tools_prepare_and_retrieve_evidence(monkeypatch):
     monkeypatch.setattr(
         research_tools,
         "retrieve_relevant_chunks",
-        lambda _paper_id, _question, top_k: [
+        lambda _paper_id, _question, top_k, **_kwargs: [
             {
                 "chunk_id": 31,
                 "page_number": 4,
@@ -935,7 +931,7 @@ def test_research_plan_waits_for_confirmation_without_searching(monkeypatch):
     assert result.queries == ["agent memory architecture", "long-term agent memory"]
 
 
-def test_langgraph_sqlite_checkpoint_resumes_both_interrupts_after_restart(
+def test_langgraph_checkpoint_finishes_after_paper_selection(
     tmp_path,
     monkeypatch,
 ):
@@ -1002,13 +998,11 @@ def test_langgraph_sqlite_checkpoint_resumes_both_interrupts_after_restart(
 
     assert final_result["workflow_status"] == "papers_selected"
     assert final_result["selected_paper_ids"] == [101]
-    assert resumed_graph.get_state(config).next == (
-        "request_report_confirmation",
-    )
+    assert resumed_graph.get_state(config).next == ()
     resumed_connection.close()
 
 
-def test_langgraph_report_stage_resumes_third_interrupt_and_checkpoints_papers(
+def test_langgraph_selection_does_not_run_report_stage(
     tmp_path,
     monkeypatch,
 ):
@@ -1090,29 +1084,17 @@ def test_langgraph_report_stage_resumes_third_interrupt_and_checkpoints_papers(
     )
 
     assert selection["workflow_status"] == "papers_selected"
-    assert graph.get_state(config).next == ("request_report_confirmation",)
-
-    report_result = graph.invoke(
-        Command(resume={"approved": True}),
-        config=config,
-    )
+    assert "__interrupt__" not in selection
     state = graph.get_state(config)
 
-    assert "__interrupt__" in report_result
-    assert prepared == [101, 102]
-    assert retrieved == [101, 102]
-    assert state.values["workflow_status"] == "report_completed"
-    assert state.values["report_prepare_index"] == 2
-    assert state.values["report_retrieve_index"] == 2
-    assert state.values["report_context_stats"]["raw_evidence_count"] == 2
-    assert state.values["report_context_stats"]["selected_evidence_count"] == 2
-    assert state.values["report_context_quality"]["status"] == "passed"
-    assert state.values["report_citation_validation"]["status"] == "passed"
-    assert state.next == ("request_report_regeneration",)
+    assert prepared == []
+    assert retrieved == []
+    assert state.values["workflow_status"] == "papers_selected"
+    assert state.next == ()
     connection.close()
 
 
-def test_langgraph_report_resumes_after_restart_without_repeating_prepared_paper(
+def test_finished_selection_checkpoint_restart_does_not_start_report(
     tmp_path,
     monkeypatch,
 ):
@@ -1187,17 +1169,8 @@ def test_langgraph_report_resumes_after_restart_without_repeating_prepared_paper
         config=config,
     )
 
-    stream = first_graph.stream(
-        Command(resume={"approved": True}),
-        config=config,
-        stream_mode="values",
-    )
-    for values in stream:
-        if values.get("report_prepare_index") == 1:
-            break
-    stream.close()
-    assert first_graph.get_state(config).values["report_prepare_index"] == 1
-    assert prepared == [101]
+    assert first_graph.get_state(config).next == ()
+    assert prepared == []
     first_connection.close()
 
     resumed_connection = sqlite3.connect(checkpoint_path, check_same_thread=False)
@@ -1207,9 +1180,9 @@ def test_langgraph_report_resumes_after_restart_without_repeating_prepared_paper
     resumed_graph.invoke(None, config=config)
     resumed_state = resumed_graph.get_state(config)
 
-    assert prepared == [101, 102]
-    assert resumed_state.values["workflow_status"] == "report_completed"
-    assert resumed_state.next == ("request_report_regeneration",)
+    assert prepared == []
+    assert resumed_state.values["workflow_status"] == "papers_selected"
+    assert resumed_state.next == ()
     resumed_connection.close()
 
 
@@ -1488,6 +1461,10 @@ def test_research_report_combines_evidence_and_access_limitations(
     assert db.start_research_task(task_id)
     db.save_research_task_results(task_id, paper_ids)
     assert db.select_research_task_papers(task_id, paper_ids)
+    assert db.set_research_report_question(
+        task_id,
+        "Compare the selected papers' memory mechanisms",
+    )
     assert db.start_research_report(task_id)
 
     monkeypatch.setattr(
@@ -1552,6 +1529,9 @@ def test_research_report_combines_evidence_and_access_limitations(
         1,
     )[0].strip()
     prompt_payload = json.loads(serialized)
+    assert prompt_payload["research_question"] == (
+        "Compare the selected papers' memory mechanisms"
+    )
     assert prompt_payload["evidence"][0]["physical_page"] == 7
     assert prompt_payload["access_limitations"][0]["legal_access_url"] == (
         "https://doi.org/10.1000/report"
@@ -2169,7 +2149,7 @@ def test_research_task_page_renders_candidate_checkboxes():
     assert "42 ms" in html
 
 
-def test_research_task_page_renders_completed_report():
+def test_research_task_page_hides_completed_legacy_report():
     template_dir = Path(__file__).parents[1] / "my_agent_project" / "templates"
     environment = Environment(loader=FileSystemLoader(template_dir))
     environment.globals["url_for"] = (
@@ -2197,6 +2177,7 @@ def test_research_task_page_renders_completed_report():
             "publisher": "arXiv",
             "published": "2026-01-01",
             "status": "downloaded",
+            "preparation_status": "ready",
             "page_url": "https://arxiv.org/abs/1234.5678",
             "pdf_url": "https://arxiv.org/pdf/1234.5678",
             "doi": None,
@@ -2248,17 +2229,159 @@ def test_research_task_page_renders_completed_report():
         max_selected_papers=5,
     )
 
-    assert "跨论文研究报告" in html
-    assert "证据支持该结论" in html
-    assert "https://doi.org/10.1000/closed" in html
-    assert "/research-tasks/10/report" in html
-    assert "去重后：2 条" in html
-    assert "重复移除：精确 1 / 高重叠 0" in html
-    assert "上下文门禁：passed" in html
-    assert "估算Token：900 → 300" in html
+    assert "跨论文研究报告" not in html
+    assert "证据支持该结论" not in html
+    assert "https://doi.org/10.1000/closed" not in html
+    assert "/research-tasks/10/report" not in html
+    assert "/api/research-tasks/10/papers/12/summary" in html
+    assert "生成论文解读" in html
     assert 'data-followup-chat' in html
     assert 'data-stream-url="/research-tasks/10/chat"' in html
     assert "/static/research_followup_chat.js" in html
+
+
+def test_research_task_page_unlocks_chat_without_report():
+    template_dir = Path(__file__).parents[1] / "my_agent_project" / "templates"
+    environment = Environment(loader=FileSystemLoader(template_dir))
+    environment.globals["url_for"] = (
+        lambda name, path: f"/static{path}" if name == "static" else "/"
+    )
+    template = environment.get_template("research_task.html")
+    task = {
+        "id": 11,
+        "question": "How does the method work?",
+        "status": "papers_selected",
+        "plan_goal": "Read the selected paper",
+        "plan_queries": ["selected paper method"],
+        "plan_rationale": "",
+        "planner_status": "planned",
+        "planner_error": "",
+        "plan_model": "deepseek-test",
+        "selected_count": 1,
+        "report_question": "",
+    }
+    selected_papers = [
+        {
+            "id": 12,
+            "title": "Selected Paper",
+            "authors": "Researcher",
+            "source": "arxiv",
+            "publisher": "arXiv",
+            "published": "2026-01-01",
+            "status": "downloaded",
+            "preparation_status": "ready",
+            "page_url": "https://example.com/paper",
+            "pdf_url": "https://example.com/paper.pdf",
+            "doi": None,
+            "local_path": "downloads/papers/selected.pdf",
+            "error": None,
+            "downloaded_at": None,
+        }
+    ]
+
+    html = template.render(
+        task=task,
+        papers=[],
+        selected_papers=selected_papers,
+        tool_calls=[],
+        messages=[],
+        report=None,
+        max_selected_papers=5,
+    )
+
+    assert 'data-followup-chat' in html
+    assert 'data-stream-url="/research-tasks/11/chat"' in html
+    assert 'name="message_kind" value="followup"' in html
+    assert "跨论文研究报告" not in html
+    assert 'name="message_kind" value="report_question"' not in html
+    assert "/api/research-tasks/11/papers/12/summary" in html
+    assert "/static/paper_summary.js" in html
+
+
+def test_selected_paper_preparation_fanout_isolates_one_rejection(monkeypatch):
+    calls = []
+
+    def enqueue(paper_id):
+        calls.append(paper_id)
+        if paper_id == 2:
+            raise RuntimeError("全文不可访问")
+        if paper_id == 1:
+            return {"job_id": 10, "preparation_status": "downloading"}
+        return {"job_id": None, "preparation_status": "ready"}
+
+    monkeypatch.setattr(main, "enqueue_paper_preparation_job", enqueue)
+
+    results = main.enqueue_selected_paper_preparations([1, 2, 3])
+
+    assert calls == [1, 2, 3]
+    assert results[0]["result"]["job_id"] == 10
+    assert results[1]["result"] is None
+    assert results[1]["error"] == "全文不可访问"
+    assert results[2]["result"]["preparation_status"] == "ready"
+
+
+def test_paper_selection_route_triggers_independent_preparation_jobs(monkeypatch):
+    preparation_calls = []
+    monkeypatch.setattr(
+        main,
+        "get_research_task",
+        lambda _task_id: {
+            "id": 15,
+            "status": "awaiting_selection",
+            "paper_ids": [21, 22],
+            "checkpoint_thread_id": "",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "select_research_task_papers",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        main,
+        "enqueue_selected_paper_preparations",
+        lambda paper_ids: preparation_calls.extend(paper_ids) or [],
+    )
+
+    response = main.select_research_papers(15, [21, 22])
+
+    assert response.status_code == 303
+    assert preparation_calls == [21, 22]
+
+
+def test_no_javascript_followup_does_not_become_report_question(monkeypatch):
+    followups = []
+    monkeypatch.setattr(
+        main,
+        "get_research_task",
+        lambda _task_id: {
+            "id": 16,
+            "status": "papers_selected",
+            "checkpoint_thread_id": "",
+        },
+    )
+    monkeypatch.setattr(main, "get_research_report", lambda _task_id: None)
+    monkeypatch.setattr(
+        main,
+        "enqueue_research_followup_job",
+        lambda task_id, message: followups.append((task_id, message)),
+    )
+    monkeypatch.setattr(
+        main,
+        "set_research_report_question",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("follow-up must not be stored as a report question")
+        ),
+    )
+
+    response = main.post_research_message(
+        16,
+        "What does Section IV show?",
+        "followup",
+    )
+
+    assert response.status_code == 303
+    assert followups == [(16, "What does Section IV show?")]
 
 
 def test_research_followup_chat_script_uses_post_stream_without_reload():

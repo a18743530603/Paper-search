@@ -29,6 +29,11 @@ from .schemas import (
     INDEX_INDEXED,
     INDEX_INDEXING,
     INDEX_NOT_STARTED,
+    PAPER_SUMMARY_COMPLETED,
+    PAPER_SUMMARY_FAILED,
+    PAPER_SUMMARY_GENERATING,
+    PAPER_SUMMARY_QUEUED,
+    PAPER_SUMMARY_RUNNING,
     PARSE_PARSED,
     PARSE_PARSING,
     PARSE_NOT_STARTED,
@@ -189,6 +194,26 @@ CREATE TABLE IF NOT EXISTS research_reports (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS paper_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    paper_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    content TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY (task_id) REFERENCES research_tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
+    UNIQUE (task_id, paper_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_summaries_paper_id
+ON paper_summaries(paper_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS research_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -986,6 +1011,24 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            UPDATE paper_summaries
+            SET status = 'failed',
+                error = '上一次单篇论文解读被应用重启中断，请重新生成。',
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('queued', 'generating')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM background_jobs AS job
+                  WHERE job.research_task_id = paper_summaries.task_id
+                    AND job.paper_id = paper_summaries.paper_id
+                    AND job.job_type = 'paper_summary'
+                    AND job.status IN ('queued', 'running', 'retry_wait')
+              )
+            """
+        )
+        conn.execute(
+            """
             UPDATE research_messages
             SET status = 'failed',
                 error = '上一次追问执行被应用重启中断，请重新提交。',
@@ -1032,6 +1075,7 @@ def validate_mysql_business_schema() -> None:
         "research_tasks",
         "research_tool_calls",
         "research_reports",
+        "paper_summaries",
         "research_messages",
         "research_task_memories",
         "agent_traces",
@@ -1599,6 +1643,7 @@ def list_agent_metric_tasks() -> list[dict]:
             """
             SELECT t.id, t.checkpoint_thread_id, t.planner_status,
                    t.status AS task_status, t.created_at, t.confirmed_at,
+                   t.selected_at,
                    t.completed_at AS task_completed_at,
                    r.status AS report_status,
                    r.started_at AS report_started_at,
@@ -1656,6 +1701,158 @@ def get_research_report(task_id: int) -> Optional[dict]:
             (task_id,),
         ).fetchone()
     return _research_report_from_row(row) if row is not None else None
+
+
+def _paper_summary_from_row(row) -> dict:
+    summary = dict(row)
+    try:
+        evidence = json.loads(summary.get("evidence_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        evidence = []
+    summary["evidence"] = evidence if isinstance(evidence, list) else []
+    return summary
+
+
+def get_paper_summary(task_id: int, paper_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT summary.*,
+                   (
+                       SELECT job.status
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = summary.task_id
+                         AND job.paper_id = summary.paper_id
+                         AND job.job_type = 'paper_summary'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS job_status,
+                   (
+                       SELECT job.attempt_count
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = summary.task_id
+                         AND job.paper_id = summary.paper_id
+                         AND job.job_type = 'paper_summary'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS job_attempts,
+                   (
+                       SELECT job.max_attempts
+                       FROM background_jobs AS job
+                       WHERE job.research_task_id = summary.task_id
+                         AND job.paper_id = summary.paper_id
+                         AND job.job_type = 'paper_summary'
+                       ORDER BY job.id DESC
+                       LIMIT 1
+                   ) AS job_max_attempts
+            FROM paper_summaries AS summary
+            WHERE summary.task_id = ? AND summary.paper_id = ?
+            """,
+            (task_id, paper_id),
+        ).fetchone()
+    return _paper_summary_from_row(row) if row is not None else None
+
+
+def list_paper_summaries(task_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM paper_summaries
+            WHERE task_id = ?
+            ORDER BY id
+            """,
+            (task_id,),
+        ).fetchall()
+    return [_paper_summary_from_row(row) for row in rows]
+
+
+def mark_paper_summary_generating(task_id: int, paper_id: int) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE paper_summaries
+            SET status = ?, error = NULL, completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ? AND paper_id = ? AND status = ?
+            """,
+            (
+                PAPER_SUMMARY_GENERATING,
+                task_id,
+                paper_id,
+                PAPER_SUMMARY_QUEUED,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def update_paper_summary(
+    task_id: int,
+    paper_id: int,
+    status: str,
+    *,
+    content: Optional[str] = None,
+    evidence: Optional[list[dict]] = None,
+    model: Optional[str] = None,
+    error: Optional[str] = None,
+) -> bool:
+    completed = status in {PAPER_SUMMARY_COMPLETED, PAPER_SUMMARY_FAILED}
+    evidence_json = (
+        json.dumps(evidence, ensure_ascii=False) if evidence is not None else None
+    )
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE paper_summaries
+            SET status = ?,
+                content = COALESCE(?, content),
+                evidence_json = COALESCE(?, evidence_json),
+                model = COALESCE(?, model),
+                error = ?,
+                completed_at = CASE
+                    WHEN ? THEN CURRENT_TIMESTAMP
+                    ELSE completed_at
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ? AND paper_id = ?
+            """,
+            (
+                status,
+                content,
+                evidence_json,
+                model,
+                error[:1000] if error else None,
+                int(completed),
+                task_id,
+                paper_id,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def mark_paper_summary_retry_pending(
+    task_id: int,
+    paper_id: int,
+    error: str,
+) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE paper_summaries
+            SET status = ?, error = ?, completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ? AND paper_id = ?
+              AND status != ?
+            """,
+            (
+                PAPER_SUMMARY_QUEUED,
+                error[:1000],
+                task_id,
+                paper_id,
+                PAPER_SUMMARY_COMPLETED,
+            ),
+        )
+    return cursor.rowcount == 1
 
 
 def _research_message_from_row(row: sqlite3.Row) -> dict:
@@ -2584,6 +2781,51 @@ def list_indexed_chunks(paper_id: int) -> list[sqlite3.Row]:
                 (paper_id,),
             )
         )
+
+
+def get_paper_parent_chunks(
+    paper_id: int,
+    parent_chunk_ids: Iterable[int],
+) -> dict[int, dict]:
+    """Load existing parent rows for one paper without crossing paper boundaries."""
+
+    parent_ids = []
+    for raw_parent_id in parent_chunk_ids:
+        try:
+            parent_id = int(raw_parent_id)
+        except (TypeError, ValueError):
+            continue
+        if parent_id > 0 and parent_id not in parent_ids:
+            parent_ids.append(parent_id)
+    if not parent_ids:
+        return {}
+    placeholders = ", ".join("?" for _parent_id in parent_ids)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, paper_id, page_number, parent_index, content
+            FROM paper_parent_chunks
+            WHERE paper_id = ? AND id IN ({placeholders})
+            """,
+            (paper_id, *parent_ids),
+        ).fetchall()
+    return {int(row["id"]): dict(row) for row in rows}
+
+
+def list_paper_summary_chunks(paper_id: int) -> list[dict]:
+    """Return ordered Original Paper Evidence without retrieval vectors."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, paper_id, page_number, chunk_index, content,
+                   parent_chunk_id, chunk_role, section_title, content_type
+            FROM paper_chunks
+            WHERE paper_id = ? AND TRIM(content) != ''
+            ORDER BY chunk_index
+            """,
+            (paper_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def count_paper_parent_chunks(paper_id: int) -> int:
@@ -3905,6 +4147,207 @@ def enqueue_research_report_job(
         }
 
 
+def enqueue_paper_summary_job(
+    task_id: int,
+    paper_id: int,
+    *,
+    max_attempts: int = 3,
+    now: Optional[datetime] = None,
+) -> dict:
+    if task_id < 1 or paper_id < 1:
+        raise ValueError("task_id and paper_id must be positive")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    timestamp = _db_timestamp(now)
+    dedupe_key = f"paper_summary:{task_id}:{paper_id}"
+    try:
+        with _enqueue_transaction() as conn:
+            task = conn.execute(
+                """
+                SELECT status, selected_paper_ids_json
+                FROM research_tasks
+                WHERE id = ?
+                """
+                + _enqueue_lock_clause(),
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise LookupError("研究任务不存在")
+            if task["status"] != "papers_selected":
+                raise RuntimeError("研究任务尚未进入Research Workspace")
+            if paper_id not in _selected_paper_ids_from_task_row(task):
+                raise RuntimeError("只能为当前任务已选择的论文生成解读")
+
+            paper = conn.execute(
+                """
+                SELECT p.id, d.parse_status, d.index_status
+                FROM papers AS p
+                LEFT JOIN paper_documents AS d ON d.paper_id = p.id
+                WHERE p.id = ?
+                """
+                + _enqueue_lock_clause(),
+                (paper_id,),
+            ).fetchone()
+            if paper is None:
+                raise LookupError("论文记录不存在")
+            if (
+                paper["parse_status"] != PARSE_PARSED
+                or paper["index_status"] != INDEX_INDEXED
+            ):
+                raise RuntimeError("论文尚未完成解析和索引")
+
+            preparation = conn.execute(
+                """
+                SELECT id
+                FROM background_jobs
+                WHERE paper_id = ?
+                  AND job_type IN (
+                      'download_paper', 'prepare_paper',
+                      'parse_paper', 'index_paper'
+                  )
+                  AND status IN ('queued', 'running', 'retry_wait')
+                LIMIT 1
+                """,
+                (paper_id,),
+            ).fetchone()
+            if preparation is not None:
+                raise RuntimeError("论文仍有准备任务正在执行")
+
+            active = _active_job_by_dedupe_key(conn, dedupe_key)
+            summary = conn.execute(
+                """
+                SELECT id, status
+                FROM paper_summaries
+                WHERE task_id = ? AND paper_id = ?
+                """,
+                (task_id, paper_id),
+            ).fetchone()
+            if active is not None:
+                if summary is None or summary["status"] not in PAPER_SUMMARY_RUNNING:
+                    raise RuntimeError("论文解读队列与Artifact状态不一致")
+                return {
+                    "job_id": int(active["id"]),
+                    "summary_id": int(summary["id"]),
+                    "task_id": task_id,
+                    "paper_id": paper_id,
+                    "created": False,
+                }
+
+            conn.execute(
+                backend_sql(
+                    sqlite_sql="""
+                        INSERT INTO paper_summaries (
+                            task_id, paper_id, status, content, evidence_json,
+                            model, error, completed_at, updated_at
+                        )
+                        VALUES (?, ?, 'queued', NULL, '[]', NULL, NULL, NULL, ?)
+                        ON CONFLICT(task_id, paper_id) DO UPDATE SET
+                            status = 'queued', content = NULL,
+                            evidence_json = '[]', model = NULL, error = NULL,
+                            completed_at = NULL, updated_at = excluded.updated_at
+                    """,
+                    mysql_sql="""
+                        INSERT INTO paper_summaries (
+                            task_id, paper_id, status, content, evidence_json,
+                            model, error, completed_at, updated_at
+                        )
+                        VALUES (?, ?, 'queued', NULL, '[]', NULL, NULL, NULL, ?)
+                            AS incoming
+                        ON DUPLICATE KEY UPDATE
+                            status = 'queued', content = NULL,
+                            evidence_json = '[]', model = NULL, error = NULL,
+                            completed_at = NULL, updated_at = incoming.updated_at
+                    """,
+                ),
+                (task_id, paper_id, timestamp),
+            )
+            summary = conn.execute(
+                """
+                SELECT id FROM paper_summaries
+                WHERE task_id = ? AND paper_id = ?
+                """,
+                (task_id, paper_id),
+            ).fetchone()
+            if summary is None:
+                raise RuntimeError("论文解读Artifact创建失败")
+
+            job_cursor = conn.execute(
+                """
+                INSERT INTO background_jobs (
+                    job_type, payload_json, dedupe_key, paper_id,
+                    research_task_id, status, max_attempts, available_at,
+                    created_at, updated_at
+                )
+                VALUES (
+                    'paper_summary', ?, ?, ?, ?, 'queued', ?, ?, ?, ?
+                )
+                """,
+                (
+                    json.dumps(
+                        {"task_id": task_id, "paper_id": paper_id},
+                        ensure_ascii=False,
+                    ),
+                    dedupe_key,
+                    paper_id,
+                    task_id,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return {
+                "job_id": int(job_cursor.lastrowid),
+                "summary_id": int(summary["id"]),
+                "task_id": task_id,
+                "paper_id": paper_id,
+                "created": True,
+            }
+    except pymysql.err.IntegrityError as exc:
+        active = _active_job_after_expected_dedupe_conflict(exc, dedupe_key)
+        if active is None:
+            raise
+        summary = get_paper_summary(task_id, paper_id)
+        if summary is None or summary["status"] not in PAPER_SUMMARY_RUNNING:
+            raise RuntimeError("论文解读队列与Artifact状态不一致") from None
+        return {
+            "job_id": int(active["id"]),
+            "summary_id": int(summary["id"]),
+            "task_id": task_id,
+            "paper_id": paper_id,
+            "created": False,
+        }
+
+
+def _selected_paper_preparation_job_is_active(conn, paper_ids: list[int]) -> bool:
+    if not paper_ids:
+        return False
+    placeholders = parameter_placeholders(len(paper_ids))
+    row = conn.execute(
+        f"""
+        SELECT id
+        FROM background_jobs
+        WHERE paper_id IN ({placeholders})
+          AND job_type IN (
+              'download_paper', 'prepare_paper', 'parse_paper', 'index_paper'
+          )
+          AND status IN ('queued', 'running', 'retry_wait')
+        LIMIT 1
+        """,
+        tuple(paper_ids),
+    ).fetchone()
+    return row is not None
+
+
+def _selected_paper_ids_from_task_row(task) -> list[int]:
+    try:
+        values = json.loads(task["selected_paper_ids_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [int(value) for value in values] if isinstance(values, list) else []
+
+
 def create_research_followup_messages(task_id: int, question: str) -> dict:
     question = " ".join(str(question or "").split())
     if not question:
@@ -3914,7 +4357,11 @@ def create_research_followup_messages(task_id: int, question: str) -> dict:
 
     with _enqueue_transaction() as conn:
         task = conn.execute(
-            "SELECT status, selected_count FROM research_tasks WHERE id = ?"
+            """
+            SELECT status, selected_count, selected_paper_ids_json
+            FROM research_tasks
+            WHERE id = ?
+            """
             + _enqueue_lock_clause(),
             (task_id,),
         ).fetchone()
@@ -3922,12 +4369,11 @@ def create_research_followup_messages(task_id: int, question: str) -> dict:
             raise LookupError("研究任务不存在")
         if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
             raise RuntimeError("研究任务尚未冻结论文集合")
-        report = conn.execute(
-            "SELECT status FROM research_reports WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        if report is None or report["status"] != "completed":
-            raise RuntimeError("研究报告完成后才能继续追问")
+        if _selected_paper_preparation_job_is_active(
+            conn,
+            _selected_paper_ids_from_task_row(task),
+        ):
+            raise RuntimeError("所选论文正在准备，完成后即可开始研究对话")
         active_message = conn.execute(
             """
             SELECT id
@@ -4001,7 +4447,11 @@ def enqueue_research_followup_job(
     try:
         with _enqueue_transaction() as conn:
             task = conn.execute(
-                "SELECT status, selected_count FROM research_tasks WHERE id = ?"
+                """
+                SELECT status, selected_count, selected_paper_ids_json
+                FROM research_tasks
+                WHERE id = ?
+                """
                 + _enqueue_lock_clause(),
                 (task_id,),
             ).fetchone()
@@ -4009,12 +4459,11 @@ def enqueue_research_followup_job(
                 raise LookupError("研究任务不存在")
             if task["status"] != "papers_selected" or int(task["selected_count"]) < 1:
                 raise RuntimeError("研究任务尚未冻结论文集合")
-            report = conn.execute(
-                "SELECT status FROM research_reports WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            if report is None or report["status"] != "completed":
-                raise RuntimeError("研究报告完成后才能继续追问")
+            if _selected_paper_preparation_job_is_active(
+                conn,
+                _selected_paper_ids_from_task_row(task),
+            ):
+                raise RuntimeError("所选论文正在准备，完成后即可开始研究对话")
             active_message = conn.execute(
                 """
                 SELECT id

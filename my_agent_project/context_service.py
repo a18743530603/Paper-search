@@ -7,7 +7,6 @@ from typing import Any, Mapping, Sequence
 
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 6000
-DEFAULT_MAX_CHUNKS_PER_PAPER = 2
 DEFAULT_MIN_CHUNKS_PER_PAPER = 1
 DEFAULT_OVERLAP_DUPLICATE_THRESHOLD = 0.85
 MIN_OVERLAP_SHINGLES = 12
@@ -26,7 +25,6 @@ _BILINGUAL_TOKEN_PATTERN = re.compile(
 @dataclass(frozen=True)
 class ContextConfig:
     max_estimated_tokens: int = DEFAULT_CONTEXT_TOKEN_BUDGET
-    max_chunks_per_paper: int = DEFAULT_MAX_CHUNKS_PER_PAPER
     min_chunks_per_paper: int = DEFAULT_MIN_CHUNKS_PER_PAPER
 
     def __post_init__(self) -> None:
@@ -34,8 +32,6 @@ class ContextConfig:
             raise ValueError("max_estimated_tokens必须为正整数")
         if self.min_chunks_per_paper < 0:
             raise ValueError("min_chunks_per_paper不能小于0")
-        if self.max_chunks_per_paper < self.min_chunks_per_paper:
-            raise ValueError("max_chunks_per_paper不能小于min_chunks_per_paper")
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -52,11 +48,27 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def evidence_context_text(item: Mapping[str, Any]) -> str:
-    return (
-        f"[论文：{item.get('paper_title', '')}；"
-        f"第 {item.get('page_number', '')} 页]\n"
-        f"{item.get('content', '')}"
+    metadata = [
+        f"论文：{item.get('paper_title', '')}",
+        f"物理页：{item.get('page_number', '')}",
+    ]
+    section_title = str(item.get("section_title") or "").strip()
+    if section_title:
+        metadata.insert(1, f"章节：{section_title}")
+    alignment = item.get("section_alignment")
+    alignment_note = (
+        str(alignment.get("response_note") or "").strip()
+        if isinstance(alignment, Mapping)
+        else ""
     )
+    suffix = f"\n章节对应：{alignment_note}" if alignment_note else ""
+    return f"[{'；'.join(metadata)}]{suffix}\n{item.get('content', '')}"
+
+
+def estimate_evidence_tokens(item: Mapping[str, Any]) -> int:
+    """Estimate the exact evidence block serialized into research context."""
+
+    return estimate_text_tokens(evidence_context_text(item))
 
 
 def _paper_key(item: Mapping[str, Any]) -> str:
@@ -65,21 +77,6 @@ def _paper_key(item: Mapping[str, Any]) -> str:
         return f"id:{paper_id}"
     title = " ".join(str(item.get("paper_title") or "未知论文").split())
     return f"title:{title.casefold()}"
-
-
-def _score(item: Mapping[str, Any]) -> float:
-    try:
-        return float(item.get("score"))
-    except (TypeError, ValueError):
-        return float("-inf")
-
-
-def _candidate_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
-    return (
-        -_score(item),
-        int(item.get("page_number") or 0),
-        int(item.get("chunk_id") or 0),
-    )
 
 
 def _positive_integer(value: Any) -> int | None:
@@ -157,7 +154,7 @@ def deduplicate_paper_evidence(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not 0.0 <= overlap_threshold <= 1.0:
         raise ValueError("overlap_threshold必须在0到1之间")
-    ordered = sorted((dict(item) for item in candidates), key=_candidate_sort_key)
+    ordered = [dict(item) for item in candidates]
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
     normalized_kept: list[str] = []
@@ -214,9 +211,33 @@ def _evidence_audit_item(
         "paper_title": item.get("paper_title", "未知论文"),
         "page_number": item.get("page_number"),
         "chunk_id": item.get("chunk_id"),
-        "estimated_tokens": estimate_text_tokens(evidence_context_text(item)),
+        "estimated_tokens": estimate_evidence_tokens(item),
         "reason": reason,
     }
+
+
+def _round_robin_selected_evidence(
+    grouped: Mapping[str, Sequence[dict[str, Any]]],
+    selected_indexes: Mapping[str, set[int]],
+) -> list[dict[str, Any]]:
+    selected_by_paper = {
+        paper_key: [
+            candidate
+            for index, candidate in enumerate(candidates)
+            if index in selected_indexes[paper_key]
+        ]
+        for paper_key, candidates in grouped.items()
+    }
+    max_selected = max(
+        (len(candidates) for candidates in selected_by_paper.values()),
+        default=0,
+    )
+    selected: list[dict[str, Any]] = []
+    for rank in range(max_selected):
+        for candidates in selected_by_paper.values():
+            if rank < len(candidates):
+                selected.append(candidates[rank])
+    return selected
 
 
 def pack_research_context(
@@ -246,30 +267,61 @@ def pack_research_context(
         grouped[paper_key] = deduplicated
         duplicate_dropped.extend(dropped)
 
-    selected: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = [*invalid_dropped, *duplicate_dropped]
     selected_tokens = 0
-    selected_per_paper = {key: 0 for key in grouped}
+    selected_indexes = {key: set() for key in grouped}
+    selected_tokens_per_paper = {key: 0 for key in grouped}
+    coverage_status = {key: "deferred" for key in grouped}
+    coverage_selected = 0
+    fill_selected = 0
 
-    for rank in range(active_config.max_chunks_per_paper):
+    uncovered_papers = set(grouped)
+    for paper_key, candidates in grouped.items():
+        if not candidates:
+            uncovered_papers.discard(paper_key)
+            coverage_status[paper_key] = "no_candidates"
+            continue
+        remaining_budget = active_config.max_estimated_tokens - selected_tokens
+        remaining_uncovered = max(1, len(uncovered_papers))
+        coverage_allowance = remaining_budget / remaining_uncovered
+        for index, item in enumerate(candidates):
+            item_tokens = estimate_evidence_tokens(item)
+            if item_tokens > coverage_allowance:
+                continue
+            selected_indexes[paper_key].add(index)
+            selected_tokens += item_tokens
+            selected_tokens_per_paper[paper_key] += item_tokens
+            coverage_status[paper_key] = "selected"
+            coverage_selected += 1
+            uncovered_papers.discard(paper_key)
+            break
+
+    max_candidate_count = max(
+        (len(candidates) for candidates in grouped.values()),
+        default=0,
+    )
+    for rank in range(max_candidate_count):
         for paper_key, candidates in grouped.items():
-            if rank >= len(candidates):
+            if rank >= len(candidates) or rank in selected_indexes[paper_key]:
                 continue
             item = candidates[rank]
-            item_tokens = estimate_text_tokens(evidence_context_text(item))
+            item_tokens = estimate_evidence_tokens(item)
             if selected_tokens + item_tokens > active_config.max_estimated_tokens:
                 dropped.append(_evidence_audit_item(item, reason="token_budget"))
                 continue
-            selected.append(item)
+            selected_indexes[paper_key].add(rank)
             selected_tokens += item_tokens
-            selected_per_paper[paper_key] += 1
+            selected_tokens_per_paper[paper_key] += item_tokens
+            fill_selected += 1
 
-    for candidates in grouped.values():
-        for item in candidates[active_config.max_chunks_per_paper :]:
-            dropped.append(_evidence_audit_item(item, reason="paper_quota"))
+    selected = _round_robin_selected_evidence(grouped, selected_indexes)
+    selected_per_paper = {
+        paper_key: len(indexes)
+        for paper_key, indexes in selected_indexes.items()
+    }
 
     raw_tokens = sum(
-        estimate_text_tokens(evidence_context_text(item))
+        estimate_evidence_tokens(item)
         for item in raw_evidence
     )
     raw_characters = sum(len(evidence_context_text(item)) for item in raw_evidence)
@@ -293,44 +345,60 @@ def pack_research_context(
                 "raw_chunks": len(raw_grouped[paper_key]),
                 "post_dedup_chunks": len(candidates),
                 "selected_chunks": selected_per_paper[paper_key],
+                "selected_estimated_tokens": selected_tokens_per_paper[paper_key],
+                "coverage_status": coverage_status[paper_key],
             }
         )
 
+    dropped_token_budget = sum(
+        1 for item in dropped if item["reason"] == "token_budget"
+    )
+    dropped_duplicate = len(duplicate_dropped)
     stats = {
-            "strategy": "fair_budget_v1",
-            "config": asdict(active_config),
-            "raw_evidence_count": len(raw_evidence),
-            "valid_evidence_count": len(valid_evidence),
-            "invalid_evidence_count": len(invalid_dropped),
-            "post_dedup_evidence_count": sum(len(items) for items in grouped.values()),
-            "exact_duplicate_count": sum(
-                1 for item in duplicate_dropped if item["reason"] == "exact_duplicate"
-            ),
-            "overlap_duplicate_count": sum(
-                1 for item in duplicate_dropped if item["reason"] == "overlap_duplicate"
-            ),
-            "selected_evidence_count": len(selected),
-            "dropped_evidence_count": len(dropped),
-            "raw_character_count": raw_characters,
-            "selected_character_count": selected_characters,
-            "raw_estimated_tokens": raw_tokens,
-            "selected_estimated_tokens": selected_tokens,
-            "estimated_token_reduction_percent": (
-                round((raw_tokens - selected_tokens) / raw_tokens * 100, 2)
-                if raw_tokens
-                else 0.0
-            ),
-            "paper_count": len(grouped),
-            "covered_paper_count": covered_papers,
-            "paper_coverage_percent": (
-                round(covered_papers / len(grouped) * 100, 2)
-                if grouped
-                else 0.0
-            ),
-            "minimum_quota_satisfied": not papers_below_minimum,
-            "papers_below_minimum": papers_below_minimum,
-            "per_paper": per_paper,
-            "dropped": dropped,
+        "strategy": "dynamic_v1",
+        "allocation_strategy": "dynamic_v1",
+        "evidence_budget_tokens": active_config.max_estimated_tokens,
+        "selected_tokens": selected_tokens,
+        "coverage_selected": coverage_selected,
+        "fill_selected": fill_selected,
+        "papers_with_candidates": len(grouped),
+        "papers_with_evidence": covered_papers,
+        "papers_without_evidence": len(grouped) - covered_papers,
+        "dropped_token_budget": dropped_token_budget,
+        "dropped_duplicate": dropped_duplicate,
+        "config": asdict(active_config),
+        "raw_evidence_count": len(raw_evidence),
+        "valid_evidence_count": len(valid_evidence),
+        "invalid_evidence_count": len(invalid_dropped),
+        "post_dedup_evidence_count": sum(len(items) for items in grouped.values()),
+        "exact_duplicate_count": sum(
+            1 for item in duplicate_dropped if item["reason"] == "exact_duplicate"
+        ),
+        "overlap_duplicate_count": sum(
+            1 for item in duplicate_dropped if item["reason"] == "overlap_duplicate"
+        ),
+        "selected_evidence_count": len(selected),
+        "dropped_evidence_count": len(dropped),
+        "raw_character_count": raw_characters,
+        "selected_character_count": selected_characters,
+        "raw_estimated_tokens": raw_tokens,
+        "selected_estimated_tokens": selected_tokens,
+        "estimated_token_reduction_percent": (
+            round((raw_tokens - selected_tokens) / raw_tokens * 100, 2)
+            if raw_tokens
+            else 0.0
+        ),
+        "paper_count": len(grouped),
+        "covered_paper_count": covered_papers,
+        "paper_coverage_percent": (
+            round(covered_papers / len(grouped) * 100, 2)
+            if grouped
+            else 0.0
+        ),
+        "minimum_quota_satisfied": not papers_below_minimum,
+        "papers_below_minimum": papers_below_minimum,
+        "per_paper": per_paper,
+        "dropped": dropped,
     }
     count_consistent = stats["selected_evidence_count"] == len(selected)
     budget_respected = selected_tokens <= active_config.max_estimated_tokens

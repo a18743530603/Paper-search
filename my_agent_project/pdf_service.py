@@ -1131,6 +1131,7 @@ def _parse_paper_pdf_with_mineru(
             and document["parser_backend"] == MINERU_PARSER_BACKEND
             and document["parser_model"] == MINERU_MODEL_VERSION
             and int(document["chunk_count"] or 0) > 0
+            and count_paper_parent_chunks(paper_id) > 0
         ):
             _increment_cache_stat(
                 cache_stats,
@@ -1141,12 +1142,13 @@ def _parse_paper_pdf_with_mineru(
                 layout_stats = json.loads(document["layout_stats_json"] or "{}")
             except (json.JSONDecodeError, TypeError):
                 layout_stats = {}
+            parent_chunk_count = count_paper_parent_chunks(paper_id)
             return {
                 "chunks_reused": True,
                 "source_hash": source_hash,
                 "page_count": int(document["page_count"] or 0),
                 "chunk_count": int(document["chunk_count"] or 0),
-                "parent_chunk_count": 0,
+                "parent_chunk_count": parent_chunk_count,
                 "layout_stats": layout_stats,
                 "parser_backend": MINERU_PARSER_BACKEND,
                 "parser_job_id": document["parser_job_id"],
@@ -1207,7 +1209,9 @@ def _parse_paper_pdf_with_mineru(
             content_list = result.content_list
             batch_id = result.batch_id
 
-        page_count, chunks, layout_stats = build_structured_chunks(content_list)
+        page_count, chunks, parent_chunks, layout_stats = build_structured_chunks(
+            content_list
+        )
         if not chunks:
             raise RuntimeError("MinerU没有提取到可用于检索的论文内容")
         layout_stats["mineru_result_cache_hit"] = cached_content is not None
@@ -1215,6 +1219,7 @@ def _parse_paper_pdf_with_mineru(
             paper_id,
             chunks,
             page_count=page_count,
+            parent_chunks=parent_chunks,
             source_hash=source_hash,
             chunk_strategy=MINERU_CHUNK_STRATEGY,
             layout_stats=layout_stats,
@@ -1228,7 +1233,7 @@ def _parse_paper_pdf_with_mineru(
             "source_hash": source_hash,
             "page_count": page_count,
             "chunk_count": len(chunks),
-            "parent_chunk_count": 0,
+            "parent_chunk_count": len(parent_chunks),
             "layout_stats": layout_stats,
             "parser_backend": MINERU_PARSER_BACKEND,
             "parser_job_id": batch_id or None,

@@ -29,10 +29,19 @@ from .model_service import (
     seed_embedding_cache_namespace,
 )
 from .mineru_service import MINERU_CHUNK_STRATEGY
+from .mmr_service import (
+    MMR_GUARANTEED_RERANK_COUNT,
+    MMR_EMBEDDING_FIELD,
+    MMRSelectionError,
+    select_mmr_candidates,
+)
+from .parent_expansion_service import expand_seed_chunks_to_parents
 from .pdf_service import (
     CHUNK_STRATEGY_ACADEMIC_NO_PREFIX,
     CHUNK_STRATEGY_MULTI_GRANULARITY,
 )
+from .reranker_service import rerank_candidates
+from .section_evidence_service import apply_section_alignment, resolve_section_alias
 from .schemas import (
     CHUNK_ROLE_CHILD,
     CHUNK_ROLE_PARENT,
@@ -67,6 +76,65 @@ SUPPORTED_RERANKERS = {RERANKER_NONE, RERANKER_DEEPSEEK_LISTWISE}
 RERANK_PROMPT_VERSION = "paper-rerank-v1"
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]")
 SECTION_CONTEXT_PREFIX_PATTERN = re.compile(r"^\[Section: [^\n]+]\s*")
+PRF_FEEDBACK_CHUNK_COUNT = 3
+PRF_EXPANSION_TERM_COUNT = 10
+PRF_ORIGINAL_QUERY_WEIGHT = 0.5
+PRF_FEEDBACK_WEIGHT = 0.5
+CANDIDATE_ONLY_FIELDS = frozenset(
+    {
+        "paper_id",
+        "physical_page",
+        "tfidf_score",
+        "hybrid_score",
+        "hybrid_rank",
+        "rerank_score",
+        "rerank_rank",
+        MMR_EMBEDDING_FIELD,
+        "mmr_score",
+        "mmr_rank",
+        "mmr_max_similarity",
+        "mmr_relevance",
+    }
+)
+PRF_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "by",
+        "can",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "its",
+        "may",
+        "of",
+        "on",
+        "or",
+        "our",
+        "that",
+        "the",
+        "their",
+        "these",
+        "this",
+        "those",
+        "to",
+        "was",
+        "we",
+        "were",
+        "which",
+        "with",
+    }
+)
 
 RAG_SYSTEM_PROMPT = """
 你是 Paper Hunter 的学术论文阅读助手。
@@ -361,6 +429,327 @@ def _cosine_similarity(left: Mapping[str, float], right: Mapping[str, float]) ->
     return dot / (left_norm * right_norm)
 
 
+def _normalize_sparse_vector(vector: Mapping[str, float]) -> dict[str, float]:
+    norm = math.sqrt(sum(float(value) * float(value) for value in vector.values()))
+    if not norm:
+        return {}
+    return {
+        str(term): float(value) / norm
+        for term, value in vector.items()
+        if float(value) != 0.0
+    }
+
+
+def _select_semantic_feedback_chunks(
+    rows: Sequence[Mapping[str, Any]],
+    semantic_scores: Sequence[float | None],
+    *,
+    count: int = PRF_FEEDBACK_CHUNK_COUNT,
+) -> list[Mapping[str, Any]]:
+    candidates = [
+        (position, row, score)
+        for position, (row, score) in enumerate(zip(rows, semantic_scores))
+        if score is not None
+    ]
+    candidates.sort(key=lambda item: (-float(item[2]), item[0]))
+    return [item[1] for item in candidates[:count]]
+
+
+def _prf_body_text(row: Mapping[str, Any]) -> str:
+    """Return only stored chunk body, excluding an academic section prefix."""
+
+    content = str(row["content"] or "")
+    return SECTION_CONTEXT_PREFIX_PATTERN.sub("", content, count=1).strip()
+
+
+def _valid_prf_term(term: str, vocabulary: set[str]) -> bool:
+    if term not in vocabulary or term in PRF_STOP_WORDS:
+        return False
+    if len(term) < 3 or term.isdigit():
+        return False
+    return term.isascii() and any(character.isalpha() for character in term)
+
+
+def _extract_prf_feedback_terms(
+    feedback_chunks: Sequence[Mapping[str, Any]],
+    document_frequency: Mapping[str, int],
+    document_count: int,
+    *,
+    expansion_terms: int = PRF_EXPANSION_TERM_COUNT,
+) -> list[tuple[str, float]]:
+    vocabulary = set(document_frequency)
+    aggregated: Counter[str] = Counter()
+    for row in feedback_chunks:
+        body = _prf_body_text(row)
+        if not body:
+            continue
+        body_tfidf = _tfidf_vector(
+            term_frequency(body),
+            document_frequency,
+            document_count,
+        )
+        for term, value in body_tfidf.items():
+            if _valid_prf_term(term, vocabulary):
+                aggregated[term] += float(value)
+    return sorted(
+        aggregated.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[:expansion_terms]
+
+
+def _build_enhanced_tfidf_query(
+    original_query_vector: Mapping[str, float],
+    feedback_terms: Sequence[tuple[str, float]],
+    *,
+    original_query_weight: float = PRF_ORIGINAL_QUERY_WEIGHT,
+    feedback_weight: float = PRF_FEEDBACK_WEIGHT,
+) -> dict[str, float]:
+    original = _normalize_sparse_vector(original_query_vector)
+    feedback = _normalize_sparse_vector(dict(feedback_terms))
+    if not original or not feedback:
+        return {}
+    terms = set(original) | set(feedback)
+    return {
+        term: (
+            original_query_weight * original.get(term, 0.0)
+            + feedback_weight * feedback.get(term, 0.0)
+        )
+        for term in terms
+    }
+
+
+def _initial_prf_diagnostics(enabled: bool) -> dict[str, Any]:
+    return {
+        "prf_enabled": enabled,
+        "prf_status": "pending" if enabled else "disabled",
+        "feedback_chunk_ids": [],
+        "feedback_terms": [],
+        "feedback_term_scores": {},
+        "feedback_chunk_count": 0,
+        "expansion_term_count": 0,
+        "original_query_weight": PRF_ORIGINAL_QUERY_WEIGHT,
+        "feedback_weight": PRF_FEEDBACK_WEIGHT,
+        "error": "",
+    }
+
+
+def _build_candidate_pool(
+    ranked_chunks: Sequence[Mapping[str, Any]],
+    *,
+    paper_id: int,
+    candidate_pool_size: int,
+) -> list[dict[str, Any]]:
+    """Materialize the bounded hybrid candidate layer before final evidence."""
+
+    if candidate_pool_size < 1:
+        raise ValueError("candidate_pool_size must be positive")
+    candidates: list[dict[str, Any]] = []
+    for hybrid_rank, ranked_chunk in enumerate(
+        ranked_chunks[:candidate_pool_size],
+        start=1,
+    ):
+        candidate = dict(ranked_chunk)
+        candidate.update(
+            {
+                "paper_id": paper_id,
+                "physical_page": candidate.get("page_number"),
+                "tfidf_score": candidate.get("keyword_score"),
+                "hybrid_score": candidate.get("score"),
+                "hybrid_rank": hybrid_rank,
+            }
+        )
+        candidates.append(candidate)
+    return candidates
+
+
+def _select_final_evidence_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    final_top_k: int,
+) -> list[dict[str, Any]]:
+    """Select final evidence in the most advanced available stable ranking."""
+
+    if final_top_k < 1:
+        raise ValueError("final_top_k must be positive")
+    ordered = _ordered_final_candidates(candidates, final_top_k=final_top_k)
+    return [
+        {
+            key: value
+            for key, value in candidate.items()
+            if key not in CANDIDATE_ONLY_FIELDS
+        }
+        for candidate in ordered
+    ]
+
+
+def _ordered_final_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    final_top_k: int,
+) -> list[dict[str, Any]]:
+    if final_top_k < 1:
+        raise ValueError("final_top_k must be positive")
+    if candidates and all(item.get("mmr_rank") is not None for item in candidates):
+        rank_field = "mmr_rank"
+    elif candidates and all(item.get("rerank_rank") is not None for item in candidates):
+        rank_field = "rerank_rank"
+    else:
+        rank_field = "hybrid_rank"
+    ordered = sorted(candidates, key=lambda item: int(item[rank_field]))
+    return [dict(candidate) for candidate in ordered[:final_top_k]]
+
+
+def _add_candidate_pool_diagnostics(
+    diagnostics: dict[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    candidate_pool_limit: int,
+) -> None:
+    diagnostics.update(
+        {
+            "candidate_pool_limit": candidate_pool_limit,
+            "candidate_pool_size": len(candidates),
+            "candidate_chunk_ids": [
+                int(candidate["chunk_id"]) for candidate in candidates
+            ],
+            "candidate_hybrid_ranks": [
+                int(candidate["hybrid_rank"]) for candidate in candidates
+            ],
+        }
+    )
+
+
+def _initial_reranker_diagnostics(
+    enabled: bool,
+    model_name: str,
+) -> dict[str, Any]:
+    return {
+        "reranker_enabled": enabled,
+        "reranker_status": "pending" if enabled else "disabled",
+        "reranker_model": model_name,
+        "reranked_candidate_count": 0,
+        "reranker_error": "",
+        "candidate_rerank_details": [],
+    }
+
+
+def _add_candidate_rerank_diagnostics(
+    diagnostics: dict[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> None:
+    diagnostics["candidate_rerank_details"] = [
+        {
+            "chunk_id": int(candidate["chunk_id"]),
+            "hybrid_rank": int(candidate["hybrid_rank"]),
+            "rerank_rank": (
+                int(candidate["rerank_rank"])
+                if candidate.get("rerank_rank") is not None
+                else None
+            ),
+            "hybrid_score": float(candidate["hybrid_score"]),
+            "rerank_score": (
+                round(float(candidate["rerank_score"]), 6)
+                if candidate.get("rerank_score") is not None
+                else None
+            ),
+        }
+        for candidate in sorted(
+            candidates,
+            key=lambda item: int(item["hybrid_rank"]),
+        )
+    ]
+
+
+def _initial_mmr_diagnostics(enabled: bool, lambda_value: float) -> dict[str, Any]:
+    return {
+        "mmr_enabled": enabled,
+        "mmr_status": "pending" if enabled else "disabled",
+        "mmr_lambda": lambda_value,
+        "mmr_selected_chunk_ids": [],
+        "mmr_selected_count": 0,
+        "guaranteed_rerank_count": 0,
+        "guaranteed_chunk_ids": [],
+        "final_seed_count": 0,
+        "final_seed_chunk_ids": [],
+        "mmr_error": "",
+        "candidate_mmr_details": [],
+    }
+
+
+def _add_candidate_mmr_diagnostics(
+    diagnostics: dict[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> None:
+    diagnostics["candidate_mmr_details"] = [
+        {
+            "chunk_id": int(candidate["chunk_id"]),
+            "rerank_rank": (
+                int(candidate["rerank_rank"])
+                if candidate.get("rerank_rank") is not None
+                else None
+            ),
+            "rerank_score": (
+                round(float(candidate["rerank_score"]), 6)
+                if candidate.get("rerank_score") is not None
+                else None
+            ),
+            "mmr_rank": (
+                int(candidate["mmr_rank"])
+                if candidate.get("mmr_rank") is not None
+                else None
+            ),
+            "mmr_score": (
+                round(float(candidate["mmr_score"]), 6)
+                if candidate.get("mmr_score") is not None
+                else None
+            ),
+            "mmr_relevance": (
+                round(float(candidate["mmr_relevance"]), 6)
+                if candidate.get("mmr_relevance") is not None
+                else None
+            ),
+            "mmr_max_similarity": (
+                round(float(candidate["mmr_max_similarity"]), 6)
+                if candidate.get("mmr_max_similarity") is not None
+                else None
+            ),
+        }
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                int(item["rerank_rank"])
+                if item.get("rerank_rank") is not None
+                else int(item["hybrid_rank"])
+            ),
+        )
+    ]
+
+
+def _mmr_fallback_status(exc: MMRSelectionError) -> str:
+    message = str(exc).lower()
+    if "too small" in message:
+        return "fallback_insufficient_candidates"
+    if "relevance" in message or "rerank" in message:
+        return "fallback_invalid_relevance"
+    if "embedding" in message:
+        return "fallback_invalid_embeddings"
+    return "fallback_error"
+
+
+def _initial_parent_expansion_diagnostics(enabled: bool) -> dict[str, Any]:
+    return {
+        "parent_expansion_enabled": enabled,
+        "parent_expansion_status": "pending" if enabled else "disabled",
+        "seed_chunk_ids": [],
+        "expanded_parent_ids": [],
+        "expanded_evidence_count": 0,
+        "parent_dedup_count": 0,
+        "parent_fallback_chunk_ids": [],
+        "parent_expansion_error": "",
+        "parent_expansion_details": [],
+    }
+
+
 def _bm25_keyword_scores(
     question: str,
     documents: Sequence[str],
@@ -429,15 +818,36 @@ def retrieve_relevant_chunks(
     paper_id: int,
     question: str,
     *,
+    lexical_query: str | None = None,
     top_k: int = 6,
     semantic_weight: float = SEMANTIC_WEIGHT,
     keyword_weight: float = KEYWORD_WEIGHT,
     keyword_retriever: str = KEYWORD_RETRIEVER_TFIDF,
     cache_stats: dict[str, int] | None = None,
     chunk_role: str | None = None,
+    prf_enabled: bool = False,
+    candidate_pool_size: int | None = None,
+    reranker_enabled: bool = False,
+    reranker_model: str = "",
+    mmr_enabled: bool = False,
+    mmr_lambda: float = 0.5,
+    parent_expansion_enabled: bool = False,
+    evidence_paper_title: str = "",
+    retrieval_diagnostics: dict[str, Any] | None = None,
 ) -> list[dict]:
+    diagnostics = retrieval_diagnostics if retrieval_diagnostics is not None else {}
+    diagnostics.clear()
+    diagnostics.update(_initial_prf_diagnostics(bool(prf_enabled)))
+    if candidate_pool_size is not None and candidate_pool_size < 1:
+        raise ValueError("candidate_pool_size must be positive")
+    if not 0.0 <= mmr_lambda <= 1.0:
+        raise ValueError("mmr_lambda must be between zero and one")
     if keyword_retriever not in SUPPORTED_KEYWORD_RETRIEVERS:
         raise ValueError(f"unsupported keyword retriever: {keyword_retriever}")
+    candidate_pool_active = (
+        candidate_pool_size is not None
+        and keyword_retriever == KEYWORD_RETRIEVER_TFIDF
+    )
     if semantic_weight < 0 or keyword_weight < 0:
         raise ValueError("retrieval weights must not be negative")
     total_weight = semantic_weight + keyword_weight
@@ -445,6 +855,9 @@ def retrieve_relevant_chunks(
         raise ValueError("at least one retrieval weight must be positive")
     semantic_weight /= total_weight
     keyword_weight /= total_weight
+    keyword_query = " ".join(str(lexical_query or question).split())
+    if not keyword_query:
+        keyword_query = question
 
     document = get_document(paper_id)
     if (
@@ -452,9 +865,15 @@ def retrieve_relevant_chunks(
         and document is not None
         and document["chunk_strategy"] == CHUNK_STRATEGY_MULTI_GRANULARITY
     ):
+        if prf_enabled:
+            diagnostics["prf_status"] = "fallback_unsupported_chunk_strategy"
+            diagnostics["error"] = (
+                "PRF is limited to the current flat production retrieval path"
+            )
         return retrieve_multi_granularity_chunks(
             paper_id,
             question,
+            lexical_query=lexical_query,
             top_k=top_k,
             semantic_weight=semantic_weight,
             keyword_weight=keyword_weight,
@@ -462,11 +881,49 @@ def retrieve_relevant_chunks(
             cache_stats=cache_stats,
         )
 
+    if candidate_pool_active:
+        _add_candidate_pool_diagnostics(
+            diagnostics,
+            [],
+            candidate_pool_limit=candidate_pool_size,
+        )
+        diagnostics.update(
+            _initial_reranker_diagnostics(
+                bool(reranker_enabled),
+                str(reranker_model or ""),
+            )
+        )
+        diagnostics.update(_initial_mmr_diagnostics(bool(mmr_enabled), mmr_lambda))
+        diagnostics.update(
+            _initial_parent_expansion_diagnostics(bool(parent_expansion_enabled))
+        )
+
     rows = list_indexed_chunks(paper_id)
     if chunk_role is not None:
         rows = [row for row in rows if row["chunk_role"] == chunk_role]
     if not rows:
+        if prf_enabled:
+            diagnostics["prf_status"] = "fallback_no_feedback_chunks"
+        if candidate_pool_active and reranker_enabled:
+            diagnostics["reranker_status"] = "fallback_no_candidates"
+        if candidate_pool_active and mmr_enabled:
+            diagnostics["mmr_status"] = "fallback_no_candidates"
+        if candidate_pool_active and parent_expansion_enabled:
+            diagnostics["parent_expansion_status"] = "fallback_no_seeds"
         return []
+
+    section_resolution = resolve_section_alias(
+        question,
+        [row["section_title"] for row in rows],
+    )
+    if section_resolution is not None:
+        diagnostics["section_alias_status"] = section_resolution["match_type"]
+        diagnostics["section_alias_matched_title"] = section_resolution[
+            "matched_section_title"
+        ]
+        diagnostics["section_alias_matched_path"] = section_resolution[
+            "matched_section_path"
+        ]
 
     stored_vectors: list[dict[str, float]] = []
     document_frequency: Counter[str] = Counter()
@@ -478,10 +935,11 @@ def retrieve_relevant_chunks(
         stored_vectors.append(vector)
         document_frequency.update(vector.keys())
 
+    question_vector: dict[str, float] = {}
     if keyword_retriever == KEYWORD_RETRIEVER_BM25:
         chunk_strategy = document["chunk_strategy"] if document is not None else None
         keyword_scores = _bm25_keyword_scores(
-            question,
+            keyword_query,
             [
                 chunk_index_text(row["content"], chunk_strategy)
                 if chunk_strategy != MINERU_CHUNK_STRATEGY
@@ -495,7 +953,7 @@ def retrieve_relevant_chunks(
             ],
         )
     else:
-        question_tf = term_frequency(question)
+        question_tf = term_frequency(keyword_query)
         question_vector = _tfidf_vector(
             question_tf,
             document_frequency,
@@ -524,15 +982,86 @@ def retrieve_relevant_chunks(
         except Exception:
             question_dense = None
 
-    ranked: list[dict] = []
-    for row, keyword_score in zip(rows, keyword_scores):
+    semantic_scores: list[float | None] = []
+    chunk_dense_vectors: list[list[float] | None] = []
+    for row in rows:
         semantic_score: float | None = None
-        if question_dense is not None and row["dense_vector_json"]:
+        stored_dense: list[float] | None = None
+        if row["dense_vector_json"]:
             try:
-                stored_dense = json.loads(row["dense_vector_json"])
-                semantic_score = _dense_cosine_similarity(question_dense, stored_dense)
+                parsed_dense = json.loads(row["dense_vector_json"])
+                if isinstance(parsed_dense, list):
+                    stored_dense = parsed_dense
+                if question_dense is not None and stored_dense is not None:
+                    semantic_score = _dense_cosine_similarity(
+                        question_dense,
+                        stored_dense,
+                    )
             except (json.JSONDecodeError, TypeError):
                 semantic_score = None
+        semantic_scores.append(semantic_score)
+        chunk_dense_vectors.append(stored_dense)
+
+    if prf_enabled:
+        if keyword_retriever != KEYWORD_RETRIEVER_TFIDF:
+            diagnostics["prf_status"] = "fallback_unsupported_keyword_retriever"
+            diagnostics["error"] = "Semantic-guided PRF only enhances TF-IDF"
+        else:
+            try:
+                feedback_chunks = _select_semantic_feedback_chunks(
+                    rows,
+                    semantic_scores,
+                )
+                diagnostics["feedback_chunk_ids"] = [
+                    int(row["id"]) for row in feedback_chunks
+                ]
+                diagnostics["feedback_chunk_count"] = len(feedback_chunks)
+                if not feedback_chunks:
+                    diagnostics["prf_status"] = "fallback_no_feedback_chunks"
+                else:
+                    feedback_terms = _extract_prf_feedback_terms(
+                        feedback_chunks,
+                        document_frequency,
+                        len(rows),
+                    )
+                    diagnostics["feedback_terms"] = [
+                        term for term, _score in feedback_terms
+                    ]
+                    diagnostics["feedback_term_scores"] = {
+                        term: round(float(score), 6)
+                        for term, score in feedback_terms
+                    }
+                    diagnostics["expansion_term_count"] = len(feedback_terms)
+                    enhanced_query = _build_enhanced_tfidf_query(
+                        question_vector,
+                        feedback_terms,
+                    )
+                    if not feedback_terms or not enhanced_query:
+                        diagnostics["prf_status"] = "fallback_no_terms"
+                    else:
+                        keyword_scores = [
+                            _cosine_similarity(
+                                enhanced_query,
+                                _tfidf_vector(
+                                    stored_vector,
+                                    document_frequency,
+                                    len(rows),
+                                ),
+                            )
+                            for stored_vector in stored_vectors
+                        ]
+                        diagnostics["prf_status"] = "applied"
+            except Exception as exc:
+                diagnostics["prf_status"] = "fallback_error"
+                diagnostics["error"] = f"{type(exc).__name__}: {exc}"[:500]
+
+    ranked: list[dict] = []
+    for row, keyword_score, semantic_score, chunk_dense_vector in zip(
+        rows,
+        keyword_scores,
+        semantic_scores,
+        chunk_dense_vectors,
+    ):
         if semantic_score is None:
             score = keyword_score
         else:
@@ -546,44 +1075,154 @@ def retrieve_relevant_chunks(
         parent_content = row["parent_content"]
         parent_page_number = row["parent_page_number"]
         parent_index = row["parent_index"]
-        ranked.append(
-            {
-                "chunk_id": row["id"],
-                "parent_chunk_id": parent_chunk_id,
-                "page_number": (
-                    parent_page_number
-                    if parent_page_number is not None
-                    else row["page_number"]
-                ),
-                "chunk_index": (
-                    parent_index if parent_index is not None else row["chunk_index"]
-                ),
-                "child_chunk_index": row["chunk_index"],
-                "retrieval_content": row["content"],
-                "content": parent_content or row["content"],
-                "section_title": str(row["section_title"] or ""),
-                "content_type": str(row["content_type"] or "text"),
-                "bbox": _parse_bbox_json(row["bbox_json"]),
-                "score": round(score, 6),
-                "semantic_score": (
-                    round(semantic_score, 6) if semantic_score is not None else None
-                ),
-                "keyword_score": round(keyword_score, 6),
-            }
-        )
+        use_small_chunk = candidate_pool_active
+        ranked_item = {
+            "chunk_id": row["id"],
+            "parent_chunk_id": parent_chunk_id,
+            "page_number": (
+                row["page_number"]
+                if use_small_chunk
+                else parent_page_number
+                if parent_page_number is not None
+                else row["page_number"]
+            ),
+            "chunk_index": (
+                row["chunk_index"]
+                if use_small_chunk
+                else parent_index
+                if parent_index is not None
+                else row["chunk_index"]
+            ),
+            "child_chunk_index": row["chunk_index"],
+            "retrieval_content": row["content"],
+            "content": row["content"] if use_small_chunk else parent_content or row["content"],
+            "section_title": str(row["section_title"] or ""),
+            "section_path": str(row["section_title"] or ""),
+            "content_type": str(row["content_type"] or "text"),
+            "bbox": _parse_bbox_json(row["bbox_json"]),
+            "score": round(score, 6),
+            "semantic_score": (
+                round(semantic_score, 6) if semantic_score is not None else None
+            ),
+            "keyword_score": round(keyword_score, 6),
+        }
+        if candidate_pool_active:
+            ranked_item[MMR_EMBEDDING_FIELD] = chunk_dense_vector
+        ranked.append(ranked_item)
     ranked.sort(key=lambda item: item["score"], reverse=True)
     deduplicated: list[dict] = []
-    seen_parents: set[int] = set()
-    for item in ranked:
-        parent_chunk_id = item.get("parent_chunk_id")
-        if parent_chunk_id is not None:
-            if parent_chunk_id in seen_parents:
-                continue
-            seen_parents.add(parent_chunk_id)
-        deduplicated.append(item)
-        if len(deduplicated) >= max(1, top_k):
-            break
-    return deduplicated
+    if candidate_pool_active:
+        deduplicated = ranked
+    else:
+        seen_parents: set[int] = set()
+        for item in ranked:
+            parent_chunk_id = item.get("parent_chunk_id")
+            if parent_chunk_id is not None:
+                if parent_chunk_id in seen_parents:
+                    continue
+                seen_parents.add(parent_chunk_id)
+            deduplicated.append(item)
+    if not candidate_pool_active:
+        return apply_section_alignment(
+            deduplicated[: max(1, top_k)],
+            section_resolution,
+        )
+    assert candidate_pool_size is not None
+    candidates = _build_candidate_pool(
+        deduplicated,
+        paper_id=paper_id,
+        candidate_pool_size=candidate_pool_size,
+    )
+    _add_candidate_pool_diagnostics(
+        diagnostics,
+        candidates,
+        candidate_pool_limit=candidate_pool_size,
+    )
+    final_candidates = candidates
+    if reranker_enabled:
+        try:
+            final_candidates = rerank_candidates(
+                question,
+                candidates,
+                model_name=reranker_model,
+            )
+            diagnostics["reranker_status"] = "applied"
+            diagnostics["reranked_candidate_count"] = len(final_candidates)
+        except Exception as exc:
+            diagnostics["reranker_status"] = "fallback_error"
+            diagnostics["reranker_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            final_candidates = candidates
+    _add_candidate_rerank_diagnostics(diagnostics, final_candidates)
+    mmr_candidates = final_candidates
+    annotated_mmr_candidates = final_candidates
+    if mmr_enabled:
+        if diagnostics.get("reranker_status") != "applied":
+            diagnostics["mmr_status"] = "fallback_no_rerank_scores"
+            diagnostics["mmr_error"] = "MMR requires an applied reranker ranking"
+        else:
+            try:
+                mmr_candidates, annotated_mmr_candidates = select_mmr_candidates(
+                    final_candidates,
+                    final_top_k=top_k,
+                    lambda_value=mmr_lambda,
+                )
+                diagnostics["mmr_status"] = "applied"
+                diagnostics["mmr_selected_chunk_ids"] = [
+                    int(candidate["chunk_id"]) for candidate in mmr_candidates
+                ]
+                diagnostics["mmr_selected_count"] = len(mmr_candidates)
+                guaranteed_count = min(
+                    MMR_GUARANTEED_RERANK_COUNT,
+                    len(mmr_candidates),
+                    top_k,
+                )
+                diagnostics["guaranteed_rerank_count"] = guaranteed_count
+                diagnostics["guaranteed_chunk_ids"] = [
+                    int(candidate["chunk_id"])
+                    for candidate in mmr_candidates[:guaranteed_count]
+                ]
+            except MMRSelectionError as exc:
+                diagnostics["mmr_status"] = _mmr_fallback_status(exc)
+                diagnostics["mmr_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                mmr_candidates = final_candidates
+                annotated_mmr_candidates = final_candidates
+            except Exception as exc:
+                diagnostics["mmr_status"] = "fallback_error"
+                diagnostics["mmr_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                mmr_candidates = final_candidates
+                annotated_mmr_candidates = final_candidates
+    _add_candidate_mmr_diagnostics(diagnostics, annotated_mmr_candidates)
+    seed_candidates = _ordered_final_candidates(mmr_candidates, final_top_k=top_k)
+    diagnostics["final_seed_count"] = len(seed_candidates)
+    diagnostics["final_seed_chunk_ids"] = [
+        int(candidate["chunk_id"]) for candidate in seed_candidates
+    ]
+    final_candidates = seed_candidates
+    if parent_expansion_enabled:
+        if diagnostics.get("mmr_status") != "applied":
+            diagnostics["parent_expansion_status"] = "fallback_no_mmr_seeds"
+            diagnostics["parent_expansion_error"] = (
+                "Parent expansion requires successfully selected MMR seed chunks"
+            )
+            diagnostics["seed_chunk_ids"] = [
+                int(candidate["chunk_id"]) for candidate in seed_candidates
+            ]
+            diagnostics["parent_fallback_chunk_ids"] = list(
+                diagnostics["seed_chunk_ids"]
+            )
+            diagnostics["expanded_evidence_count"] = len(seed_candidates)
+        else:
+            final_candidates, expansion_diagnostics = expand_seed_chunks_to_parents(
+                seed_candidates,
+                paper_id=paper_id,
+                paper_title=evidence_paper_title,
+            )
+            diagnostics.update(expansion_diagnostics)
+    selected_evidence = _select_final_evidence_candidates(
+        final_candidates,
+        final_top_k=top_k,
+    )
+    return apply_section_alignment(selected_evidence, section_resolution)
 
 
 def reciprocal_rank_fusion(
@@ -640,6 +1279,7 @@ def retrieve_multi_granularity_chunks(
     paper_id: int,
     question: str,
     *,
+    lexical_query: str | None = None,
     top_k: int = 6,
     semantic_weight: float = SEMANTIC_WEIGHT,
     keyword_weight: float = KEYWORD_WEIGHT,
@@ -654,6 +1294,7 @@ def retrieve_multi_granularity_chunks(
         "keyword_weight": keyword_weight,
         "keyword_retriever": keyword_retriever,
         "cache_stats": cache_stats,
+        "lexical_query": lexical_query,
     }
     return reciprocal_rank_fusion(
         {

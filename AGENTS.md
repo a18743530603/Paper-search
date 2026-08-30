@@ -2,7 +2,7 @@
 
 > 当前版本：`v0.17.1`
 >
-> 更新日期：`2026-08-27`
+> 更新日期：`2026-08-28`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -59,7 +59,7 @@ https://github.com/a18743530603/Paper-search.git
 - `paper_search_mcp_service.py`：用一个stdio MCP Session复用第三方`search_papers`完成多query、多来源元数据召回，将第三方Paper隔离映射为现有`PaperCandidate`，不调用下载Tool。
 - `download_service.py`：下载 PDF、清洗文件名、处理重名并隔离单篇论文的下载异常；可靠Worker可要求异常在记录失败后继续抛出。
 - `mineru_service.py`：调用MinerU云端精准解析API，流式上传PDF、轮询批次、下载并安全读取结构化结果，将章节、表格、公式、列表、页码和bbox转换为检索块，并按PDF哈希缓存结果。
-- `task_queue_service.py`：注册下载、完整准备、单独解析、索引、RAG回答、研究搜索、报告和报告后追问处理器，协调租约领取、有限重试、最终失败和Worker中断恢复。
+- `task_queue_service.py`：注册下载、完整准备、单独解析、索引、RAG回答、研究搜索、单篇Paper Summary、报告和报告后追问处理器，协调租约领取、有限重试、最终失败和Worker中断恢复。
 - `worker.py`：独立SQLite任务Worker入口；执行论文处理、问答、研究搜索、报告和`research_followup`持久任务，不承载Web请求。
 - `paper_workflow.py`：将用户触发的下载、PDF解析和向量索引串成后台准备流程，按现有状态跳过已完成步骤并在失败阶段停止。
 - `agent_trace_service.py`：集中包装LangGraph节点，尽力记录成功、中断、部分成功和失败轨迹；Trace故障不得改变原节点行为。
@@ -68,15 +68,16 @@ https://github.com/a18743530603/Paper-search.git
 - `mcp_server.py`：使用官方MCP Python SDK建立独立stdio服务；当前暴露元数据查询、外部文献检索和已索引证据检索三个受控Tool，全部复用现有Service/Tool Registry，未暴露论文准备能力。
 - `scripts/smoke_mcp_client.py`：用当前Python解释器启动独立MCP Server子进程，只执行stdio协议初始化与Tool发现并输出JSON；不调用业务Tool或外部API。
 - `context_service.py`：在报告生成前校验证据字段、按论文执行保守文本去重，再按估算Token预算和跨论文公平配额选择证据；输出质量门禁、模型上下文、重复关系和压缩审计，不调用额外模型。
-- `research_agent.py`：使用LangGraph编排研究问题规划、三次`interrupt()`人工确认、多查询/单查询条件路由、搜索、论文选择、逐篇准备、证据检索、报告生成和引用检查；规划失败自动降级，不改变下载合规边界。
+- `research_agent.py`：使用LangGraph编排研究问题规划、计划确认、搜索和论文选择；选择完成后主图结束，由业务队列独立准备论文。旧Report节点仍保留给历史Checkpoint兼容，但不再是Research Chat主流程。
 - `research_checkpoint.py`：使用`SqliteSaver`、稳定`thread_id`和`Command(resume=...)`保存并恢复生产图；检查点与业务任务SQLite分开存储。
 - `research_tools.py`：以LangChain `StructuredTool`和白名单注册表封装论文元数据检索，统一校验输入并返回来源、状态、错误和耗时摘要。
 - `research_workflow.py`：后台恢复用户已确认的检查点线程，归档论文、同步候选论文ID，并逐节点把报告图状态同步到业务SQLite；旧任务保留A3兼容入口。
 - `research_report_service.py`：在用户冻结论文并点击生成后，按准备、证据检索和DeepSeek综合顺序生成跨论文报告；使用不可信JSON上下文边界，逐篇隔离异常，无证据或门禁失败时确定性拒答。
-- `research_conversation_service.py`：在报告完成后，先更新Task Memory，再使用当前追问、active Memory、滚动摘要、最近10条有效followup消息、已有报告和新召回证据生成带引用回答；摘要和Memory提取非流式，网页回答真实流式，旧Worker任务保留为无JavaScript回退。
+- `paper_summary_service.py`：为当前任务内单篇已选且完成解析/索引的论文生成独立Paper Summary Artifact；按章节元数据和物理页序做全文结构覆盖，不使用Follow-up Top-K，无Original Paper Evidence时确定性说明不足且不调用模型。
+- `research_conversation_service.py`：所选论文准备任务结束后即可先更新Task Memory，再使用当前追问、active Memory、滚动摘要、最近10条有效followup消息、可选已有报告和新召回证据生成带引用回答；没有Report时传入空上下文，摘要、Memory和Report都不能替代Evidence。
 - `followup_context.py`：Unified Follow-up ContextBuilder纯装配层；接收上游已准备的Memory、Summary、Recent、Question、Report、Evidence和Access Limitations，输出稳定`research-followup-context-v4`，不查库、不检索、不调用模型或修改输入。
 - `task_memory_service.py`：使用DeepSeek严格JSON从当前User消息提取任务内持久偏好、要求、研究重点和决定；LLM只提出操作，代码校验临时性、论文事实、分类、长度、任务归属和幂等后再事务写库。
-- `db.py`：初始化和操作 SQLite，保存论文与研究任务、更新状态、缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
+- `db.py`：统一操作MySQL/SQLite Business Database，保存论文、研究任务、Paper Summary等Artifact与队列状态，缓存 PDF 页文本与 Seed 向量，并导出 CSV/JSON。
 - `model_service.py`：统一管理 DeepSeek `/chat/completions` 与火山方舟 Seed `/embeddings`、`/embeddings/multimodal` 的配置、鉴权、请求和异常；已合并并替代原 `agent_service.py`。
 - `pdf_service.py`：生产解析默认路由到MinerU云端；只有评测显式传入策略时才使用历史`pypdf`分块链路，以保留固定边界、章节感知和多粒度实验的可复现性。
 - `rag_service.py`：按模型命名空间与文本哈希缓存 Seed 稠密向量，提供 TF-IDF 关键词向量、混合召回、受约束 Prompt 和 DeepSeek 后台问答；没有全文时必须提示可能需要购买或机构订阅并附上链接。
@@ -143,23 +144,21 @@ GET  /evaluation/runs/{run_id}
   -> 任务进入awaiting_selection并自动刷新候选结果
   -> 用户从当前候选中选择1至5篇，使用Command(resume=...)恢复
   -> 图内和业务层双重校验候选范围，任务进入papers_selected
-  -> 图进入第三个report_confirmation interrupt，选择本身不自动下载论文
-  -> 用户在会话区单独填写report_question，不复用最初检索主题
-  -> 用户点击 POST /research-tasks/{task_id}/report
-  -> Command(resume=...)恢复同一thread_id
-  -> prepare_report_paper与retrieve_report_evidence节点逐篇执行并保存检查点
-  -> link_only、付费或单篇失败记录合法链接和限制，不中断其他论文
-  -> begin_report_generation调用fair_budget_v1选择context_evidence
-  -> 原始evidence完整保留，模型只接收预算内的跨论文公平上下文
-  -> 存在证据时DeepSeek生成带引用报告；全部无证据时代码直接拒答
-  -> validate_report_citations节点零Token校验标题/页码引用
-  -> 图停在report_regeneration interrupt，允许同线程重新生成
-  -> 报告完成后用户在同一页面继续提问
+  -> 主LangGraph在Paper Selection后结束，不再进入强制Report Confirmation
+  -> Web逐篇复用prepare_paper持久任务，独立执行Download / MinerU Parse / Index
+  -> 单篇准备失败或link_only不阻断其他论文；所有准备任务进入终态后Workspace可用
+  -> 用户可为任一已选且indexed论文请求单篇Paper Summary
+  -> 短事务创建或重置paper_summaries Artifact并写入paper_summary持久任务
+  -> Worker按章节/物理页序覆盖选择Original Paper Evidence并调用DeepSeek
+  -> Summary独立保存，不写research_messages，也不成为后续论文事实Evidence
+  -> 跨论文Report保留为可选legacy入口，使用独立report_question，不再是Chat准入条件
+  -> 无Report或Report未完成时Existing Report按空字符串进入ContextBuilder
+  -> 用户在同一页面直接研究所选论文
   -> JavaScript调用POST /research-tasks/{task_id}/chat
   -> 短事务写入用户消息和pending助手消息，不修改已有报告
   -> 当前User消息先由Task Memory Extractor提出ADD/UPDATE/REMOVE或NOOP
   -> 代码校验后事务更新当前任务active Memory；失败保留旧Memory并继续
-  -> Web流式链路按所选论文重新召回证据，并结合当前报告调用DeepSeek
+  -> Web流式链路按所选论文重新召回证据，并结合可选当前报告调用DeepSeek
   -> 读取同任务conversation_summary和最近10条有效原文
   -> 仅把刚退出窗口且未被summary_up_to_message_id覆盖的旧消息非流式合并进摘要
   -> 摘要失败记录错误并继续使用旧摘要；摘要和历史都不能替代Evidence

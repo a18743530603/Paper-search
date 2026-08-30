@@ -3,6 +3,12 @@
 {% block content %}
 {% set report_status = report["status"] if report else "not_started" %}
 {% set latest_message_status = messages[-1]["status"] if messages else "completed" %}
+{% set workspace = namespace(preparation_running=false) %}
+{% for paper in selected_papers %}
+  {% if paper["preparation_status"] in ["downloading", "parsing", "indexing"] %}
+    {% set workspace.preparation_running = true %}
+  {% endif %}
+{% endfor %}
 <section class="section-head research-task-heading" data-research-task-id="{{ task['id'] }}" data-research-task-status="{{ task['status'] }}" data-research-report-status="{{ report_status }}" data-research-message-status="{{ latest_message_status }}">
   <div>
     <p class="eyebrow">Research Workspace #{{ task["id"] }}</p>
@@ -41,19 +47,16 @@
       <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：只检索2023年后的论文，并重点关注Faithfulness指标" required></textarea>
       <button type="submit">更新计划</button>
     </form>
-  {% elif task["status"] == "papers_selected" and report_status not in ["preparing", "retrieving", "generating", "completed"] %}
-    <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post">
-      <label for="research-message">告诉我报告需要回答什么</label>
-      <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：比较这些论文如何评估RAG回答的忠实性与检索召回效果" required></textarea>
-      <button type="submit">设置报告问题</button>
-    </form>
-  {% elif task["status"] == "papers_selected" and report_status == "completed" %}
+  {% elif task["status"] == "papers_selected" and not workspace.preparation_running %}
     <form class="conversation-composer" action="/research-tasks/{{ task['id'] }}/message" method="post" data-followup-chat data-stream-url="/research-tasks/{{ task['id'] }}/chat">
-      <label for="research-message">继续追问当前报告和所选论文</label>
+      <input type="hidden" name="message_kind" value="followup">
+      <label for="research-message">研究所选论文</label>
       <textarea id="research-message" name="message" rows="3" maxlength="2000" placeholder="例如：第二篇论文为什么选择这个评价指标？" required data-chat-input></textarea>
       <button type="submit" {% if latest_message_status in ["pending", "retrieving", "generating", "streaming", "retry_wait"] %}disabled{% endif %} data-chat-submit>发送追问</button>
       <p class="chat-error" data-chat-error role="alert" hidden></p>
     </form>
+  {% elif task["status"] == "papers_selected" %}
+    <p class="conversation-waiting">正在独立准备所选论文；下载、解析和索引结束后即可开始 Research Chat。</p>
   {% else %}
     <p class="conversation-waiting">当前阶段正在执行任务，完成后可以继续对话。</p>
   {% endif %}
@@ -212,99 +215,8 @@
     </div>
   </section>
   {% set papers = selected_papers %}
+  {% set paper_summary_task_id = task["id"] %}
   {% include "table.html" %}
-  <section class="research-report" aria-labelledby="research-report-title">
-    <div class="section-head compact-heading">
-      <div>
-        <p class="eyebrow">Research Report</p>
-        <h2 id="research-report-title">跨论文研究报告</h2>
-      </div>
-      {% if report %}
-        <span class="status status-report-{{ report['status'] }}" data-report-status>{{ report["status"] }}</span>
-      {% endif %}
-    </div>
-
-    {% if not report %}
-      {% if task["report_question"] %}
-        <p class="report-question"><strong>报告问题：</strong>{{ task["report_question"] }}</p>
-        <form action="/research-tasks/{{ task['id'] }}/report" method="post">
-          <button type="submit">确认生成研究报告</button>
-        </form>
-        <p class="report-note">该操作会准备所选论文全文、检索证据，并在存在证据时调用 DeepSeek。</p>
-      {% else %}
-        <p class="empty-state">请先在上方研究对话中说明报告需要回答的问题。</p>
-      {% endif %}
-    {% elif report["status"] in ["preparing", "retrieving", "generating"] %}
-      <p class="task-progress">报告正在后台{{ {"preparing": "准备论文", "retrieving": "检索证据", "generating": "生成内容"}[report["status"]] }}，页面会自动更新。</p>
-      {% if report["job_status"] %}
-        <p class="report-note">
-          队列状态：{{ report["job_status"] }}
-          {% if report["job_attempts"] %}
-            · 第 {{ report["job_attempts"] }} / {{ report["job_max_attempts"] }} 次尝试
-          {% endif %}
-        </p>
-      {% endif %}
-      {% if report["error"] %}<p class="alert">{{ report["error"] }}</p>{% endif %}
-      {% set progress = report["details"].get("checkpoint_progress", {}) %}
-      {% if progress %}
-        <p class="report-note">
-          已准备 {{ progress.get("prepared_papers", 0) }}/{{ progress.get("selected_papers", task["selected_count"]) }} 篇；
-          已检索 {{ progress.get("retrieved_papers", 0) }}/{{ progress.get("selected_papers", task["selected_count"]) }} 篇。
-        </p>
-      {% endif %}
-    {% elif report["status"] == "failed" %}
-      <p class="alert">报告失败：{{ report["error"] }}</p>
-      <form action="/research-tasks/{{ task['id'] }}/report" method="post">
-        <button type="submit">重新生成</button>
-      </form>
-    {% elif report["status"] == "completed" %}
-      <div class="report-meta">
-        <span>模型：{{ report["model"] or "未调用模型" }}</span>
-        <span>证据：{{ report["details"].get("evidence", []) | length }} 条</span>
-        <span>访问限制：{{ report["details"].get("access_limitations", []) | length }} 篇</span>
-        {% set citation = report["details"].get("citation_validation", {}) %}
-        {% if citation %}
-          <span class="citation-check citation-{{ citation.get('status', 'warning') }}">
-            引用检查：{{ citation.get("status", "warning") }}（{{ citation.get("valid_citation_count", 0) }}/{{ citation.get("citation_count", 0) }}）
-          </span>
-        {% endif %}
-      </div>
-      {% set context_stats = report["details"].get("context_stats", {}) %}
-      {% if context_stats %}
-        <div class="context-stats" aria-label="上下文工程统计">
-          <span>上下文：{{ context_stats.get("raw_evidence_count", 0) }} → {{ context_stats.get("selected_evidence_count", 0) }} 条</span>
-          <span>去重后：{{ context_stats.get("post_dedup_evidence_count", context_stats.get("raw_evidence_count", 0)) }} 条</span>
-          <span>重复移除：精确 {{ context_stats.get("exact_duplicate_count", 0) }} / 高重叠 {{ context_stats.get("overlap_duplicate_count", 0) }}</span>
-          <span>估算Token：{{ context_stats.get("raw_estimated_tokens", 0) }} → {{ context_stats.get("selected_estimated_tokens", 0) }}</span>
-          <span>压缩：{{ context_stats.get("estimated_token_reduction_percent", 0) }}%</span>
-          <span>论文覆盖：{{ context_stats.get("covered_paper_count", 0) }}/{{ context_stats.get("paper_count", 0) }}</span>
-          {% set context_quality = report["details"].get("context_quality", {}) %}
-          {% if context_quality %}
-            <span class="context-gate context-gate-{{ context_quality.get('status', 'failed') }}">
-              上下文门禁：{{ context_quality.get("status", "failed") }}
-            </span>
-          {% endif %}
-        </div>
-      {% endif %}
-      <div class="research-report-content">{{ report["content"] }}</div>
-      {% if report["details"].get("access_limitations") %}
-        <div class="report-limitations">
-          <h3>未验证全文</h3>
-          <ul>
-            {% for item in report["details"]["access_limitations"] %}
-              <li>
-                <strong>{{ item["paper_title"] }}</strong>：{{ item["reason"] }}
-                {% if item["url"] %}<a href="{{ item['url'] }}" target="_blank" rel="noreferrer">访问论文</a>{% endif %}
-              </li>
-            {% endfor %}
-          </ul>
-        </div>
-      {% endif %}
-      <form class="report-regenerate" action="/research-tasks/{{ task['id'] }}/report" method="post">
-        <button class="secondary" type="submit">重新生成</button>
-      </form>
-    {% endif %}
-  </section>
 {% elif task["status"] == "completed" %}
   <section class="section-head compact-heading">
     <div>
@@ -322,4 +234,5 @@
 {% block scripts %}
   <script src="{{ url_for('static', path='/research_task_poll.js') }}" defer></script>
   <script src="{{ url_for('static', path='/research_followup_chat.js') }}" defer></script>
+  <script src="{{ url_for('static', path='/paper_summary.js') }}" defer></script>
 {% endblock %}

@@ -20,9 +20,11 @@ from .paper_workflow import (
     get_paper_preparation_status,
     prepare_paper_for_qa,
 )
+from .paper_summary_service import generate_paper_summary
 from .schemas import INDEX_FAILED, INDEX_INDEXING, PARSE_FAILED, PARSE_PARSING
 from .schemas import (
     INDEX_INDEXED,
+    PAPER_SUMMARY_COMPLETED,
     PARSE_PARSED,
     RAG_ANSWERED,
     RAG_ANSWERING,
@@ -48,6 +50,7 @@ JOB_ANSWER_RAG_QUERY = "answer_rag_query"
 JOB_RESEARCH_SEARCH = "research_search"
 JOB_RESEARCH_REPORT = "research_report"
 JOB_RESEARCH_FOLLOWUP = "research_followup"
+JOB_PAPER_SUMMARY = "paper_summary"
 JOB_STATUS_RETRY_WAIT = "retry_wait"
 JOB_STATUS_FAILED = "failed"
 DEFAULT_JOB_LEASE_SECONDS = 90
@@ -180,6 +183,21 @@ def _research_followup_handler(payload: dict[str, Any]) -> None:
         raise RuntimeError(str(error or "Research follow-up did not complete"))
 
 
+def _paper_summary_handler(payload: dict[str, Any]) -> None:
+    task_id = int(payload.get("task_id") or 0)
+    paper_id = int(payload.get("paper_id") or 0)
+    summary = db.get_paper_summary(task_id, paper_id)
+    if task_id < 1 or paper_id < 1 or summary is None:
+        raise RuntimeError("Paper summary job references a missing artifact")
+    if summary["status"] == PAPER_SUMMARY_COMPLETED:
+        return
+    generate_paper_summary(task_id, paper_id, raise_on_error=True)
+    summary = db.get_paper_summary(task_id, paper_id)
+    if summary is None or summary["status"] != PAPER_SUMMARY_COMPLETED:
+        error = summary["error"] if summary is not None else None
+        raise RuntimeError(str(error or "Paper summary did not complete"))
+
+
 JOB_HANDLERS: dict[str, JobHandler] = {
     JOB_DOWNLOAD_PAPER: _download_paper_handler,
     JOB_PREPARE_PAPER: _prepare_paper_handler,
@@ -189,6 +207,7 @@ JOB_HANDLERS: dict[str, JobHandler] = {
     JOB_RESEARCH_SEARCH: _research_search_handler,
     JOB_RESEARCH_REPORT: _research_report_handler,
     JOB_RESEARCH_FOLLOWUP: _research_followup_handler,
+    JOB_PAPER_SUMMARY: _paper_summary_handler,
 }
 
 
@@ -313,9 +332,47 @@ def _mark_research_followup_failed(message_id: int, error: str) -> None:
         )
 
 
+def _mark_paper_summary_retry_pending(
+    task_id: int,
+    paper_id: int,
+    error: str,
+) -> None:
+    summary = db.get_paper_summary(task_id, paper_id)
+    if summary is not None and summary["status"] != PAPER_SUMMARY_COMPLETED:
+        db.mark_paper_summary_retry_pending(
+            task_id,
+            paper_id,
+            f"Paper summary failed; waiting for retry: {error}"[:1000],
+        )
+
+
+def _mark_paper_summary_failed(task_id: int, paper_id: int, error: str) -> None:
+    summary = db.get_paper_summary(task_id, paper_id)
+    if summary is not None and summary["status"] != PAPER_SUMMARY_COMPLETED:
+        db.update_paper_summary(
+            task_id,
+            paper_id,
+            "failed",
+            error=error[:1000],
+        )
+
+
 def recover_expired_jobs() -> list[dict]:
     recovered = db.recover_expired_background_jobs()
     for job in recovered:
+        if job["job_type"] == JOB_PAPER_SUMMARY:
+            task_id = int(job.get("research_task_id") or 0)
+            paper_id = int(job.get("paper_id") or 0)
+            if task_id and paper_id:
+                if job["status"] == JOB_STATUS_FAILED:
+                    _mark_paper_summary_failed(task_id, paper_id, job["last_error"])
+                else:
+                    _mark_paper_summary_retry_pending(
+                        task_id,
+                        paper_id,
+                        job["last_error"],
+                    )
+            continue
         if job["job_type"] == JOB_RESEARCH_FOLLOWUP:
             message_id = int(job.get("payload", {}).get("message_id") or 0)
             if message_id:
@@ -527,6 +584,13 @@ def _execute_claimed_job(
                 _mark_research_followup_retry_pending(message_id, error)
             elif message_id and next_status == JOB_STATUS_FAILED:
                 _mark_research_followup_failed(message_id, error)
+        elif job["job_type"] == JOB_PAPER_SUMMARY:
+            task_id = int(job.get("research_task_id") or 0)
+            paper_id = int(job.get("paper_id") or 0)
+            if task_id and paper_id and next_status == JOB_STATUS_RETRY_WAIT:
+                _mark_paper_summary_retry_pending(task_id, paper_id, error)
+            elif task_id and paper_id and next_status == JOB_STATUS_FAILED:
+                _mark_paper_summary_failed(task_id, paper_id, error)
         job["status"] = next_status or job["status"]
         job["last_error"] = error
         return job

@@ -14,6 +14,9 @@ function updateStatusBadge(element, status) {
 function updatePaperStatus(paper) {
   const row = document.querySelector(`[data-paper-row][data-paper-id="${paper.id}"]`);
   if (row) {
+    const previousPreparationStatus = row
+      .querySelector("[data-preparation-status]")
+      ?.textContent.trim();
     updateStatusBadge(row.querySelector("[data-download-status]"), paper.status);
     updateStatusBadge(
       row.querySelector("[data-preparation-status]"),
@@ -21,6 +24,26 @@ function updatePaperStatus(paper) {
     );
     const dateCell = row.querySelector("[data-downloaded-at]");
     if (dateCell) dateCell.textContent = paper.downloaded_at || "-";
+    const researchTask = document.querySelector(
+      '[data-research-task-status="papers_selected"]',
+    );
+    const terminalStatuses = new Set([
+      "ready",
+      "download_failed",
+      "parse_failed",
+      "index_failed",
+      "link_only",
+    ]);
+    if (
+      researchTask
+      && ["downloading", "parsing", "indexing"].includes(
+        previousPreparationStatus,
+      )
+      && terminalStatuses.has(paper.preparation_status)
+    ) {
+      window.location.reload();
+      return;
+    }
   }
 
   const detailStatus = document.querySelector(".detail [data-download-status]");

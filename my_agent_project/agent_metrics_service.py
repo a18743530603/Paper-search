@@ -56,12 +56,9 @@ def _average(values: Iterable[int | float]) -> tuple[float | None, int]:
 
 
 def _task_outcome(task: Mapping[str, Any]) -> str:
-    if task.get("report_status") == "completed":
+    if task.get("task_status") in {"papers_selected", "completed"}:
         return "completed"
-    if (
-        task.get("task_status") == "failed"
-        or task.get("report_status") == "failed"
-    ):
+    if task.get("task_status") == "failed":
         return "failed"
     return "excluded"
 
@@ -74,8 +71,9 @@ def _task_completion_rate(tasks: list[dict]) -> dict[str, Any]:
         denominator,
         excluded=outcomes["excluded"],
         definition=(
-            "报告完成任务 /（报告完成任务 + 系统失败任务）；等待审批、等待选择、"
-            "尚未生成报告和用户取消均不进入分母。"
+            "已冻结论文集合并进入Research Workspace的任务 /（Workspace可用任务 + "
+            "系统失败任务）；等待审批、等待选择和用户取消均不进入分母，"
+            "可选Report成功或失败不改变任务完成结果。"
         ),
     )
 
@@ -212,7 +210,9 @@ def _task_latency(tasks: list[dict]) -> dict[str, Any]:
             continue
         started = _parse_timestamp(task.get("created_at"))
         completed = _parse_timestamp(
-            task.get("report_completed_at") or task.get("task_completed_at")
+            task.get("selected_at")
+            or task.get("task_completed_at")
+            or task.get("report_completed_at")
         )
         if started is None or completed is None or completed < started:
             continue
@@ -221,7 +221,10 @@ def _task_latency(tasks: list[dict]) -> dict[str, Any]:
     return {
         "value_ms": average,
         "sample_count": sample_count,
-        "definition": "已决任务从research_tasks.created_at到任务或报告completed_at的平均耗时。",
+        "definition": (
+            "已决任务从research_tasks.created_at到selected_at（进入Research "
+            "Workspace）的平均耗时；历史记录缺失selected_at时回退到既有完成时间。"
+        ),
     }
 
 

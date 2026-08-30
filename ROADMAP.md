@@ -4,7 +4,7 @@
 >
 > 日志建立日期：`2026-08-16`
 >
-> 当前阶段：`SQLite → MySQL Phase 6 Fresh MySQL Cutover已完成；Business Database正式使用MySQL，LangGraph Checkpoint继续使用SQLite SqliteSaver`
+> 当前阶段：`Research Workspace新架构第二阶段已完成；Paper Summary作为独立可选Artifact接入`
 
 本文件用于在后续 Codex 对话之间同步开发路线和实际进度。它记录“接下来为什么做、做到哪里、验证结果和下一步”，功能细节仍写入 `README.md`、`PROJECT.md`、`CHANGELOG.md` 和 `AGENTS.md`，实验数据仍写入 `EXPERIMENTS.md`。
 
@@ -827,3 +827,25 @@ MCP 层不复制搜索、数据库或 RAG 逻辑。需要增加 MCP Client 冒�
 - 当前MySQL用户仍拥有全局DDL、DML和管理权限，足以完成本地migration与运行，但权限明显宽于长期生产运行所需。后续生产化应拆分Migration User（DDL）与Runtime User（SELECT/INSERT/UPDATE/DELETE）；本轮不为权限重构阻塞Cutover。
 - 回滚方案仅记录、不主动执行：停止FastAPI/Worker，将`BUSINESS_DB_BACKEND`显式改回`sqlite`，使用`metadata_before_mysql.db`恢复Business SQLite，并保留`paper_hunter`现场用于诊断。长期正式架构仍为Business Data使用MySQL、LangGraph Checkpoint使用SQLite SqliteSaver。
 - Phase 1–6 Exit Criteria全部满足：Paper Hunter Business Database已完成SQLite → MySQL Fresh Cutover；Historical SQLite Business Data intentionally not migrated；不存在silent MySQL → SQLite fallback；未进入或修改LangGraph SqliteSaver迁移。
+
+### 2026-08-28：Research Workspace第一阶段——解除强制Report
+
+- 主LangGraph在`request_paper_selection`成功后直接结束，不再强制进入`request_report_confirmation`；计划确认和论文选择仍保留原生`interrupt()`与SQLite SqliteSaver恢复语义，旧Report节点继续注册以兼容已有Checkpoint。
+- `POST /research-tasks/{task_id}/select`冻结1至5篇论文后，逐篇复用现有`prepare_paper`持久Job；下载、MinerU解析、分块和Seed/TF-IDF索引继续由独立Worker执行，不进入Web请求事务或长数据库事务。ready论文直接复用，active任务由原dedupe保护，单篇不可访问或状态拒绝不阻断其他论文入队。
+- Streaming和无JavaScript Worker Follow-up都不再查询`research_reports.status == completed`作为准入条件；新的数据库门禁要求Task处于`papers_selected`、存在冻结论文且没有活动下载/准备/解析/索引Job。全部准备任务进入成功、失败或访问受限终态后均可Chat，失败论文只形成Access Limitations。
+- `prepare_research_followup_context()`在Report不存在、失败或尚未完成时传入`existing_report=""`，只有completed Report才作为可选背景；Task Memory、Summary、Recent Messages、Existing Report仍不能替代当前Original Paper Evidence。零Evidence继续确定性拒答且不调用回答模型。
+- 跨论文Report表、Job、Prompt、Evidence打包、Citation Validation和历史Checkpoint路径均保留。新任务由于主图已经结束，会使用既有Service fallback；fallback已统一优先使用独立`report_question`，不再悄悄退回原始检索问题。
+- 前端只做必要解锁：准备任务运行时显示等待说明，状态轮询在所选论文进入终态时刷新；Workspace可用后直接显示Research Chat。原Report区域保留为可选表单和结果区，没有增加Paper Summary、Timeline重构或CSS重设计。
+- Agent Metrics把`papers_selected/completed`定义为Workspace任务完成，优先使用`selected_at`计算任务延迟；可选Report失败不再把正常Workspace任务算作失败或excluded。未改Eval主体、RAG Top-K、分块、Embedding、Reranker或Prompt安全边界。
+- 隔离真实E2E使用随机临时MySQL库和CITISEN真实PDF跑通Selection → `prepare_paper` → 下载 → MinerU解析 → 索引 → 无Report流式Chat：生成`131`个chunks，Follow-up使用`2`条Original Paper Evidence完成回答，`research_reports`始终为空；临时库清理后`temporary_workspace_databases_remaining=0`，正式`paper_hunter`中验收Paper/Task写入均为`0`。
+- 专项SQLite/工作流/Follow-up/ContextBuilder/Queue回归`259 passed`；Phase 1–6真实MySQL回归`120 passed, 1 skipped`；完整canonical pytest`848 passed, 2 skipped`；`git diff --check`通过。
+
+### 2026-08-28：Research Workspace第二阶段——单篇Paper Summary
+
+- 新增独立`paper_summaries` Artifact和MySQL `003_paper_summaries.sql` migration，以`task_id + paper_id`唯一约束绑定当前Research Task中的单篇论文；正文不写入`research_messages`，重新生成覆盖同一Artifact而不建立版本系统。
+- `enqueue_paper_summary_job()`只接受当前任务已选择且`parsed/indexed`的论文，在同一短事务中创建或重置Artifact并写入`paper_summary`持久Job；active dedupe key为`paper_summary:{task_id}:{paper_id}`，租约、心跳、retry、expired recovery和最终失败全部复用现有Worker。
+- Summary Evidence不使用Follow-up `Top-K=3 → max 2 chunks`。第一版直接读取当前论文的原始`paper_chunks`，优先利用`section_title`，缺失章节时回退物理页分组；固定覆盖首尾、方法、实验、结果、结论、局限等已存在结构，再按文档顺序均匀补齐，最多16条/28000字符，不执行查询检索、Reranker、Neighbor或Parent Expansion。
+- 无Original Paper Evidence时确定性生成“证据不足”说明且不调用DeepSeek；有证据时使用不可信JSON边界和单篇Summary Prompt，生成内容与实际Evidence一起持久化。Summary只帮助阅读，未注入Conversation、Task Memory或Report，Research Chat的事实仍由当轮Original Paper Evidence支撑。
+- 新增POST/GET `/api/research-tasks/{task_id}/papers/{paper_id}/summary`，支持请求生成、轮询状态/内容和在无活动Job时重新生成；API与DB入队层都校验论文属于当前Task的selected集合。
+- 本阶段按要求只运行直接相关测试：SQLite/静态migration专项`24 passed`，真实MySQL随机临时库定向集成`2 passed`，Research Chat/optional Report/selection邻接回归`6 passed`；`git diff --check`通过，`temporary_paper_summary_databases_remaining=0`。未运行canonical pytest或Phase 1–6全量MySQL回归。
+- 隔离真实单篇E2E只读复制正式库中CITISEN的`131`个原文chunks到随机临时MySQL库，通过真实`paper_summary` Job与`deepseek-v4-pro`完成生成：结构覆盖Evidence `16`条、正文`4901`字符、Artifact/Job均为completed/succeeded，Report保持不存在，Summary未写入Conversation Message；临时脚本与数据库随后删除。

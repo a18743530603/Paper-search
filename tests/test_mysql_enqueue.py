@@ -241,7 +241,6 @@ def test_mysql_two_research_report_enqueues_share_one_active_job() -> None:
 @isolated_mysql_enqueue_test
 def test_mysql_followup_messages_and_job_remain_atomic_under_duplicate() -> None:
     task_id = _create_research_task(status="papers_selected", selected_count=1)
-    _complete_report(task_id)
     results = _concurrent_results(
         2,
         lambda _index: db.enqueue_research_followup_job(task_id, "Same question"),
@@ -264,7 +263,6 @@ def test_mysql_followup_messages_and_job_remain_atomic_under_duplicate() -> None
 @isolated_mysql_enqueue_test
 def test_mysql_streaming_and_worker_followup_paths_share_task_lock() -> None:
     task_id = _create_research_task(status="papers_selected", selected_count=1)
-    _complete_report(task_id)
     operations = (
         lambda: db.create_research_followup_messages(task_id, "Live question"),
         lambda: db.enqueue_research_followup_job(task_id, "Fallback question"),
@@ -538,7 +536,6 @@ def test_mysql_followup_messages_roll_back_when_job_insert_fails(
     monkeypatch,
 ) -> None:
     task_id = _create_research_task(status="papers_selected", selected_count=1)
-    _complete_report(task_id)
     monkeypatch.setattr(
         db.MySQLConnectionAdapter,
         "execute",

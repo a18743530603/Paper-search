@@ -317,9 +317,11 @@ def request_paper_selection(state: ResearchSearchState) -> dict[str, Any]:
 
 def route_after_paper_selection(
     state: ResearchSearchState,
-) -> Literal["request_report_confirmation", "end"]:
-    if state.get("workflow_status") == "papers_selected":
-        return "request_report_confirmation"
+) -> Literal["end"]:
+    # Paper preparation and Research Chat now continue through the durable
+    # Business Database queue after the selection is persisted.  Cross-paper
+    # Report generation remains available as an optional legacy action, but it
+    # is no longer the next mandatory checkpoint in the main research graph.
     return "end"
 
 
@@ -573,7 +575,6 @@ def build_checkpointed_research_graph(checkpointer):
         "request_paper_selection",
         route_after_paper_selection,
         {
-            "request_report_confirmation": "request_report_confirmation",
             "end": END,
         },
     )

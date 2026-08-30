@@ -308,3 +308,78 @@ def test_context_builder_15_does_not_mutate_prepared_inputs():
     )
 
     assert [memory, history, evidence, limitations] == originals
+
+
+def test_followup_context_without_report_keeps_evidence_and_partial_limitations(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        research_conversation_service,
+        "get_research_task",
+        lambda _task_id: {
+            "id": 7,
+            "status": "papers_selected",
+            "selected_paper_ids": [1, 2],
+        },
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "get_research_report",
+        lambda _task_id: None,
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "update_task_memory_from_message",
+        lambda *_args, **_kwargs: {"memories": [], "error": ""},
+    )
+
+    def retrieve(paper_id, _question, **kwargs):
+        assert kwargs["top_k"] == 5
+        if paper_id == 1:
+            return {
+                "evidence": [
+                    {
+                        "paper_id": 1,
+                        "paper_title": "Prepared Paper",
+                        "page_number": 4,
+                        "chunk_id": 9,
+                        "score": 0.9,
+                        "content": "The prepared paper contains valid evidence.",
+                    }
+                ],
+                "access_limitation": None,
+            }
+        return {
+            "evidence": [],
+            "access_limitation": {
+                "paper_id": 2,
+                "paper_title": "Unavailable Paper",
+                "url": "https://example.com/unavailable",
+                "reason": "全文不可访问",
+            },
+        }
+
+    monkeypatch.setattr(
+        research_conversation_service,
+        "retrieve_report_paper_evidence",
+        retrieve,
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "prepare_research_conversation_context",
+        lambda *_args, **_kwargs: {
+            "conversation_summary": "older summary",
+            "recent_messages": [{"role": "user", "content": "older question"}],
+            "summary_error": "",
+        },
+    )
+
+    context = research_conversation_service.prepare_research_followup_context(
+        7,
+        "current question",
+    )
+
+    assert context["report_content"] == ""
+    assert [item["paper_id"] for item in context["evidence"]] == [1]
+    assert context["access_limitations"][0]["paper_id"] == 2
+    assert context["conversation_summary"] == "older summary"

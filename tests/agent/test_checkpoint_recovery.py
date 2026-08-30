@@ -301,9 +301,9 @@ def test_paper_selection_recovers_without_repeating_plan_or_search(
         config=config,
     )
 
-    assert "__interrupt__" in selected
+    assert "__interrupt__" not in selected
     assert selected["workflow_status"] == "papers_selected"
-    assert resumed_graph.get_state(config).next == ("request_report_confirmation",)
+    assert resumed_graph.get_state(config).next == ()
     assert planner_calls == 1
     assert search_queries == ["agent memory architecture", "agent memory retrieval"]
     assert len(_node_traces(thread_id, "multi_query_search")) == 1
@@ -315,7 +315,7 @@ def test_paper_selection_recovers_without_repeating_plan_or_search(
     resumed_connection.close()
 
 
-def test_report_confirmation_and_partial_progress_resume_without_replay(
+def test_paper_selection_finishes_without_running_report_nodes(
     tmp_path,
     monkeypatch,
 ):
@@ -391,39 +391,19 @@ def test_report_confirmation_and_partial_progress_resume_without_replay(
         Command(resume={"paper_ids": [101, 102], "cancelled": False}),
         config=config,
     )
-    assert "__interrupt__" in report_waiting
-    first_connection.close()
+    final_state = first_graph.get_state(config)
 
-    second_connection, second_graph = _graph(checkpoint_path)
-    stream = second_graph.stream(
-        Command(resume={"approved": True}),
-        config=config,
-        stream_mode="values",
-    )
-    for values in stream:
-        if values.get("report_prepare_index") == 1:
-            break
-    stream.close()
-    assert prepared_ids == [101]
-    second_connection.close()
-
-    final_connection, final_graph = _graph(checkpoint_path)
-    final_graph.invoke(None, config=config)
-    final_state = final_graph.get_state(config)
-
-    assert final_state.values["workflow_status"] == "report_completed"
-    assert final_state.next == ("request_report_regeneration",)
+    assert "__interrupt__" not in report_waiting
+    assert final_state.values["workflow_status"] == "papers_selected"
+    assert final_state.next == ()
     assert planner_calls == 1
     assert search_queries == ["agent memory architecture", "agent memory retrieval"]
-    assert prepared_ids == [101, 102]
-    assert retrieved_ids == [101, 102]
-    assert model_calls == 1
+    assert prepared_ids == []
+    assert retrieved_ids == []
+    assert model_calls == 0
     assert len(_node_traces(thread_id, "multi_query_search")) == 1
-    assert len(_node_traces(thread_id, "prepare_report_paper")) == 2
-    assert len(_node_traces(thread_id, "retrieve_report_evidence")) == 2
-    assert len(_node_traces(thread_id, "synthesize_research_report")) == 1
-    assert [
-        trace["status"]
-        for trace in _node_traces(thread_id, "request_report_confirmation")
-    ] == ["interrupted", "success"]
-    final_connection.close()
+    assert _node_traces(thread_id, "request_report_confirmation") == []
+    assert _node_traces(thread_id, "prepare_report_paper") == []
+    assert _node_traces(thread_id, "retrieve_report_evidence") == []
+    assert _node_traces(thread_id, "synthesize_research_report") == []
+    first_connection.close()

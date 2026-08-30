@@ -3,7 +3,7 @@ import re
 import time
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,11 +19,14 @@ from .config import (
     MINERU_REQUEST_TIMEOUT,
     MINERU_RESULTS_DIR,
 )
-from .schemas import PaperChunk
+from .context_service import estimate_text_tokens
+from .schemas import PaperChunk, PaperParentChunk
 
 
 MINERU_PARSER_BACKEND = "mineru_cloud"
 MINERU_CHUNK_STRATEGY = "mineru_structured"
+MINERU_PARENT_TARGET_TOKENS = 1000
+MINERU_PARENT_HARD_MAX_TOKENS = 1500
 MAX_PDF_BYTES = 200 * 1024 * 1024
 MAX_RESULT_ZIP_BYTES = 512 * 1024 * 1024
 MAX_CONTENT_LIST_BYTES = 128 * 1024 * 1024
@@ -381,7 +384,7 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
 
 def build_structured_chunks(
     content_list: Sequence[Mapping[str, Any]],
-) -> tuple[int, list[PaperChunk], dict[str, Any]]:
+) -> tuple[int, list[PaperChunk], list[PaperParentChunk], dict[str, Any]]:
     sections: list[str] = []
     chunks: list[PaperChunk] = []
     content_type_counts: dict[str, int] = {}
@@ -442,11 +445,88 @@ def build_structured_chunks(
         )
         content_type_counts[normalized_type] = content_type_counts.get(normalized_type, 0) + 1
 
+    chunks, parent_chunks, parent_stats = build_structured_parent_chunks(chunks)
     stats = {
         "source_block_count": len(content_list),
         "structured_chunk_count": len(chunks),
         "section_count": len(section_paths),
         "skipped_block_count": skipped_blocks,
         "content_type_counts": content_type_counts,
+        **parent_stats,
     }
-    return maximum_page, chunks, stats
+    return maximum_page, chunks, parent_chunks, stats
+
+
+def build_structured_parent_chunks(
+    chunks: Sequence[PaperChunk],
+    *,
+    target_tokens: int = MINERU_PARENT_TARGET_TOKENS,
+    hard_max_tokens: int = MINERU_PARENT_HARD_MAX_TOKENS,
+) -> tuple[list[PaperChunk], list[PaperParentChunk], dict[str, int]]:
+    """Group consecutive MinerU blocks into page- and section-bounded parents."""
+
+    if target_tokens < 1:
+        raise ValueError("target_tokens must be positive")
+    if hard_max_tokens < target_tokens:
+        raise ValueError(
+            "hard_max_tokens must be greater than or equal to target_tokens"
+        )
+
+    linked_chunks: list[PaperChunk] = []
+    parents: list[PaperParentChunk] = []
+    current: list[PaperChunk] = []
+    current_key: tuple[int, str] | None = None
+    oversized_parent_count = 0
+    parent_token_counts: list[int] = []
+
+    def parent_text(items: Sequence[PaperChunk]) -> str:
+        return "\n\n".join(item.content for item in items)
+
+    def flush() -> None:
+        nonlocal current, current_key, oversized_parent_count
+        if not current:
+            return
+        content = parent_text(current)
+        estimated_tokens = estimate_text_tokens(content)
+        parent_index = len(parents)
+        parents.append(
+            PaperParentChunk(
+                page_number=current[0].page_number,
+                parent_index=parent_index,
+                content=content,
+            )
+        )
+        linked_chunks.extend(
+            replace(chunk, parent_index=parent_index) for chunk in current
+        )
+        parent_token_counts.append(estimated_tokens)
+        if estimated_tokens > hard_max_tokens:
+            # A MinerU block is atomic: preserve its original content and retrieval
+            # granularity instead of truncating or splitting it solely for a parent.
+            oversized_parent_count += 1
+        current = []
+        current_key = None
+
+    for chunk in chunks:
+        chunk_key = (chunk.page_number, chunk.section_title)
+        if current and chunk_key != current_key:
+            flush()
+
+        candidate = [*current, chunk]
+        if current and estimate_text_tokens(parent_text(candidate)) > hard_max_tokens:
+            flush()
+            candidate = [chunk]
+
+        current = candidate
+        current_key = chunk_key
+        if estimate_text_tokens(parent_text(current)) >= target_tokens:
+            flush()
+
+    flush()
+    return linked_chunks, parents, {
+        "parent_chunk_count": len(parents),
+        "parent_target_tokens": target_tokens,
+        "parent_hard_max_tokens": hard_max_tokens,
+        "parent_max_estimated_tokens": max(parent_token_counts, default=0),
+        "oversized_parent_count": oversized_parent_count,
+    }

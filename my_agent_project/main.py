@@ -27,6 +27,7 @@ from .db import (
     enqueue_index_job,
     enqueue_parse_job,
     enqueue_paper_preparation_job,
+    enqueue_paper_summary_job,
     enqueue_rag_answer_job,
     enqueue_research_report_job,
     enqueue_research_search_job,
@@ -36,6 +37,7 @@ from .db import (
     get_evaluation_run,
     get_generation_evaluation_run,
     get_paper,
+    get_paper_summary,
     get_research_task,
     get_research_report,
     initialize_business_database,
@@ -123,6 +125,55 @@ def paper_view(paper):
         dict(document) if document else None,
     )
     return item
+
+
+def enqueue_selected_paper_preparations(paper_ids: list[int]) -> list[dict]:
+    """Best-effort fan-out to the existing durable per-paper preparation jobs."""
+    results = []
+    for paper_id in paper_ids:
+        try:
+            queued = enqueue_paper_preparation_job(int(paper_id))
+            results.append(
+                {"paper_id": int(paper_id), "result": queued, "error": ""}
+            )
+        except (LookupError, RuntimeError) as exc:
+            # A ready, inaccessible, or already-running paper must not prevent
+            # the remaining selected papers from entering their own jobs.
+            results.append(
+                {"paper_id": int(paper_id), "result": None, "error": str(exc)}
+            )
+    return results
+
+
+def paper_summary_api_payload(summary: dict) -> dict:
+    return {
+        "id": int(summary["id"]),
+        "task_id": int(summary["task_id"]),
+        "paper_id": int(summary["paper_id"]),
+        "status": summary["status"],
+        "content": summary.get("content"),
+        "model": summary.get("model"),
+        "error": summary.get("error"),
+        "evidence_count": len(summary.get("evidence") or []),
+        "created_at": summary["created_at"],
+        "updated_at": summary["updated_at"],
+        "completed_at": summary.get("completed_at"),
+        "job_status": summary.get("job_status"),
+        "job_attempts": summary.get("job_attempts"),
+        "job_max_attempts": summary.get("job_max_attempts"),
+    }
+
+
+def require_selected_task_paper(task_id: int, paper_id: int) -> dict:
+    task = get_research_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    if paper_id not in {int(value) for value in task["selected_paper_ids"]}:
+        raise HTTPException(
+            status_code=409,
+            detail="Paper is not selected for this research task",
+        )
+    return task
 
 
 @app.get("/")
@@ -252,6 +303,7 @@ def confirm_research_task(task_id: int):
 def post_research_message(
     task_id: int,
     message: str = Form(...),
+    message_kind: str = Form(default=""),
 ):
     message = " ".join(message.split())
     if not message:
@@ -293,7 +345,11 @@ def post_research_message(
                 plan_error=plan["plan_error"],
             )
     elif task["status"] == "papers_selected" and (
-        report is None or report["status"] != "completed"
+        message_kind == "report_question"
+        or (
+            not message_kind
+            and (report is None or report["status"] != "completed")
+        )
     ):
         if report is not None and report["status"] in {
             "preparing",
@@ -303,7 +359,7 @@ def post_research_message(
             raise HTTPException(status_code=409, detail="报告正在生成，请稍后再发消息")
         if not set_research_report_question(task_id, message):
             raise HTTPException(status_code=409, detail="当前阶段不能设置报告问题")
-    elif task["status"] == "papers_selected" and report is not None:
+    elif task["status"] == "papers_selected":
         try:
             enqueue_research_followup_job(task_id, message)
         except (ValueError, RuntimeError) as exc:
@@ -399,6 +455,7 @@ def select_research_papers(
     )
     if not selected:
         raise HTTPException(status_code=409, detail="Research papers cannot be selected")
+    enqueue_selected_paper_preparations(selected_ids)
     return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
 
 
@@ -418,6 +475,43 @@ def create_research_report_route(task_id: int):
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(url=f"/research-tasks/{task_id}", status_code=303)
+
+
+@app.post("/api/research-tasks/{task_id}/papers/{paper_id}/summary")
+def create_paper_summary_route(
+    task_id: int,
+    paper_id: int,
+    response: Response,
+):
+    require_selected_task_paper(task_id, paper_id)
+    try:
+        queued = enqueue_paper_summary_job(task_id, paper_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    summary = get_paper_summary(task_id, paper_id)
+    if summary is None:
+        raise HTTPException(status_code=500, detail="Paper summary was not created")
+    response.status_code = 202
+    return {
+        "created": bool(queued["created"]),
+        "job_id": int(queued["job_id"]),
+        "summary": paper_summary_api_payload(summary),
+    }
+
+
+@app.get("/api/research-tasks/{task_id}/papers/{paper_id}/summary")
+def get_paper_summary_route(task_id: int, paper_id: int):
+    require_selected_task_paper(task_id, paper_id)
+    summary = get_paper_summary(task_id, paper_id)
+    return {
+        "task_id": task_id,
+        "paper_id": paper_id,
+        "summary": (
+            paper_summary_api_payload(summary) if summary is not None else None
+        ),
+    }
 
 
 @app.get("/api/research-tasks/{task_id}")

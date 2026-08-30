@@ -10,6 +10,8 @@ _PYTEST_RUNTIME = tempfile.TemporaryDirectory(prefix="paper-hunter-pytest-")
 # randomly named temporary databases and never use the formal paper_hunter database.
 os.environ["BUSINESS_DB_BACKEND"] = "sqlite"
 os.environ["DOWNLOAD_DIR"] = _PYTEST_RUNTIME.name
+os.environ["RESEARCH_QUERY_ROUTING_ENABLED"] = "false"
+os.environ["RESEARCH_PRF_ENABLED"] = "false"
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:

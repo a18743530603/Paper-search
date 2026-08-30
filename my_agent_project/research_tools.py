@@ -5,6 +5,16 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from .config import (
+    RESEARCH_CANDIDATE_POOL_SIZE,
+    RESEARCH_FINAL_SEED_COUNT,
+    RESEARCH_MMR_ENABLED,
+    RESEARCH_MMR_LAMBDA,
+    RESEARCH_PARENT_EXPANSION_ENABLED,
+    RESEARCH_PRF_ENABLED,
+    RESEARCH_RERANKER_ENABLED,
+    RESEARCH_RERANKER_MODEL,
+)
 from .db import get_document, get_paper
 from .paper_search_mcp_service import LEGACY_SOURCE_IDS, normalize_source_ids
 from .paper_workflow import PREPARATION_READY, prepare_paper_for_qa
@@ -137,18 +147,21 @@ def prepare_paper_for_research(paper_id: int) -> dict[str, Any]:
     }
 
 
-@tool(RETRIEVE_EVIDENCE_TOOL_NAME)
-def retrieve_paper_evidence(
+def retrieve_paper_evidence_with_lexical_query(
     paper_id: int,
     question: str,
-    top_k: int = 3,
+    *,
+    lexical_query: str,
+    top_k: int = RESEARCH_FINAL_SEED_COUNT,
 ) -> dict[str, Any]:
-    """Retrieve page-numbered evidence from one indexed academic paper."""
     question = " ".join(question.split())
     if paper_id < 1:
         raise ValueError("paper_id必须为正整数")
     if not question:
         raise ValueError("研究问题不能为空")
+    lexical_query = " ".join(str(lexical_query or question).split())
+    if not lexical_query:
+        lexical_query = question
     if not 1 <= top_k <= 6:
         raise ValueError("top_k必须在1到6之间")
     paper = get_paper(paper_id)
@@ -156,18 +169,66 @@ def retrieve_paper_evidence(
         raise LookupError("论文记录不存在")
 
     started = perf_counter()
-    evidence = retrieve_relevant_chunks(paper_id, question, top_k=top_k)
+    retrieval_diagnostics: dict[str, Any] = {}
+    evidence = retrieve_relevant_chunks(
+        paper_id,
+        question,
+        lexical_query=lexical_query,
+        top_k=top_k,
+        prf_enabled=RESEARCH_PRF_ENABLED and lexical_query != question,
+        candidate_pool_size=RESEARCH_CANDIDATE_POOL_SIZE,
+        reranker_enabled=RESEARCH_RERANKER_ENABLED,
+        reranker_model=RESEARCH_RERANKER_MODEL,
+        mmr_enabled=RESEARCH_MMR_ENABLED,
+        mmr_lambda=RESEARCH_MMR_LAMBDA,
+        parent_expansion_enabled=RESEARCH_PARENT_EXPANSION_ENABLED,
+        evidence_paper_title=str(paper["title"]),
+        retrieval_diagnostics=retrieval_diagnostics,
+    )
     return {
         "tool_name": RETRIEVE_EVIDENCE_TOOL_NAME,
-        "input": {"paper_id": paper_id, "question": question, "top_k": top_k},
+        "input": {
+            "paper_id": paper_id,
+            "question": question,
+            "lexical_query": lexical_query,
+            "semantic_query_type": "original_query",
+            "tfidf_query_type": (
+                "english_retrieval_query"
+                if lexical_query != question
+                else "original_query"
+            ),
+            "top_k": top_k,
+            "candidate_pool_size": RESEARCH_CANDIDATE_POOL_SIZE,
+            "reranker_enabled": RESEARCH_RERANKER_ENABLED,
+            "reranker_model": RESEARCH_RERANKER_MODEL,
+            "mmr_enabled": RESEARCH_MMR_ENABLED,
+            "mmr_lambda": RESEARCH_MMR_LAMBDA,
+            "parent_expansion_enabled": RESEARCH_PARENT_EXPANSION_ENABLED,
+        },
         "status": "succeeded" if evidence else "failed",
         "result_count": len(evidence),
         "paper_title": paper["title"],
         "page_url": paper_access_url(dict(paper)),
         "error": "" if evidence else "没有检索到相关全文证据",
         "duration_ms": max(0, round((perf_counter() - started) * 1000)),
+        "diagnostics": retrieval_diagnostics,
         "evidence": evidence,
     }
+
+
+@tool(RETRIEVE_EVIDENCE_TOOL_NAME)
+def retrieve_paper_evidence(
+    paper_id: int,
+    question: str,
+    top_k: int = RESEARCH_FINAL_SEED_COUNT,
+) -> dict[str, Any]:
+    """Retrieve page-numbered evidence from one indexed academic paper."""
+    return retrieve_paper_evidence_with_lexical_query(
+        paper_id,
+        question,
+        lexical_query=question,
+        top_k=top_k,
+    )
 
 
 RESEARCH_TOOL_REGISTRY = {

@@ -11,6 +11,7 @@
         <th>问答准备</th>
         <th>下载日期</th>
         <th>链接</th>
+        {% if paper_summary_task_id %}<th>论文解读</th>{% endif %}
       </tr>
     </thead>
     <tbody>
@@ -45,7 +46,54 @@
             </form>
           {% endif %}
         </td>
+        {% if paper_summary_task_id %}
+          <td>
+            <div
+              class="paper-summary-control"
+              data-paper-summary
+              data-summary-url="/api/research-tasks/{{ paper_summary_task_id }}/papers/{{ paper['id'] }}/summary"
+              data-paper-ready="{{ 'true' if paper['preparation_status'] == 'ready' else 'false' }}"
+            >
+              {% if paper["preparation_status"] == "ready" %}
+                <span class="paper-summary-status" data-summary-status>论文解读：正在检查状态...</span>
+                <div class="paper-summary-actions">
+                  <button class="link-button" type="button" data-summary-generate hidden>生成论文解读</button>
+                  <button
+                    class="link-button"
+                    type="button"
+                    data-summary-view
+                    aria-expanded="false"
+                    aria-controls="paper-summary-panel-{{ paper_summary_task_id }}-{{ paper['id'] }}"
+                    hidden
+                  >查看论文解读</button>
+                  <button class="link-button" type="button" data-summary-regenerate hidden>重新生成</button>
+                </div>
+                <small class="paper-summary-error" data-summary-error role="alert" hidden></small>
+              {% else %}
+                <span class="paper-summary-status" data-summary-status>论文解读：准备中</span>
+                <button class="link-button" type="button" disabled>生成论文解读</button>
+              {% endif %}
+            </div>
+          </td>
+        {% endif %}
       </tr>
+      {% if paper_summary_task_id %}
+        <tr
+          class="paper-summary-detail-row"
+          id="paper-summary-panel-{{ paper_summary_task_id }}-{{ paper['id'] }}"
+          data-paper-summary-panel
+          data-summary-url="/api/research-tasks/{{ paper_summary_task_id }}/papers/{{ paper['id'] }}/summary"
+          hidden
+        >
+          <td colspan="9">
+            <section class="paper-summary-detail" aria-label="{{ paper['title'] }} 的论文解读">
+              <h3>{{ paper["title"] }} · 论文解读</h3>
+              <div class="paper-summary-content" data-summary-content></div>
+              <small class="paper-summary-meta" data-summary-meta></small>
+            </section>
+          </td>
+        </tr>
+      {% endif %}
       {% endfor %}
     </tbody>
   </table>

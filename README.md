@@ -96,12 +96,11 @@ M1的核心不是简单缩短文本块：系统同时索引约1200字符父块�
 
 - 通过网页输入关键词或论文标题。
 - 首页只有一个研究工作台入口；输入主题、论文标题或问题后，LangGraph生成可调整的检索计划，经用户确认才执行搜索。
-- 在计划确认前可通过同一对话区补充范围并重新规划；选择论文后，报告问题与最初搜索主题分开保存。
-- 报告完成后可继续提问：网页主链路重新召回所选论文页码证据，并结合任务滚动摘要、最近10条消息和当前报告调用DeepSeek真实流式回答；Worker保留为无JavaScript回退。
-- 多路检索完成后由用户从候选结果中选择最多5篇论文，冻结后续解析和跨论文研究的输入范围。
-- 使用LangGraph原生SQLite Checkpointer保存图状态；两个审批点均由`interrupt()`暂停并通过`Command(resume=...)`恢复。
-- 用户确认论文集合后可显式启动跨论文报告；系统复用下载、解析、索引和RAG检索服务，输出带论文标题与物理页码的证据报告。
-- 报告准备、逐篇检索、生成和引用检查均属于同一LangGraph线程；应用重启后可从最后一个检查点继续。
+- 在计划确认前可通过同一对话区补充范围并重新规划；选择论文后逐篇复用`prepare_paper`持久任务完成下载、MinerU解析和索引。
+- 所选论文准备任务进入终态后即可直接Research Chat：网页主链路重新召回所选论文页码证据，并结合任务滚动摘要、最近10条消息和可选已有Report调用DeepSeek真实流式回答；Worker保留为无JavaScript回退。
+- 多路检索完成后由用户从候选结果中选择最多5篇论文，冻结后续解析和跨论文研究的输入范围；单篇失败或访问受限不阻断其他论文。
+- 使用LangGraph原生SQLite Checkpointer保存计划确认与论文选择状态；两个审批点均由`interrupt()`暂停并通过`Command(resume=...)`恢复，Paper Selection后主图结束。
+- 跨论文报告保留为可选legacy能力；用户明确填写独立`report_question`后才启动，Report不再是Research Chat准入凭证。
 - 生成报告前使用跨论文公平配额和总Token预算整理上下文，原始证据与最终模型上下文分别保存，便于审计。
 - 全文受限论文不会被模型猜测内容，而是显示购买或机构订阅说明及合法访问链接；全部论文均无证据时不会调用DeepSeek。
 - 通过统一MCP按任务的明确来源列表检索论文；首页默认全选后端白名单提供的21个来源，升级前旧任务回退arXiv和Crossref。
@@ -305,6 +304,7 @@ paper_title,question_type,question,reference_answer,evidence_page,evidence_text
 |   |-- research_tools.py
 |   |-- research_workflow.py
 |   |-- research_report_service.py
+|   |-- paper_summary_service.py
 |   |-- db.py
 |   |-- model_service.py
 |   |-- pdf_service.py
@@ -485,11 +485,11 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 - `multi_query_search()` / `single_query_search()`：只通过白名单工具注册表调用`search_literature`，模型不能直接下载论文或绕过原下载策略。
 - `deduplicate_results()`：按DOI、网页URL和规范化标题合并重复结果，执行用户指定的结果上限，并把图状态推进到`awaiting_selection`。
 - `request_plan_confirmation()`与`request_paper_selection()`：只构造JSON可序列化审批载荷并调用`interrupt()`，中断前不执行非幂等副作用。
-- `request_report_confirmation()`：第三个人工审批点；选完论文不会立即下载，只有点击生成报告后才恢复图。
+- `route_after_paper_selection()`：选择完成后结束主图；Web随后逐篇复用现有`prepare_paper`持久任务，不再强制进入Report Confirmation。
 - `prepare_report_paper_node()`与`retrieve_report_evidence_node()`：使用自循环节点逐篇推进，每篇完成后形成独立SQLite检查点。
 - `begin_report_generation()`、`synthesize_research_report()`与`validate_report_citations_node()`：先暴露生成状态，再调用DeepSeek，最后执行零Token的引用来源校验。
 - `begin_report_generation()`会先调用`pack_research_context()`；后续生成和引用检查只使用模型实际看到的`report_context_evidence`。
-- `request_report_regeneration()`：报告完成后继续保留可恢复中断，使重新生成仍使用同一`thread_id`。
+- 旧`request_report_confirmation()`、Report节点和`request_report_regeneration()`继续保留给历史Checkpoint兼容；新任务的可选Report走现有Service fallback，并始终使用独立`report_question`。
 - `build_checkpointed_research_graph()`：编译生产图并注入SQLite Checkpointer；原直接运行入口只保留给兼容和单元测试。
 
 ### `research_tools.py`
@@ -536,6 +536,10 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 - `validate_research_report_citations()`：用正则和证据集合校验引用标题、物理页码及无效引用；它只检查引用来源结构，不冒充事实语义裁判。
 - 每篇论文具有独立异常边界；一篇下载、解析、索引或检索失败不会中断其余论文。
 
+### `paper_summary_service.py`
+
+负责生成单篇论文的可选结构化解读。它不接收用户问题，也不复用Follow-up的Top-K证据上限，而是利用现有`section_title`、物理页码、内容类型和块顺序，从全文主要结构中选择有限且可审计的Original Paper Evidence。Summary通过`paper_summaries`独立保存，不写入`research_messages`；无证据时由代码生成明确说明并跳过DeepSeek。Summary以后可以辅助Conversation理解上下文，但不能替代下一轮重新召回的论文原文证据。
+
 ### `db.py`
 
 负责 SQLite 的全部数据读写，包括初始化表、持久化研究任务、插入检索结果、查询历史与详情、更新下载状态、缓存 PDF 页文本与 Seed 向量，以及导出 CSV/JSON。
@@ -547,6 +551,8 @@ re.sub(r'[\\/*?:"<>|]', "_", title)
 `research_tool_calls`按任务和调用序号保存工具名称、JSON输入、执行状态、结果数、来源分布、错误与耗时；同一任务恢复时整体替换，避免重复审计记录。
 
 `research_reports`按研究任务保存`preparing → retrieving → generating → completed/failed`状态、报告正文、模型、证据摘要、访问限制、工具调用摘要和阶段时间。`start_research_report()`使用事务锁防止重复提交。
+
+`paper_summaries`以`task_id + paper_id`唯一绑定单篇论文解读，保存`queued → generating → completed/failed`状态、正文、实际送入模型的Original Paper Evidence、模型、错误与完成时间；重复生成沿用同一个Artifact，活动Job由`paper_summary:{task_id}:{paper_id}`去重。
 
 `details_json.evidence`保存完整原始召回，`details_json.context_evidence`保存真正发送给DeepSeek的证据，`details_json.context_stats`保存`fair_budget_v1`配置、压缩率、论文覆盖和删除审计，`details_json.context_quality`保存质量门禁结果。
 

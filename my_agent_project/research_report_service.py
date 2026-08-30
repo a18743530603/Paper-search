@@ -20,7 +20,9 @@ from .research_tools import (
     PREPARE_PAPER_TOOL_NAME,
     RETRIEVE_EVIDENCE_TOOL_NAME,
     invoke_research_tool,
+    retrieve_paper_evidence_with_lexical_query,
 )
+from .section_evidence_service import section_leaf
 from .schemas import (
     RESEARCH_REPORT_COMPLETED,
     RESEARCH_REPORT_FAILED,
@@ -129,8 +131,23 @@ def build_research_context_payload(
                 "evidence_id": f"E{index}",
                 "paper_id": item.get("paper_id"),
                 "paper_title": str(item.get("paper_title") or "未知论文"),
+                **(
+                    {"section_title": str(item.get("section_title"))}
+                    if item.get("section_title")
+                    else {}
+                ),
+                **(
+                    {"section_path": str(item.get("section_path"))}
+                    if item.get("section_path")
+                    else {}
+                ),
                 "physical_page": int(item.get("page_number") or 0),
                 "chunk_id": item.get("chunk_id"),
+                **(
+                    {"section_alignment": dict(item["section_alignment"])}
+                    if isinstance(item.get("section_alignment"), Mapping)
+                    else {}
+                ),
                 "excerpt": str(item.get("content") or ""),
             }
             for index, item in enumerate(evidence, start=1)
@@ -283,19 +300,35 @@ def retrieve_report_paper_evidence(
     paper_id: int,
     question: str,
     *,
+    lexical_query: str | None = None,
     top_k: int = REPORT_EVIDENCE_PER_PAPER,
 ) -> dict[str, Any]:
+    tool_input: dict[str, Any] = {
+        "paper_id": paper_id,
+        "question": question,
+        "top_k": top_k,
+    }
+    if lexical_query and lexical_query != question:
+        tool_input["lexical_query"] = lexical_query
     try:
-        retrieve_result = invoke_research_tool(
-            RETRIEVE_EVIDENCE_TOOL_NAME,
-            {"paper_id": paper_id, "question": question, "top_k": top_k},
-        )
+        if lexical_query and lexical_query != question:
+            retrieve_result = retrieve_paper_evidence_with_lexical_query(
+                paper_id,
+                question,
+                lexical_query=lexical_query,
+                top_k=top_k,
+            )
+        else:
+            retrieve_result = invoke_research_tool(
+                RETRIEVE_EVIDENCE_TOOL_NAME,
+                tool_input,
+            )
     except Exception as exc:
         paper_row = get_paper(paper_id)
         paper = dict(paper_row) if paper_row is not None else {}
         retrieve_result = {
             "tool_name": RETRIEVE_EVIDENCE_TOOL_NAME,
-            "input": {"paper_id": paper_id, "question": question, "top_k": top_k},
+            "input": tool_input,
             "status": "failed",
             "result_count": 0,
             "paper_title": paper.get("title", f"论文 #{paper_id}"),
@@ -317,8 +350,12 @@ def retrieve_report_paper_evidence(
             },
         }
 
-    evidence = [
-        {
+    evidence = []
+    for chunk in retrieve_result.get("evidence", []):
+        section_path = str(
+            chunk.get("section_path") or chunk.get("section_title") or ""
+        ).strip()
+        item = {
             "paper_id": paper_id,
             "paper_title": retrieve_result["paper_title"],
             "page_number": int(chunk["page_number"]),
@@ -326,8 +363,17 @@ def retrieve_report_paper_evidence(
             "score": chunk.get("score"),
             "content": chunk["content"],
         }
-        for chunk in retrieve_result.get("evidence", [])
-    ]
+        if section_path:
+            item["section_title"] = section_leaf(section_path)
+            item["section_path"] = section_path
+        if chunk.get("section_alignment"):
+            item["section_alignment"] = dict(chunk["section_alignment"])
+        if chunk.get("parent_chunk_id") is not None:
+            item["parent_chunk_id"] = int(chunk["parent_chunk_id"])
+        if chunk.get("seed_chunk_ids"):
+            item["seed_chunk_ids"] = list(chunk["seed_chunk_ids"])
+            item["seed_mmr_rank"] = chunk.get("seed_mmr_rank")
+        evidence.append(item)
     return {
         "tool_call": tool_call,
         "evidence": evidence,
@@ -413,6 +459,9 @@ def generate_research_report(task_id: int) -> None:
     task = get_research_task(task_id)
     if task is None:
         return
+    report_question = str(
+        task.get("report_question") or task.get("question") or ""
+    ).strip()
 
     evidence: list[dict[str, Any]] = []
     access_limitations: list[dict[str, Any]] = []
@@ -441,7 +490,7 @@ def generate_research_report(task_id: int) -> None:
                 continue
             result = retrieve_report_paper_evidence(
                 int(paper_id),
-                task["question"],
+                report_question,
             )
             tool_calls.append(result["tool_call"])
             evidence.extend(result["evidence"])
@@ -465,7 +514,7 @@ def generate_research_report(task_id: int) -> None:
                 details=details,
             )
         report, model = generate_report_content(
-            task["question"],
+            report_question,
             context_evidence,
             access_limitations,
             context_pack["quality_gate"],

@@ -1,0 +1,127 @@
+{
+  "version": "retrieval-fusion-ab-v1",
+  "created_at": "2026-08-29",
+  "description": "Three-paper, twelve-question Ground Truth for a read-only Weighted Score versus RRF ranking comparison.",
+  "papers": [
+    {
+      "task_id": 4,
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "expected_chunk_count": 292,
+      "cases": [
+        {
+          "case_id": "ict-datasets",
+          "question_type": "dataset",
+          "question": "这篇论文使用了哪些数据集进行实验？",
+          "question_source": "research_messages:21",
+          "target_chunk_ids": [370],
+          "annotation_reason": "正文直接列出 CIFAR-10、SVHN 和 CIFAR-100，并说明有标注/无标注数据划分。"
+        },
+        {
+          "case_id": "ict-method",
+          "question_type": "method",
+          "question": "这篇论文采用了什么方法进行半监督学习？",
+          "question_source": "research_messages:23",
+          "target_chunk_ids": [334],
+          "annotation_reason": "摘要直接命名 ICT，并概括以无标注样本插值预测一致性训练深度网络。"
+        },
+        {
+          "case_id": "ict-consistency-mechanism",
+          "question_type": "fine_grained_mechanism",
+          "question": "这篇论文中的一致性训练是如何实现的？",
+          "question_source": "user_frozen_text:not_present_in_current_research_messages",
+          "target_chunk_ids": [366],
+          "annotation_reason": "正文完整描述监督损失、插值一致性项、mean-teacher 伪标签、无标注样本插值与参数更新过程。"
+        },
+        {
+          "case_id": "ict-metrics",
+          "question_type": "metric",
+          "question": "这篇论文使用了什么评价指标？",
+          "question_source": "research_messages:25",
+          "target_chunk_ids": [376],
+          "annotation_reason": "实验表标题明确评价量为 CIFAR-10 test error rate (%)，并给出三次 ICT 试验结果。"
+        },
+        {
+          "case_id": "ict-results",
+          "question_type": "results",
+          "question": "这篇论文的主要实验结果是什么？",
+          "question_source": "research_messages:27",
+          "target_chunk_ids": [386, 387, 388, 389, 394],
+          "annotation_reason": "五个正文块分别覆盖相对监督基线的误差下降、CIFAR-10 的 25% 改善、SVHN 竞争力、WRN-28-2 双数据集改善及 CIFAR-100 结果。"
+        },
+        {
+          "case_id": "ict-conclusion",
+          "question_type": "conclusion",
+          "question": "这篇论文最后得出了什么结论？",
+          "question_source": "research_messages:29",
+          "target_chunk_ids": [596],
+          "annotation_reason": "Conclusion 正文完整总结 ICT 的效率、性能、正则化解释、失效条件和未来工作。"
+        }
+      ]
+    },
+    {
+      "task_id": 5,
+      "paper_id": 38,
+      "paper_title": "HiDiff: Hybrid Diffusion Framework for Medical Image Segmentation",
+      "expected_chunk_count": 144,
+      "cases": [
+        {
+          "case_id": "hidiff-datasets",
+          "question_type": "dataset",
+          "question": "这篇论文使用了哪些医学图像数据集进行实验？",
+          "question_source": "research_messages:33",
+          "target_chunk_ids": [694],
+          "annotation_reason": "Datasets 正文一次性列出 Synapse、BraTS-2021、Kvasir-SEG、CVC-ClinicDB、DRIVE 和 CHASE DB1。"
+        },
+        {
+          "case_id": "hidiff-method",
+          "question_type": "method",
+          "question": "HiDiff 的核心方法是什么？",
+          "question_source": "research_messages:35",
+          "target_chunk_ids": [686, 687, 692],
+          "annotation_reason": "三个正文块共同覆盖判别分割器与 Bernoulli 扩散细化器的混合框架、交替协作训练及基于 prior mask 的迭代推理。"
+        },
+        {
+          "case_id": "hidiff-metrics",
+          "question_type": "metric",
+          "question": "这篇论文使用了什么评价指标？",
+          "question_source": "research_messages:37",
+          "target_chunk_ids": [701],
+          "annotation_reason": "Evaluation Metrics 正文直接定义 Dice、HD95、NaN Ratio、IoU、Recall 和 Accuracy。"
+        }
+      ]
+    },
+    {
+      "task_id": 6,
+      "paper_id": 48,
+      "paper_title": "Prediction of Soil Moisture Content Based On Satellite Data and Sequence-to-Sequence Networks",
+      "expected_chunk_count": 25,
+      "cases": [
+        {
+          "case_id": "soil-data",
+          "question_type": "dataset",
+          "question": "这篇论文使用了哪些数据来预测土壤含水量？",
+          "question_source": "research_messages:41",
+          "target_chunk_ids": [775, 776],
+          "annotation_reason": "两个块共同给出 Sentinel-1 极化雷达、Sentinel-2 RGB/NIR、天气站、土壤湿度传感器、20 个站点、3 个葡萄酒产区和 7 年日数据。"
+        },
+        {
+          "case_id": "soil-model",
+          "question_type": "method",
+          "question": "这篇论文使用了什么模型进行土壤含水量预测？",
+          "question_source": "research_messages:43",
+          "target_chunk_ids": [779, 780, 783],
+          "annotation_reason": "三个块分别说明 convolutional seq2seq autoencoder、AE/LSTM 对照和双 recurrent encoder-decoder/ConvLSTM 架构。"
+        },
+        {
+          "case_id": "soil-results",
+          "question_type": "results",
+          "question": "这篇论文最后得到的主要实验结果是什么？",
+          "question_source": "research_messages:45",
+          "target_chunk_ids": [780, 786],
+          "annotation_reason": "正文报告 AE 与 LSTM 精度相近但数据条件不同，以及试点农场方案可替代昂贵传感器且实施成本约低四倍。"
+        }
+      ]
+    }
+  ]
+}

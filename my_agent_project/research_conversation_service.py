@@ -3,7 +3,7 @@ import re
 from collections.abc import Iterator
 from typing import Any, Mapping, Sequence
 
-from .config import DEEPSEEK_MODEL
+from .config import DEEPSEEK_MODEL, RESEARCH_FINAL_SEED_COUNT
 from .context_service import pack_research_context
 from .db import (
     get_research_conversation_summary,
@@ -21,6 +21,7 @@ from .research_report_service import (
     retrieve_report_paper_evidence,
     validate_research_report_citations,
 )
+from .retrieval_query_service import route_retrieval_query
 from .task_memory_service import update_task_memory_from_message
 
 
@@ -275,9 +276,19 @@ def prepare_research_followup_context(
     exclude_message_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     task = get_research_task(task_id)
+    if task is None:
+        raise LookupError("研究任务不存在")
+    if task.get("status") != "papers_selected" or not task.get(
+        "selected_paper_ids"
+    ):
+        raise RuntimeError("研究任务尚未冻结论文集合")
+
     report = get_research_report(task_id)
-    if task is None or report is None or report["status"] != "completed":
-        raise RuntimeError("研究报告尚未完成")
+    report_content = (
+        str(report.get("content") or "")
+        if report is not None and report.get("status") == "completed"
+        else ""
+    )
 
     memory_result = update_task_memory_from_message(
         task_id,
@@ -288,9 +299,25 @@ def prepare_research_followup_context(
 
     evidence: list[dict[str, Any]] = []
     access_limitations: list[dict[str, Any]] = []
+    retrieval_tool_calls: list[dict[str, Any]] = []
+    query_route = route_retrieval_query(question)
     for paper_id in task["selected_paper_ids"]:
-        result = retrieve_report_paper_evidence(int(paper_id), question)
+        if query_route.lexical_query != query_route.original_query:
+            result = retrieve_report_paper_evidence(
+                int(paper_id),
+                question,
+                lexical_query=query_route.lexical_query,
+                top_k=RESEARCH_FINAL_SEED_COUNT,
+            )
+        else:
+            result = retrieve_report_paper_evidence(
+                int(paper_id),
+                question,
+                top_k=RESEARCH_FINAL_SEED_COUNT,
+            )
         evidence.extend(result["evidence"])
+        if result.get("tool_call"):
+            retrieval_tool_calls.append(result["tool_call"])
         if result.get("access_limitation"):
             access_limitations.append(result["access_limitation"])
 
@@ -300,7 +327,7 @@ def prepare_research_followup_context(
         exclude_message_ids=exclude_message_ids,
     )
     return {
-        "report_content": str(report.get("content") or ""),
+        "report_content": report_content,
         "task_memory": memory_result["memories"],
         "task_memory_error": memory_result["error"],
         "conversation_summary": conversation_context["conversation_summary"],
@@ -309,6 +336,16 @@ def prepare_research_followup_context(
         "evidence": context_pack["evidence"],
         "access_limitations": access_limitations,
         "quality_gate": context_pack["quality_gate"],
+        "query_routing": query_route.to_dict(),
+        "retrieval_tool_calls": retrieval_tool_calls,
+        "retrieval_diagnostics": [
+            {
+                "paper_id": (tool_call.get("input") or {}).get("paper_id"),
+                **dict(tool_call.get("diagnostics") or {}),
+            }
+            for tool_call in retrieval_tool_calls
+            if tool_call.get("diagnostics")
+        ],
     }
 
 
@@ -423,6 +460,8 @@ def stream_research_followup(
                 "message_id": message_id,
                 "model": "deterministic-no-evidence",
                 "evidence_count": len(selected_evidence),
+                "query_routing": context.get("query_routing", {}),
+                "retrieval_diagnostics": context.get("retrieval_diagnostics", []),
             }
             return
 
@@ -466,6 +505,8 @@ def stream_research_followup(
             "message_id": message_id,
             "model": DEEPSEEK_MODEL,
             "evidence_count": len(selected_evidence),
+            "query_routing": context.get("query_routing", {}),
+            "retrieval_diagnostics": context.get("retrieval_diagnostics", []),
         }
     except GeneratorExit:
         if not completed:

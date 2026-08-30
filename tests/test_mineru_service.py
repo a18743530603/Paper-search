@@ -186,7 +186,9 @@ def test_mineru_structured_chunks_keep_sections_types_and_pages():
         },
     ]
 
-    page_count, chunks, stats = mineru_service.build_structured_chunks(content_list)
+    page_count, chunks, parents, stats = mineru_service.build_structured_chunks(
+        content_list
+    )
 
     assert page_count == 4
     assert [chunk.content_type for chunk in chunks] == [
@@ -210,6 +212,39 @@ def test_mineru_structured_chunks_keep_sections_types_and_pages():
         "image": 1,
         "equation": 1,
     }
+    assert len(parents) == 3
+    assert [chunk.parent_index for chunk in chunks] == [0, 1, 1, 2]
+    assert parents[0].page_number == 1
+    assert parents[1].page_number == 2
+    assert "Table 1" in parents[1].content
+    assert "Model architecture" in parents[1].content
+    assert stats["parent_chunk_count"] == 3
+
+
+def test_mineru_parent_builder_respects_page_section_and_hard_limit():
+    first = "alpha " * 900
+    second = "beta " * 700
+    content_list = [
+        {"type": "text", "text": "1 Methods", "text_level": 1, "page_idx": 0},
+        {"type": "text", "text": first, "page_idx": 0},
+        {"type": "text", "text": second, "page_idx": 0},
+        {"type": "text", "text": "2 Results", "text_level": 1, "page_idx": 0},
+        {"type": "text", "text": "result one", "page_idx": 0},
+        {"type": "text", "text": "result two", "page_idx": 0},
+        {"type": "text", "text": "result page two", "page_idx": 1},
+    ]
+
+    _pages, chunks, parents, stats = mineru_service.build_structured_chunks(
+        content_list
+    )
+
+    assert [chunk.parent_index for chunk in chunks] == [0, 1, 2, 2, 3]
+    assert [parent.page_number for parent in parents] == [1, 1, 1, 2]
+    assert parents[0].content == first.strip()
+    assert parents[1].content == second.strip()
+    assert parents[2].content == "result one\n\nresult two"
+    assert stats["parent_max_estimated_tokens"] <= 1500
+    assert stats["oversized_parent_count"] == 0
 
 
 def test_default_pdf_parse_uses_cached_mineru_structure(tmp_path, monkeypatch):
@@ -232,6 +267,12 @@ def test_default_pdf_parse_uses_cached_mineru_structure(tmp_path, monkeypatch):
             "page_idx": 1,
             "bbox": [10, 20, 900, 80],
         },
+        {
+            "type": "text",
+            "text": "The gain is consistent across datasets.",
+            "page_idx": 1,
+            "bbox": [10, 90, 900, 140],
+        },
     ]
     monkeypatch.setattr(
         pdf_service,
@@ -248,10 +289,19 @@ def test_default_pdf_parse_uses_cached_mineru_structure(tmp_path, monkeypatch):
     assert document["parser_backend"] == "mineru_cloud"
     assert document["parser_model"] == pdf_service.MINERU_MODEL_VERSION
     chunks = db.list_paper_chunks(paper_id)
-    assert len(chunks) == 1
+    assert len(chunks) == 2
     assert chunks[0]["section_title"] == "2 Results"
     assert chunks[0]["content_type"] == "text"
     assert json.loads(chunks[0]["bbox_json"]) == [10.0, 20.0, 900.0, 80.0]
+    assert chunks[0]["parent_chunk_id"] is not None
+    assert chunks[0]["parent_chunk_id"] == chunks[1]["parent_chunk_id"]
+    assert db.count_paper_parent_chunks(paper_id) == 1
+    assert result["parent_chunk_count"] == 1
+
+    reused = pdf_service.parse_paper_pdf(paper_id)
+
+    assert reused["chunks_reused"] is True
+    assert reused["parent_chunk_count"] == 1
 
 
 def test_mineru_requires_token_before_remote_upload(tmp_path, monkeypatch):

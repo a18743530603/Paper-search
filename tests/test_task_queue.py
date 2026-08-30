@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier, Event
 
+import pytest
+
 from my_agent_project import (
     db,
     rag_service,
@@ -589,8 +591,6 @@ def test_research_followup_without_evidence_completes_without_model(
 ):
     paper_id = _setup_database(tmp_path, monkeypatch)
     task_id = _create_selected_research_task(paper_id)
-    db.start_research_report(task_id)
-    _complete_research_report(task_id)
     queued = db.enqueue_research_followup_job(task_id, "Explain the missing result")
 
     monkeypatch.setattr(
@@ -633,9 +633,6 @@ def test_realtime_followup_stream_persists_complete_message_without_job(
 ):
     paper_id = _setup_database(tmp_path, monkeypatch)
     task_id = _create_selected_research_task(paper_id)
-    db.start_research_report(task_id)
-    _complete_research_report(task_id)
-    original_report = db.get_research_report(task_id)["content"]
     created = db.create_research_followup_messages(task_id, "Compare the methods")
 
     monkeypatch.setattr(
@@ -690,7 +687,7 @@ def test_realtime_followup_stream_persists_complete_message_without_job(
     assert messages[-2]["role"] == "user"
     assert messages[-1]["role"] == "assistant"
     assert db.list_background_jobs() == []
-    assert db.get_research_report(task_id)["content"] == original_report
+    assert db.get_research_report(task_id) is None
 
 
 def test_realtime_followup_stream_failure_marks_message_failed(
@@ -1381,6 +1378,33 @@ def test_registered_preparation_handler_reuses_paper_workflow(tmp_path, monkeypa
     assert result["status"] == "succeeded"
     assert calls == [(paper_id, True)]
     assert db.get_background_job(queued["job_id"])["status"] == "succeeded"
+
+
+def test_workspace_chat_waits_for_preparation_but_not_for_report(
+    tmp_path,
+    monkeypatch,
+):
+    paper_id = _setup_database(tmp_path, monkeypatch)
+    task_id = _create_selected_research_task(paper_id)
+    queued = db.enqueue_paper_preparation_job(paper_id)
+
+    with pytest.raises(RuntimeError, match="所选论文正在准备"):
+        db.create_research_followup_messages(task_id, "How does it work?")
+
+    def fake_prepare(received_paper_id, *, download_claimed=False):
+        assert received_paper_id == paper_id
+        assert download_claimed is True
+        _mark_paper_indexed(received_paper_id, tmp_path)
+        return "ready"
+
+    monkeypatch.setattr(task_queue_service, "prepare_paper_for_qa", fake_prepare)
+    result = task_queue_service.run_one_job("worker-a")
+    created = db.create_research_followup_messages(task_id, "How does it work?")
+
+    assert result["id"] == queued["job_id"]
+    assert result["status"] == "succeeded"
+    assert created["question"] == "How does it work?"
+    assert db.get_research_report(task_id) is None
 
 
 def test_preparation_worker_retries_failed_parse_then_completes(

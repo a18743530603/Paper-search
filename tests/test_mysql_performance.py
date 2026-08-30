@@ -558,7 +558,7 @@ def test_mysql_representative_explain_probe() -> None:
         )
         connection = db.connect()
         try:
-            assert apply_mysql_migrations(connection) == ["002"]
+            assert apply_mysql_migrations(connection) == ["002", "003"]
             assert apply_mysql_migrations(connection) == []
             with connection.cursor() as cursor:
                 cursor.execute("ANALYZE TABLE research_messages")
