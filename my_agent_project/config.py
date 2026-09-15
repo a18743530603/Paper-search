@@ -15,6 +15,7 @@ load_dotenv(BASE_DIR / ".env")
 
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "downloads"))
 PAPERS_DIR = DOWNLOAD_DIR / "papers"
+RESEARCH_VISUALS_DIR = DOWNLOAD_DIR / "research_visuals"
 EXPORTS_DIR = DOWNLOAD_DIR / "exports"
 ORIGIN_EXPORTS_DIR = EXPORTS_DIR / "origin"
 DATABASE_PATH = DOWNLOAD_DIR / "metadata.db"
@@ -102,7 +103,10 @@ MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 ENABLE_AGENT = os.getenv("ENABLE_AGENT", "false").lower() in {"1", "true", "yes", "on"}
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro").strip()
+DEEPSEEK_MODEL = os.getenv(
+    "DEEPSEEK_MODEL",
+    "deepseek-v4-flash-vision-exp",
+).strip()
 DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "true").lower() in {
     "1",
     "true",
@@ -184,6 +188,7 @@ def configure_utf8_stdio() -> None:
 
 def ensure_runtime_dirs() -> None:
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+    RESEARCH_VISUALS_DIR.mkdir(parents=True, exist_ok=True)
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ORIGIN_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     MINERU_RESULTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,7 @@
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">Research Workspace</p>
+    <p class="eyebrow">研究工作台</p>
     <h1>从一个主题开始，持续完成论文检索、证据问答与研究报告。</h1>
     <p class="lede">系统先提出可调整的检索计划，经你确认后才调用搜索工具；论文下载、报告生成等关键操作仍由你决定。</p>
   </div>
@@ -14,28 +14,93 @@
     <label for="max_results">候选论文数量</label>
     <input id="max_results" name="max_results" type="number" min="1" max="50" value="{{ max_results }}">
     <fieldset class="source-picker" data-source-picker>
-      <legend>论文来源</legend>
-      <div class="source-picker-head">
-        <p class="source-picker-count" data-source-count aria-live="polite"></p>
-        <div class="source-picker-actions">
-          <button class="button secondary compact" type="button" data-select-all>全选</button>
-          <button class="button secondary compact" type="button" data-clear-all>清空</button>
+      <legend>文献检索范围</legend>
+      {% if source_presets is defined and source_presets %}
+      <div class="source-preset-control">
+        <label for="source-preset">研究领域</label>
+        <select id="source-preset" data-source-preset>
+          <option value="custom">自定义选择</option>
+          {% for preset in source_presets %}
+          <option
+            value="{{ preset.id }}"
+            data-sources='{{ preset.sources | tojson }}'
+            data-description="{{ preset.description }}"
+          >{{ preset.label }}</option>
+          {% endfor %}
+        </select>
+        <p class="source-preset-description" data-preset-description></p>
+      </div>
+      {% endif %}
+
+      <div class="source-selection-summary" aria-live="polite">
+        <div>
+          <span>当前检索来源</span>
+          <strong data-source-count></strong>
         </div>
+        <p data-source-names></p>
       </div>
-      <div class="source-grid">
-        {% for source_id, source_label in source_options %}
-        <label class="source-option">
-          <input
-            type="checkbox"
-            name="sources"
-            value="{{ source_id }}"
-            {% if source_id in selected_sources %}checked{% endif %}
-          >
-          <span>{{ source_label }}</span>
-        </label>
-        {% endfor %}
-      </div>
-      <p class="source-picker-error" data-source-error hidden>至少选择一个论文来源。</p>
+
+      <details class="source-picker-details" data-source-details {% if error %}open{% endif %}>
+        <summary>
+          <span>详细选择来源</span>
+          <span class="source-details-count" data-details-count></span>
+        </summary>
+        <div class="source-picker-body">
+          <div class="source-picker-head">
+            <p>按平台用途分组，可在推荐组合上继续增减。</p>
+            <div class="source-picker-actions">
+              <button class="button secondary compact" type="button" data-select-all>全选</button>
+              <button class="button secondary compact" type="button" data-clear-all>清空</button>
+            </div>
+          </div>
+          {% if source_groups is defined and source_groups %}
+          <div class="source-groups">
+            {% for group in source_groups %}
+            <section class="source-group" aria-labelledby="source-group-{{ group.id }}">
+              <div class="source-group-heading">
+                <h3 id="source-group-{{ group.id }}">{{ group.label }}</h3>
+                <p>{{ group.description }}</p>
+              </div>
+              <div class="source-grid">
+                {% for source in group.sources %}
+                <label class="source-option">
+                  <input
+                    type="checkbox"
+                    name="sources"
+                    value="{{ source.id }}"
+                    data-source-label="{{ source.label }}"
+                    {% if source.id in selected_sources %}checked{% endif %}
+                  >
+                  <span>
+                    <strong>{{ source.label }}</strong>
+                    <small>{{ source.description }}</small>
+                  </span>
+                </label>
+                {% endfor %}
+              </div>
+            </section>
+            {% endfor %}
+          </div>
+          {% else %}
+          <div class="source-grid">
+            {% for source_id, source_label in source_options %}
+            <label class="source-option">
+              <input
+                type="checkbox"
+                name="sources"
+                value="{{ source_id }}"
+                data-source-label="{{ source_label }}"
+                {% if source_id in selected_sources %}checked{% endif %}
+              >
+              <span><strong>{{ source_label }}</strong></span>
+            </label>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+      </details>
+      <p class="source-access-note"><strong>关于爱思唯尔：</strong>当前公开来源可以发现部分爱思唯尔论文；ScienceDirect 与 Scopus 的直接检索需要单独的 API 和机构权限。</p>
+      <p class="source-picker-error" data-source-error hidden>至少选择一个文献来源。</p>
     </fieldset>
     <button type="submit" data-create-task>创建研究任务</button>
   </form>

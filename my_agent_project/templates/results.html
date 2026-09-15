@@ -3,7 +3,7 @@
 {% block content %}
 <section class="section-head">
   <div>
-    <p class="eyebrow">Search Results</p>
+    <p class="eyebrow">检索结果</p>
     <h1>“{{ query }}” 的检索结果</h1>
     {% if enhanced_query != query %}
       <p class="lede">增强检索词：{{ enhanced_query }}</p>
@@ -17,7 +17,7 @@
   <section class="research-plan" aria-labelledby="research-plan-title">
     <div class="research-plan-head">
       <div>
-        <p class="eyebrow">LangGraph Research Plan</p>
+        <p class="eyebrow">研究计划</p>
         <h2 id="research-plan-title">{{ research_plan["goal"] }}</h2>
       </div>
       <span class="status status-{{ research_plan['status'] }}">{{ research_plan["status"] }}</span>

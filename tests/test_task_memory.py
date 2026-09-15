@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from my_agent_project import db, research_conversation_service, task_memory_service
+from my_agent_project import (
+    db,
+    research_conversation_service,
+    research_evidence_service,
+    task_memory_service,
+)
 from my_agent_project.schemas import PaperCandidate
 
 
@@ -302,7 +307,7 @@ def test_memory_11_extractor_failure_does_not_break_streaming(
         ),
     )
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         lambda *_args, **_kwargs: {
             "evidence": [

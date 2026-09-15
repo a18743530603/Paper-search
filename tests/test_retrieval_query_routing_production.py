@@ -3,6 +3,7 @@ import json
 from my_agent_project import (
     rag_service,
     research_conversation_service,
+    research_evidence_service,
     retrieval_query_service,
 )
 
@@ -259,7 +260,7 @@ def test_followup_routes_once_for_all_papers_without_polluting_prompt(monkeypatc
             model="deepseek-test",
         )
 
-    monkeypatch.setattr(research_conversation_service, "route_retrieval_query", route)
+    monkeypatch.setattr(research_evidence_service, "route_retrieval_query", route)
 
     def retrieve(paper_id, question, **kwargs):
         retrieval_calls.append((paper_id, question, kwargs))
@@ -284,9 +285,16 @@ def test_followup_routes_once_for_all_papers_without_polluting_prompt(monkeypatc
         }
 
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         retrieve,
+    )
+    monkeypatch.setattr(
+        research_conversation_service,
+        "run_coverage_research_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("force legacy evidence fallback")
+        ),
     )
 
     context = research_conversation_service.prepare_research_followup_context(

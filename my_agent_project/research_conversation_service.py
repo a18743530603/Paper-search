@@ -3,8 +3,7 @@ import re
 from collections.abc import Iterator
 from typing import Any, Mapping, Sequence
 
-from .config import DEEPSEEK_MODEL, RESEARCH_FINAL_SEED_COUNT
-from .context_service import pack_research_context
+from .config import DEEPSEEK_MODEL
 from .db import (
     get_research_conversation_summary,
     get_research_message,
@@ -17,11 +16,12 @@ from .db import (
 )
 from .followup_context import build_followup_context
 from .model_service import ask_deepseek, stream_deepseek
+from .research_evidence_service import acquire_research_evidence
+from .research_loop_service import run_coverage_research_loop
 from .research_report_service import (
-    retrieve_report_paper_evidence,
     validate_research_report_citations,
 )
-from .retrieval_query_service import route_retrieval_query
+from .research_visual_service import visual_payloads_from_evidence
 from .task_memory_service import update_task_memory_from_message
 
 
@@ -297,31 +297,26 @@ def prepare_research_followup_context(
         exclude_message_ids=exclude_message_ids,
     )
 
-    evidence: list[dict[str, Any]] = []
-    access_limitations: list[dict[str, Any]] = []
-    retrieval_tool_calls: list[dict[str, Any]] = []
-    query_route = route_retrieval_query(question)
-    for paper_id in task["selected_paper_ids"]:
-        if query_route.lexical_query != query_route.original_query:
-            result = retrieve_report_paper_evidence(
-                int(paper_id),
-                question,
-                lexical_query=query_route.lexical_query,
-                top_k=RESEARCH_FINAL_SEED_COUNT,
-            )
-        else:
-            result = retrieve_report_paper_evidence(
-                int(paper_id),
-                question,
-                top_k=RESEARCH_FINAL_SEED_COUNT,
-            )
-        evidence.extend(result["evidence"])
-        if result.get("tool_call"):
-            retrieval_tool_calls.append(result["tool_call"])
-        if result.get("access_limitation"):
-            access_limitations.append(result["access_limitation"])
-
-    context_pack = pack_research_context(evidence)
+    try:
+        research_result = run_coverage_research_loop(
+            question,
+            task["selected_paper_ids"],
+        )
+        research_fields = research_result.as_context_fields()
+    except Exception as exc:
+        legacy_result = acquire_research_evidence(
+            question,
+            task["selected_paper_ids"],
+        )
+        research_fields = legacy_result.as_context_fields()
+        research_fields["research_loop"] = {
+            "status": "FAILED",
+            "fallback": "legacy",
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+            "action_count": 0,
+            "requirements": [],
+            "actions": [],
+        }
     conversation_context = prepare_research_conversation_context(
         task_id,
         exclude_message_ids=exclude_message_ids,
@@ -333,19 +328,7 @@ def prepare_research_followup_context(
         "conversation_summary": conversation_context["conversation_summary"],
         "conversation_history": conversation_context["recent_messages"],
         "conversation_summary_error": conversation_context["summary_error"],
-        "evidence": context_pack["evidence"],
-        "access_limitations": access_limitations,
-        "quality_gate": context_pack["quality_gate"],
-        "query_routing": query_route.to_dict(),
-        "retrieval_tool_calls": retrieval_tool_calls,
-        "retrieval_diagnostics": [
-            {
-                "paper_id": (tool_call.get("input") or {}).get("paper_id"),
-                **dict(tool_call.get("diagnostics") or {}),
-            }
-            for tool_call in retrieval_tool_calls
-            if tool_call.get("diagnostics")
-        ],
+        **research_fields,
     }
 
 
@@ -442,6 +425,7 @@ def stream_research_followup(
             exclude_message_ids=(current_user_message_id, message_id),
         )
         selected_evidence = context["evidence"]
+        visual_payloads = visual_payloads_from_evidence(selected_evidence)
         if not context["quality_gate"]["model_call_allowed"]:
             full_answer = build_no_followup_evidence_answer(
                 question,
@@ -455,11 +439,14 @@ def stream_research_followup(
                 model="deterministic-no-evidence",
             )
             completed = True
+            for visual_payload in visual_payloads:
+                yield "visual", visual_payload
             yield "delta", {"content": full_answer}
             yield "done", {
                 "message_id": message_id,
                 "model": "deterministic-no-evidence",
                 "evidence_count": len(selected_evidence),
+                "visual_count": len(visual_payloads),
                 "query_routing": context.get("query_routing", {}),
                 "retrieval_diagnostics": context.get("retrieval_diagnostics", []),
             }
@@ -472,6 +459,8 @@ def stream_research_followup(
             evidence=selected_evidence,
         )
         yield "status", {"status": "generating", "message_id": message_id}
+        for visual_payload in visual_payloads:
+            yield "visual", visual_payload
         prompt = build_research_followup_prompt(
             question,
             context["report_content"],
@@ -505,6 +494,7 @@ def stream_research_followup(
             "message_id": message_id,
             "model": DEEPSEEK_MODEL,
             "evidence_count": len(selected_evidence),
+            "visual_count": len(visual_payloads),
             "query_routing": context.get("query_routing", {}),
             "retrieval_diagnostics": context.get("retrieval_diagnostics", []),
         }

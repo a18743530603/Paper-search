@@ -17,6 +17,42 @@ if (followupForm) {
     messageCount.textContent = `${current + 2} 条`;
   };
 
+  const createVisualCard = (payload) => {
+    const figure = document.createElement("figure");
+    figure.className = "conversation-visual-card";
+    figure.dataset.visualId = payload.visual_id || "";
+
+    const link = document.createElement("a");
+    link.href = payload.image_url || "";
+    link.target = "_blank";
+    link.rel = "noreferrer";
+
+    const image = document.createElement("img");
+    image.src = payload.image_url || "";
+    image.alt = `${payload.content_type || "Figure"} · 第${payload.physical_page || "?"}页`;
+    image.loading = "lazy";
+    link.append(image);
+
+    const caption = document.createElement("figcaption");
+    const kind = payload.content_type === "table" ? "Table" : "Figure";
+    const details = [kind];
+    if (payload.physical_page) details.push(`第${payload.physical_page}页`);
+    if (payload.section_title) details.push(payload.section_title);
+    caption.textContent = details.join(" · ");
+    figure.append(link, caption);
+    return figure;
+  };
+
+  const appendVisual = (message, payload) => {
+    if (!payload.visual_id || !payload.image_url) return;
+    const duplicate = Array.from(
+      message.visualsNode.querySelectorAll("[data-visual-id]"),
+    ).some((node) => node.dataset.visualId === payload.visual_id);
+    if (duplicate) return;
+    message.visualsNode.append(createVisualCard(payload));
+    scrollToLatest();
+  };
+
   const createMessage = (role, content, status = "completed") => {
     const article = document.createElement("article");
     article.className = `conversation-message conversation-${role}`;
@@ -39,10 +75,13 @@ if (followupForm) {
     contentNode.className = "conversation-content";
     contentNode.dataset.messageContent = "";
     contentNode.textContent = content;
-    article.append(meta, contentNode);
+    const visualsNode = document.createElement("div");
+    visualsNode.className = "conversation-visuals";
+    visualsNode.dataset.messageVisuals = "";
+    article.append(meta, visualsNode, contentNode);
     stream?.append(article);
     scrollToLatest();
-    return { article, contentNode, statusNode };
+    return { article, contentNode, statusNode, visualsNode };
   };
 
   const setStatus = (message, status, waitingText) => {
@@ -99,6 +138,8 @@ if (followupForm) {
         if (payload.message_id) {
           assistantMessage.article.dataset.messageId = String(payload.message_id);
         }
+      } else if (event === "visual") {
+        appendVisual(assistantMessage, payload);
       } else if (event === "delta") {
         if (!assistantMessage.article.dataset.hasDelta) {
           assistantMessage.article.dataset.hasDelta = "true";

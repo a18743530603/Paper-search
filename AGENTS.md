@@ -1,8 +1,8 @@
 # Paper Hunter 项目记忆
 
-> 当前版本：`v0.17.1`
+> 当前版本：`v0.18.0`
 >
-> 更新日期：`2026-08-28`
+> 更新日期：`2026-09-15`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -964,13 +964,20 @@ git push
 - 英文回答引用格式有3/33次使用`[Paper A, p.4]`或半角逗号，Citation Contract=`90.91%`；Memory本身仍正确执行，报告必须分开描述能力与格式。
 - 生成结果位于`E:\PaperHunterData\smolagent-tests\outputs\context_memory_eval_v1_2026-08-27.{json,md}`。全部benchmark案例、历史未提交测评资产和pytest缓存均已迁至E盘，仓库原路径仅通过Junction保持兼容；未来Eval也必须使用该E盘根目录。
 
+## v0.18.0 全站视觉重构
+
+- 新增`my_agent_project/static/research-ui.css`作为原`styles.css`之后加载的主题层，完整保留既有样式和对话图片展示规则，并统一全站设计Token、布局、控件、状态、表格、对话、阅读正文、证据、评测和响应式表现。
+- `base.html`新增当前导航`aria-current`、页面路径标记和键盘“跳到主要内容”入口；首页、任务、结果、历史、评测和Origin页面的英文装饰性眉标改为中文信息标签。
+- Research Workspace主要区块由纵向进度线串联；报告、Paper Summary、Evidence和解析正文采用阅读字体与受控行宽。动效只用于控件反馈，并尊重`prefers-reduced-motion`。
+- 现有业务逻辑、FastAPI路由、接口、表单字段、Jinja数据绑定和JavaScript事件未修改；浏览器验收覆盖全部GET页面、桌面和移动布局。模板与前端契约测试`142 passed`；去重主测试目录`540 passed, 1 skipped, 3 failed`，剩余失败来自本轮开始前已有的数据库方言计数、MySQL外键数量和检索问题路由未提交改动。
+
 ## 已知环境信息
 
 - 工作区位于 Windows 中文路径下。
 - 推荐使用 `uv run ...` 启动和测试，减少虚拟环境与路径编码问题。
 - Git 曾因仓库所有者不同配置过 `safe.directory`。
 - 文档修改不涉及代码时通常不必重新运行测试；代码有变化时应执行 `uv run pytest`。
-- 当前版本为`v0.17.1`：A1-A7与B1保持完成；报告后追问支持真实流式响应、最近10条原文、滚动摘要、任务级Task Memory和统一ContextBuilder。Context / Memory真实评测已完成，Task Memory因Recent来源越权暂未封版；跨任务长期用户画像、向量记忆和动态Token窗口尚未开始。
+- 当前版本为`v0.18.0`：A1-A7与B1保持完成；全站已采用统一学术研究工作台视觉系统。报告后追问继续支持真实流式响应、最近10条原文、滚动摘要、任务级Task Memory和统一ContextBuilder；Task Memory的Recent来源越权仍未封版。
 - `pdf_service.parse_paper_pdf()`不传策略时使用MinerU；`extract_pdf_chunks()`及`chunk_size/overlap`只属于显式受控实验路径。
 - `rag_service.retrieve_relevant_chunks()` 接受并归一化 `semantic_weight`、`keyword_weight`。
 - `evaluation_service.validate_experiment_config()` 校验范围并推导关键词权重；`create_experiment_run()` 保存配置；`run_configured_experiment()` 重新解析、索引并执行评测。

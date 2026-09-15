@@ -4,7 +4,7 @@
 {% set ready_cases = cases | selectattr("index_status", "equalto", "indexed") | list %}
 <section class="section-head evaluation-head">
   <div>
-    <p class="eyebrow">CHUNKING EVALUATION</p>
+    <p class="eyebrow">分块评测</p>
     <h1>分块实验室</h1>
     <p class="section-note">{{ cases | length }} 个案例 / {{ ready_cases | length }} 个已建立索引</p>
   </div>
@@ -17,7 +17,7 @@
 
 <section class="experiment-config">
   <div class="experiment-config-title">
-    <p class="eyebrow">EXPERIMENT CONFIG</p>
+    <p class="eyebrow">实验参数</p>
     <h2>论文分块策略</h2>
   </div>
   <form action="/evaluation/run" method="post" class="experiment-form">
@@ -91,7 +91,7 @@
 <section class="evaluation-summary" {% if selected_run["status"] == "running" %}data-evaluation-running{% endif %}>
   <div class="evaluation-run-title">
     <div>
-      <p class="eyebrow">RUN #{{ selected_run["id"] }}</p>
+      <p class="eyebrow">运行 #{{ selected_run["id"] }}</p>
       <h2>{{ selected_run["name"] }}</h2>
     </div>
     <span class="status status-{{ selected_run['status'] }}">{{ selected_run["status"] }}</span>

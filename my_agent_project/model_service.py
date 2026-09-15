@@ -1,6 +1,6 @@
 import json
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import httpx
 
@@ -201,6 +201,54 @@ def ask_deepseek_json(
     if not isinstance(parsed, dict):
         raise ModelRequestError("DeepSeek JSON 顶层必须是对象")
     return parsed, DEEPSEEK_MODEL
+
+
+def ask_deepseek_tool_call(
+    system_prompt: str,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    *,
+    max_tokens: int = 1400,
+) -> tuple[dict[str, Any], str]:
+    """Request exactly one explicit native Function Call decision.
+
+    Structural and business validation of ``message.tool_calls`` remains the
+    caller's responsibility.  This transport helper only keeps the DeepSeek
+    Chat Completions request shape centralized.
+    """
+
+    if not is_deepseek_configured():
+        raise ModelConfigurationError(
+            "尚未配置 DeepSeek。请在项目根目录的 .env 中设置 DEEPSEEK_API_KEY。"
+        )
+    if not messages:
+        raise ValueError("原生Tool Calling messages不能为空")
+    if not tools:
+        raise ValueError("原生Tool Calling tools不能为空")
+
+    body: dict[str, Any] = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": str(system_prompt or "")},
+            *[dict(item) for item in messages],
+        ],
+        "tools": [dict(item) for item in tools],
+        "tool_choice": "required",
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+    }
+    payload = _request_deepseek(body)
+    try:
+        message = payload["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ModelRequestError(
+            "DeepSeek原生Tool Calling返回了无法识别的响应格式"
+        ) from exc
+    if not isinstance(message, Mapping):
+        raise ModelRequestError("DeepSeek原生Tool Calling没有返回Assistant消息")
+    return dict(message), DEEPSEEK_MODEL
 
 
 def _seed_api_mode() -> str:

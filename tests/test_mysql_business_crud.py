@@ -189,8 +189,8 @@ def test_duplicate_only_ignore_reraises_unrelated_mysql_1062(monkeypatch) -> Non
 def test_phase3_sql_dialect_inventory_is_explicit() -> None:
     source = Path("my_agent_project/db.py").read_text(encoding="utf-8")
 
-    assert source.count("ON CONFLICT") == 11
-    assert source.count("ON DUPLICATE KEY UPDATE") == 11
+    assert source.count("ON CONFLICT") == 12
+    assert source.count("ON DUPLICATE KEY UPDATE") == 12
     assert source.count("INSERT OR IGNORE") == 2
     assert "INSERT IGNORE" not in source
     assert source.count('conn.execute("BEGIN IMMEDIATE")') == 6

@@ -3,7 +3,7 @@
 {% block content %}
 <section class="section-head evaluation-head">
   <div>
-    <p class="eyebrow">GENERATION EVALUATION</p>
+    <p class="eyebrow">生成评测</p>
     <h1>RAG 生成质量</h1>
     <p class="section-note">Faithfulness / Relevance / Reference / Citation</p>
   </div>
@@ -11,7 +11,7 @@
 
 <section class="experiment-config">
   <div class="experiment-config-title">
-    <p class="eyebrow">EXPERIMENT CONFIG</p>
+    <p class="eyebrow">实验参数</p>
     <h2>选择检索运行</h2>
   </div>
   <form action="/generation-evaluation/run" method="post" class="experiment-form">
@@ -37,7 +37,7 @@
 <section class="evaluation-summary" {% if selected_run["status"] == "running" %}data-evaluation-running{% endif %}>
   <div class="evaluation-run-title">
     <div>
-      <p class="eyebrow">GENERATION RUN #{{ selected_run["id"] }}</p>
+      <p class="eyebrow">生成运行 #{{ selected_run["id"] }}</p>
       <h2>{{ selected_run["name"] }}</h2>
     </div>
     <span class="status status-{{ selected_run['status'] }}">{{ selected_run["status"] }}</span>

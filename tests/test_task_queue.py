@@ -11,6 +11,7 @@ from my_agent_project import (
     db,
     rag_service,
     research_conversation_service,
+    research_evidence_service,
     task_queue_service,
 )
 from my_agent_project.schemas import PaperCandidate
@@ -594,7 +595,7 @@ def test_research_followup_without_evidence_completes_without_model(
     queued = db.enqueue_research_followup_job(task_id, "Explain the missing result")
 
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         lambda *_args, **_kwargs: {
             "evidence": [],
@@ -636,7 +637,7 @@ def test_realtime_followup_stream_persists_complete_message_without_job(
     created = db.create_research_followup_messages(task_id, "Compare the methods")
 
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         lambda *_args, **_kwargs: {
             "evidence": [
@@ -701,7 +702,7 @@ def test_realtime_followup_stream_failure_marks_message_failed(
     created = db.create_research_followup_messages(task_id, "Explain the result")
 
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         lambda *_args, **_kwargs: {
             "evidence": [
@@ -757,7 +758,7 @@ def test_recent_messages_previous_turn_is_injected_without_current_duplicate(
     created = db.create_research_followup_messages(task_id, "那它为什么更好？")
 
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         lambda *_args, **_kwargs: {
             "evidence": [
@@ -1101,7 +1102,7 @@ def test_summary_08_failure_does_not_break_streaming_chat(tmp_path, monkeypatch)
     )
     created = db.create_research_followup_messages(task_id, "继续比较")
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         lambda *_args, **_kwargs: {
             "evidence": [

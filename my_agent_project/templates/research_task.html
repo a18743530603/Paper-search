@@ -11,7 +11,7 @@
 {% endfor %}
 <section class="section-head research-task-heading" data-research-task-id="{{ task['id'] }}" data-research-task-status="{{ task['status'] }}" data-research-report-status="{{ report_status }}" data-research-message-status="{{ latest_message_status }}">
   <div>
-    <p class="eyebrow">Research Workspace #{{ task["id"] }}</p>
+    <p class="eyebrow">研究任务 #{{ task["id"] }}</p>
     <h1>{{ task["question"] }}</h1>
   </div>
   <span class="status status-{{ task['status'] }}">{{ task["status"] }}</span>
@@ -20,7 +20,7 @@
 <section class="research-conversation" aria-labelledby="research-conversation-title">
   <div class="section-head compact-heading">
     <div>
-      <p class="eyebrow">Conversation</p>
+      <p class="eyebrow">研究对话</p>
       <h2 id="research-conversation-title">研究对话</h2>
     </div>
     <span class="selection-limit" data-message-count>{{ messages | length }} 条</span>
@@ -32,6 +32,20 @@
           <strong>{{ "你" if message["role"] == "user" else "Paper Hunter" }}</strong>
           <span>{{ message["phase"] }}</span>
           {% if message["status"] != "completed" %}<span class="status status-message-{{ message['status'] }}" data-message-status>{{ message["status"] }}</span>{% endif %}
+        </div>
+        <div class="conversation-visuals" data-message-visuals>
+          {% for visual in message.get("visuals", []) %}
+            <figure class="conversation-visual-card" data-visual-id="{{ visual['visual_id'] }}">
+              <a href="{{ visual['image_url'] }}" target="_blank" rel="noreferrer">
+                <img src="{{ visual['image_url'] }}" alt="{{ visual['content_type'] }} · 第{{ visual['physical_page'] }}页" loading="lazy">
+              </a>
+              <figcaption>
+                {{ "Table" if visual["content_type"] == "table" else "Figure" }}
+                {% if visual["physical_page"] %} · 第{{ visual["physical_page"] }}页{% endif %}
+                {% if visual["section_title"] %} · {{ visual["section_title"] }}{% endif %}
+              </figcaption>
+            </figure>
+          {% endfor %}
         </div>
         <div class="conversation-content" data-message-content>{{ message["content"] }}</div>
         {% if message["model"] %}<small>模型：{{ message["model"] }}</small>{% endif %}
@@ -65,7 +79,7 @@
 <section class="research-plan" aria-labelledby="research-plan-title">
   <div class="research-plan-head">
     <div>
-      <p class="eyebrow">Research Plan</p>
+      <p class="eyebrow">研究计划</p>
       <h2 id="research-plan-title">{{ task["plan_goal"] }}</h2>
     </div>
     <span class="status status-{{ task['planner_status'] }}">{{ task["planner_status"] }}</span>
@@ -85,7 +99,7 @@
   <section class="tool-trace" aria-labelledby="tool-trace-title">
     <div class="section-head compact-heading">
       <div>
-        <p class="eyebrow">Tool Trace</p>
+        <p class="eyebrow">调用轨迹</p>
         <h2 id="tool-trace-title">工具调用轨迹</h2>
       </div>
       <span class="selection-limit">{{ tool_calls | length }} 次</span>
@@ -163,7 +177,7 @@
 {% elif task["status"] == "awaiting_selection" %}
   <section class="section-head compact-heading">
     <div>
-      <p class="eyebrow">Candidate Papers</p>
+      <p class="eyebrow">候选论文</p>
       <h2>选择用于后续研究的论文</h2>
     </div>
     <span class="selection-limit">最多 {{ max_selected_papers }} 篇</span>
@@ -210,7 +224,7 @@
 {% elif task["status"] == "papers_selected" %}
   <section class="section-head compact-heading">
     <div>
-      <p class="eyebrow">Selected Papers</p>
+      <p class="eyebrow">已选论文</p>
       <h2>已冻结论文集合（{{ task["selected_count"] }}）</h2>
     </div>
   </section>
@@ -220,7 +234,7 @@
 {% elif task["status"] == "completed" %}
   <section class="section-head compact-heading">
     <div>
-      <p class="eyebrow">Search Results</p>
+      <p class="eyebrow">检索结果</p>
       <h2>检索结果（{{ task["result_count"] }}）</h2>
     </div>
   </section>

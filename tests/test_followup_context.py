@@ -2,7 +2,10 @@ import json
 
 import pytest
 
-from my_agent_project import research_conversation_service
+from my_agent_project import (
+    research_conversation_service,
+    research_evidence_service,
+)
 from my_agent_project.followup_context import build_followup_context
 
 
@@ -360,7 +363,7 @@ def test_followup_context_without_report_keeps_evidence_and_partial_limitations(
         }
 
     monkeypatch.setattr(
-        research_conversation_service,
+        research_evidence_service,
         "retrieve_report_paper_evidence",
         retrieve,
     )

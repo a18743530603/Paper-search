@@ -2828,6 +2828,90 @@ def list_paper_summary_chunks(paper_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def list_paper_section_metadata(paper_id: int) -> list[dict]:
+    """Return persisted section navigation fields without loading content."""
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT section_title, page_number, chunk_index
+            FROM paper_chunks
+            WHERE paper_id = ? AND TRIM(section_title) != ''
+            ORDER BY chunk_index
+            """,
+            (paper_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_paper_chunks_for_text_match(paper_id: int) -> list[dict]:
+    """Return ordered child chunks for deterministic in-paper text matching."""
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, paper_id, chunk_index, parent_chunk_id,
+                   section_title, page_number, content
+            FROM paper_chunks
+            WHERE paper_id = ?
+            ORDER BY chunk_index
+            """,
+            (paper_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_paper_visual_chunk(paper_id: int, chunk_id: int) -> Optional[dict]:
+    """Return persisted metadata for one visual child chunk."""
+
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, paper_id, page_number, chunk_index, parent_chunk_id,
+                   section_title, content_type, bbox_json, content
+            FROM paper_chunks
+            WHERE paper_id = ? AND id = ?
+              AND content_type IN ('table', 'image', 'chart')
+            """,
+            (paper_id, chunk_id),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_exact_section_chunks(paper_id: int, section_path: str) -> list[dict]:
+    """Return child chunks whose canonical section path matches exactly.
+
+    Section navigation exposes paths with surrounding whitespace removed, so
+    the same canonicalization is applied at the query boundary. Comparison
+    remains binary/case-sensitive on both supported business DB backends.
+    """
+
+    canonical_path = str(section_path or "").strip()
+    with connect() as conn:
+        rows = conn.execute(
+            backend_sql(
+                sqlite_sql="""
+                    SELECT id, paper_id, chunk_index, parent_chunk_id,
+                           section_title, page_number, content
+                    FROM paper_chunks
+                    WHERE paper_id = ?
+                      AND TRIM(section_title) COLLATE BINARY = ? COLLATE BINARY
+                    ORDER BY chunk_index
+                """,
+                mysql_sql="""
+                    SELECT id, paper_id, chunk_index, parent_chunk_id,
+                           section_title, page_number, content
+                    FROM paper_chunks
+                    WHERE paper_id = ?
+                      AND BINARY TRIM(section_title) = BINARY ?
+                    ORDER BY chunk_index
+                """,
+            ),
+            (paper_id, canonical_path),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def count_paper_parent_chunks(paper_id: int) -> int:
     with connect() as conn:
         row = conn.execute(

@@ -89,6 +89,10 @@ from .research_agent import (
     create_research_plan,
 )
 from .research_conversation_service import stream_research_followup
+from .research_visual_service import (
+    get_visual_asset,
+    visual_payloads_from_evidence,
+)
 from .research_checkpoint import (
     delete_research_checkpoint,
     research_checkpoint_info,
@@ -113,8 +117,131 @@ initialize_business_database()
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-app = FastAPI(title="Paper Hunter", version="0.17.1")
+app = FastAPI(title="Paper Hunter", version="0.18.0")
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+
+SOURCE_GROUPS = (
+    {
+        "id": "general",
+        "label": "综合检索",
+        "description": "跨学科搜索、引用信息与出版物元数据",
+        "sources": (
+            ("google_scholar", "跨学科网页学术搜索"),
+            ("semantic", "AI 辅助的跨学科文献索引"),
+            ("openalex", "开放的全球学术知识图谱"),
+            ("crossref", "DOI 与出版物元数据"),
+        ),
+    },
+    {
+        "id": "medicine",
+        "label": "医学与生命科学",
+        "description": "医学索引、生命科学论文与开放全文",
+        "sources": (
+            ("pubmed", "医学与生命科学文献索引"),
+            ("pmc", "生物医学免费全文库"),
+            ("europepmc", "生命科学文献与开放全文"),
+            ("biorxiv", "生命科学预印本"),
+            ("medrxiv", "医学与健康科学预印本"),
+        ),
+    },
+    {
+        "id": "computing",
+        "label": "计算机与信息安全",
+        "description": "计算机会议、预印本和密码学研究",
+        "sources": (
+            ("arxiv", "计算机、数学等领域预印本"),
+            ("dblp", "计算机论文与会议索引"),
+            ("citeseerx", "计算机领域学术搜索"),
+            ("iacr", "密码学与信息安全论文"),
+        ),
+    },
+    {
+        "id": "open_access",
+        "label": "开放获取与研究仓库",
+        "description": "补充开放论文、机构仓库、数据和软件",
+        "sources": (
+            ("core", "开放获取论文聚合"),
+            ("openaire", "欧洲开放科研成果"),
+            ("doaj", "开放获取期刊目录"),
+            ("base", "机构仓库学术搜索"),
+            ("zenodo", "论文、数据与软件仓库"),
+            ("hal", "法国开放学术仓库"),
+            ("unpaywall", "按 DOI 查找合法开放版本"),
+        ),
+    },
+    {
+        "id": "social_science",
+        "label": "社会科学、商科与法律",
+        "description": "社科和商业研究的工作论文与预印本",
+        "sources": (("ssrn", "社科、商科与法律预印本"),),
+    },
+)
+
+SOURCE_LABELS = dict(SEARCH_SOURCE_OPTIONS)
+SOURCE_PICKER_GROUPS = tuple(
+    {
+        **group,
+        "sources": tuple(
+            {
+                "id": source_id,
+                "label": SOURCE_LABELS[source_id],
+                "description": description,
+            }
+            for source_id, description in group["sources"]
+        ),
+    }
+    for group in SOURCE_GROUPS
+)
+SOURCE_PRESETS = (
+    {
+        "id": "general",
+        "label": "综合研究（推荐）",
+        "description": "适合尚未限定学科的主题，兼顾覆盖面、引用信息和开放版本。",
+        "sources": ("google_scholar", "semantic", "openalex", "crossref", "core"),
+    },
+    {
+        "id": "computer_ai",
+        "label": "计算机与人工智能",
+        "description": "优先覆盖计算机会议、期刊和最新预印本。",
+        "sources": ("arxiv", "google_scholar", "semantic", "openalex", "dblp"),
+    },
+    {
+        "id": "medicine_life",
+        "label": "医学与生命科学",
+        "description": "PubMed 负责权威索引，PMC 和 Europe PMC 补充全文，预印本用于追踪新进展。",
+        "sources": ("pubmed", "pmc", "europepmc", "medrxiv", "biorxiv", "crossref"),
+    },
+    {
+        "id": "social_business",
+        "label": "社会科学与商科",
+        "description": "覆盖正式出版物，并用 SSRN 补充工作论文与早期研究。",
+        "sources": ("google_scholar", "ssrn", "semantic", "openalex", "crossref"),
+    },
+    {
+        "id": "security",
+        "label": "密码学与信息安全",
+        "description": "IACR ePrint 聚焦密码学，arXiv 和 dblp 补充安全与计算机研究。",
+        "sources": ("iacr", "arxiv", "dblp", "semantic", "crossref"),
+    },
+    {
+        "id": "open_access",
+        "label": "开放获取优先",
+        "description": "优先查找可合法开放阅读的论文、机构仓库和研究成果。",
+        "sources": ("openalex", "core", "openaire", "doaj", "base", "zenodo", "hal", "unpaywall"),
+    },
+    {
+        "id": "all",
+        "label": "全部来源",
+        "description": "覆盖最广，但重复结果更多，检索时间也可能更长。",
+        "sources": DEFAULT_SOURCE_IDS,
+    },
+)
+DEFAULT_UI_SOURCE_IDS = SOURCE_PRESETS[0]["sources"]
+
+templates.env.globals.update(
+    source_groups=SOURCE_PICKER_GROUPS,
+    source_presets=SOURCE_PRESETS,
+)
 
 
 def paper_view(paper):
@@ -125,6 +252,15 @@ def paper_view(paper):
         dict(document) if document else None,
     )
     return item
+
+
+def research_messages_with_visuals(task_id: int) -> list[dict]:
+    messages = list_research_messages(task_id)
+    for message in messages:
+        message["visuals"] = visual_payloads_from_evidence(
+            message.get("evidence", [])
+        )
+    return messages
 
 
 def enqueue_selected_paper_preparations(paper_ids: list[int]) -> list[dict]:
@@ -184,7 +320,7 @@ def home(request: Request):
         {
             "max_results": MAX_RESULTS,
             "source_options": SEARCH_SOURCE_OPTIONS,
-            "selected_sources": DEFAULT_SOURCE_IDS,
+            "selected_sources": DEFAULT_UI_SOURCE_IDS,
         },
     )
 
@@ -280,7 +416,7 @@ def research_task_detail(request: Request, task_id: int):
                 paper_view(paper) for paper in selected_papers if paper is not None
             ],
             "tool_calls": list_research_tool_calls(task_id),
-            "messages": list_research_messages(task_id),
+            "messages": research_messages_with_visuals(task_id),
             "report": get_research_report(task_id),
             "max_selected_papers": MAX_RESEARCH_SELECTED_PAPERS,
         },
@@ -400,6 +536,18 @@ def stream_research_chat(
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@app.get("/research-visuals/{visual_id}")
+def research_visual(visual_id: str):
+    asset = get_visual_asset(visual_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Research visual not found")
+    return FileResponse(
+        asset.image_path,
+        media_type=asset.mime_type,
+        headers={"Cache-Control": "private, max-age=3600"},
     )
 
 

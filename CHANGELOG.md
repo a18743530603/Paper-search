@@ -2,6 +2,17 @@
 
 本文件按时间倒序记录项目的功能变化。每次功能更新都必须先确定版本号，并同步更新 `README.md`、`PROJECT.md`、`AGENTS.md`、`pyproject.toml` 和 FastAPI 应用版本。
 
+## `v0.18.0` - 2026-09-15
+
+### 全站视觉重构
+
+- 新增独立`research-ui.css`主题层，以现代、克制的学术研究工作台为方向统一全站颜色、字体、间距和组件规则。
+- 重构导航、首页研究表单、按钮、输入控件、论文来源选择、状态标签、数据表、空白/错误/禁用状态、Research Chat、报告、证据、论文详情和评测页面。
+- Research Workspace增加贯穿主要区块的研究进度线；论文正文、Summary、Report与Evidence使用独立阅读字体和受控行宽。
+- 补齐当前导航语义、键盘跳转入口、清晰焦点样式、移动端横向导航与`prefers-reduced-motion`支持。
+- 现有FastAPI路由、接口、表单字段、Jinja数据绑定、JavaScript事件及业务流程保持不变；浏览器验收覆盖全部主要GET页面和桌面/移动布局。
+- 模板与前端契约测试`142 passed`。去重后的主测试目录为`540 passed, 1 skipped, 3 failed`；剩余失败属于本轮开始前已经存在未提交改动的`db.py`/MySQL schema与检索问题路由测试，不涉及本次视觉文件。
+
 ## `v0.17.1` - 2026-08-27
 
 ### Context / Memory Eval v1

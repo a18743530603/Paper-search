@@ -1,8 +1,8 @@
 # Paper Hunter：文献检索与开放获取下载助手
 
-> 当前版本：`v0.17.1`
+> 当前版本：`v0.18.0`
 >
-> 更新日期：`2026-08-27`
+> 更新日期：`2026-09-15`
 >
 > 版本历史：见 [CHANGELOG.md](CHANGELOG.md)
 >
@@ -11,6 +11,8 @@
 > 项目全景：见 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)
 
 Paper Hunter 是一个面向新手、适合写入简历的 FastAPI 项目。用户输入关键词或论文标题后，可以在首页从统一白名单提供的21个论文来源中多选，系统再通过统一论文搜索MCP检索相关论文并保存网页地址和元数据；如果发现明确可免费获取的 PDF，则在用户确认后由后台任务下载到本地。
+
+`v0.18.0`完成全站视觉重构：新增独立`research-ui.css`设计系统，以浅色学术研究工作台为方向统一导航、表单、按钮、状态、表格、研究对话、报告、证据、评测和移动端布局；`base.html`新增当前导航标识和跳转到主要内容的键盘入口。现有路由、接口、表单字段、数据绑定、JavaScript事件与业务流程保持不变。模板与前端契约测试`142 passed`；去重后的主测试目录为`540 passed, 1 skipped, 3 failed`，剩余失败来自本次开始前已有改动的数据库方言计数、MySQL外键数量和检索问题路由测试。
 
 `v0.17.1`完成Context / Memory Eval v1：冻结29个Recent、Summary、Task Memory、Evidence隔离、任务隔离、重启恢复和Prompt Injection场景，真实调用`deepseek-v4-pro` 56次。严格场景通过`26/29`；8组对照中With Context为`8/8`，Without Context为`2/8`。Evidence Grounding、指代、Summary、持续偏好、临时覆盖、任务隔离和恢复目标均为100%，但Task Memory混合输入的Recent来源隔离连续`0/3`，英文回答引用契约为`30/33`，因此Context组合可展示但Memory v1暂不封版。该轮案例、脚本、临时数据库和原始结果统一保存在`E:\PaperHunterData\smolagent-tests\`且不进入Git。
 
@@ -692,7 +694,7 @@ created_at, updated_at
 ```env
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_MODEL=deepseek-v4-flash-vision-exp
 DEEPSEEK_THINKING=true
 DEEPSEEK_TIMEOUT=120
 

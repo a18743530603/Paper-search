@@ -1,26 +1,29 @@
 <!doctype html>
 <html lang="zh-CN">
+  {% set current_path = request.url.path if request is defined else "" %}
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}Paper Hunter{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/research-ui.css') }}">
   </head>
-  <body>
+  <body data-path="{{ current_path }}">
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
     <header class="topbar">
       <a class="brand" href="/">Paper Hunter</a>
-      <nav>
-        <a href="/">搜索</a>
-        <a href="/research-tasks">研究任务</a>
-        <a href="/papers">历史</a>
-        <a href="/evaluation">分块评测</a>
-        <a href="/generation-evaluation">生成评测</a>
-        <a href="/origin">Origin 绘图</a>
+      <nav aria-label="主导航">
+        <a href="/"{% if current_path == '/' %} aria-current="page"{% endif %}>搜索</a>
+        <a href="/research-tasks"{% if current_path.startswith('/research-tasks') %} aria-current="page"{% endif %}>研究任务</a>
+        <a href="/papers"{% if current_path.startswith('/papers') %} aria-current="page"{% endif %}>历史</a>
+        <a href="/evaluation"{% if current_path.startswith('/evaluation') %} aria-current="page"{% endif %}>分块评测</a>
+        <a href="/generation-evaluation"{% if current_path.startswith('/generation-evaluation') %} aria-current="page"{% endif %}>生成评测</a>
+        <a href="/origin"{% if current_path.startswith('/origin') %} aria-current="page"{% endif %}>Origin 绘图</a>
         <a href="/export.csv">CSV</a>
         <a href="/export.json">JSON</a>
       </nav>
     </header>
-    <main class="page">
+    <main class="page" id="main-content">
       {% block content %}{% endblock %}
     </main>
     <script src="{{ url_for('static', path='/status_poll.js') }}" defer></script>

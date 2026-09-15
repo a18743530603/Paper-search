@@ -783,4 +783,4 @@ def test_mysql_representative_explain_probe() -> None:
         assert "idx_background_jobs_task_type_recent" in index_names
         assert "idx_background_jobs_paper_type_recent" in index_names
         assert "idx_research_messages_followup_recent" in index_names
-        assert foreign_key_count == 19
+        assert foreign_key_count == 21
