@@ -1,7 +1,7 @@
 [project]
 name = "paper-hunter"
 version = "0.18.0"
-description = "FastAPI literature search and open-access PDF archiver"
+description = "Evidence-driven research agent for academic paper search, parsing, retrieval, and cited answers"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",

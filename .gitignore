@@ -16,12 +16,44 @@ env/
 # Local runtime data
 downloads/
 outputs/
+output/
+tmp/
+PaperHunterData/
 benchmarks/context_memory_eval_v1_cases.json
 scripts/evaluate_context_memory_v1.py
 *.db
 *.sqlite
 *.sqlite3
 *.pdf
+*.docx
+
+# Local Codex / interview preparation material
+.agents/
+.codex/
+.codex_resume_review/
+.uv-cache*/
+coaching_state.md
+/0
+/复习知识点/
+/求职材料/
+/学习笔记_算法.md
+/学习笔记_面试辅导.md
+/导学-PaperHunter.md
+/导学-论文猎手.md
+/简历素材_Paper Hunter.md
+/面经-PaperHunter.md
+/scripts/build_interview_review_pdf.py
+/scripts/render_review_markdown_pdf.py
+
+# Internal project memory and historical experiment notebooks
+/AGENTS.md
+/EXPERIMENTS.md
+/HELDOUT_DATASET.md
+/HELDOUT_V2_DATASET.md
+/ORIGIN.md
+/PROJECT.md
+/PROJECT_OVERVIEW.md
+/ROADMAP.md
 
 # Environment and secrets
 .env
