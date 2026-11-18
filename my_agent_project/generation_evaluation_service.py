@@ -265,6 +265,48 @@ def _cached_judgment(
     )
 
 
+def evaluate_answer_against_reference(
+    *,
+    question: str,
+    reference_answer: str,
+    answer: str,
+    evidence: Sequence[Mapping[str, Any]],
+    cache_stats: dict[str, int] | None = None,
+) -> dict:
+    """Judge one existing answer without generating a replacement answer.
+
+    This public boundary lets end-to-end Agent evaluations reuse the same
+    evidence-grounded quality contract and LLM-response cache as the existing
+    generation dashboard.  The supplied answer must already have been produced
+    by the system under evaluation.
+    """
+
+    prepared_evidence = [
+        {
+            "page_number": int(item["page_number"]),
+            "content": str(item.get("content") or ""),
+        }
+        for item in evidence
+        if item.get("page_number") is not None
+        and str(item.get("content") or "").strip()
+    ]
+    if not prepared_evidence:
+        raise ValueError("回答质量评测至少需要一条带页码的原文证据")
+    return _cached_judgment(
+        _judge_prompt(
+            str(question),
+            str(reference_answer),
+            str(answer),
+            prepared_evidence,
+        ),
+        answer=str(answer),
+        evidence_pages={
+            int(item["page_number"]) for item in prepared_evidence
+        },
+        cache_stats=cache_stats,
+    )
+
+
 def evaluate_generation_case(
     case: Mapping[str, Any],
     retrieval_result: Mapping[str, Any],

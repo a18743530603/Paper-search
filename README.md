@@ -94,6 +94,12 @@ Original Paper Chunk 是唯一论文事实来源。对话摘要、Task Memory �
 
 > Target Chunk Exact Coverage 是检索阶段诊断指标，不等同于最终回答准确率；部分答案证据可能位于同一物理页的相邻 Chunk。
 
+### Research Chat 端到端评测
+
+在检索指标之外，项目进一步使用12个真实问题运行完整 Research Agent：记录原生 Tool Call、最终 Evidence、Coverage、回答完整性与引用正确性，并按 Loop 执行、证据选择、回答生成和 Citation 分类 Badcase。首轮真实运行正常完成10/12题，7/12题达到回答完整性阈值，7/12题达到引用正确性阈值，同时发现工具参数合同、等价证据与引用粒度等问题。该结果保留原始失败，不为追求全绿而重跑覆盖。
+
+完整结果见 [Research Chat 端到端评测与 Badcase 报告](docs/END_TO_END_EVALUATION.md)。
+
 更多实验边界见 [docs/EVALUATION.md](docs/EVALUATION.md)。
 
 ## 系统架构
@@ -228,6 +234,7 @@ uv run pytest
 
 - [系统架构](docs/ARCHITECTURE.md)
 - [评测方法与结果](docs/EVALUATION.md)
+- [Research Chat 端到端评测与 Badcase](docs/END_TO_END_EVALUATION.md)
 - [版本历史](CHANGELOG.md)
 
 ## License

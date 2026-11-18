@@ -1,0 +1,121 @@
+{
+  "version": "research-chat-e2e-v1",
+  "created_at": "2026-11-18",
+  "description": "Twelve real single-paper questions reused from the frozen three-paper Target Chunk benchmark for end-to-end Research Agent answer and citation evaluation.",
+  "thresholds": {
+    "faithfulness": 0.8,
+    "answer_relevance": 0.8,
+    "reference_correctness": 0.8,
+    "citation_correctness": 0.8
+  },
+  "cases": [
+    {
+      "case_id": "ict-datasets",
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "question_type": "dataset",
+      "question": "这篇论文使用了哪些数据集进行实验？",
+      "reference_answer": "论文使用 CIFAR-10、SVHN 和 CIFAR-100。实验只标注部分训练数据，其余训练数据作为无标注数据。",
+      "target_chunk_ids": [370]
+    },
+    {
+      "case_id": "ict-method",
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "question_type": "method",
+      "question": "这篇论文采用了什么方法进行半监督学习？",
+      "reference_answer": "论文提出 Interpolation Consistency Training（ICT）：让无标注样本插值位置的模型预测与两个样本预测结果的插值保持一致，从而把分类边界推向数据分布的低密度区域。",
+      "target_chunk_ids": [334]
+    },
+    {
+      "case_id": "ict-consistency-mechanism",
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "question_type": "fine_grained_mechanism",
+      "question": "这篇论文中的一致性训练是如何实现的？",
+      "reference_answer": "训练目标由有标注样本的监督交叉熵和无标注样本的插值一致性项组成。系统从两个无标注 minibatch 获得移动平均教师产生的伪标签，对输入和伪标签分别插值，再用均方误差约束模型在插值输入上的预测接近伪标签插值；一致性项权重随训练逐步增加。",
+      "target_chunk_ids": [366]
+    },
+    {
+      "case_id": "ict-metrics",
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "question_type": "metric",
+      "question": "这篇论文使用了什么评价指标？",
+      "reference_answer": "论文主要使用分类测试错误率（test error rate，百分比）评价模型，并报告多次试验的均值及波动。",
+      "target_chunk_ids": [376]
+    },
+    {
+      "case_id": "ict-results",
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "question_type": "results",
+      "question": "这篇论文的主要实验结果是什么？",
+      "reference_answer": "ICT 相对强监督基线在 CIFAR-10 上常实现约两倍的测试错误下降，在 SVHN 上约四倍；CIFAR-10 使用 4000 个标注样本时比此前最好结果进一步降低约 25% 测试错误。它在 WRN-28-2 上对 CIFAR-10 和 SVHN 均优于对比方法，在 CIFAR-100 上也超过此前方法，使用 softplus 时表现最好。",
+      "target_chunk_ids": [386, 387, 388, 389, 394]
+    },
+    {
+      "case_id": "ict-conclusion",
+      "paper_id": 33,
+      "paper_title": "Interpolation Consistency Training for Semi-Supervised Learning",
+      "question_type": "conclusion",
+      "question": "这篇论文最后得出了什么结论？",
+      "reference_answer": "论文认为 ICT 是一种简单、计算高效的半监督学习方法，几乎不增加额外计算，在两个基准数据集上无需大规模调参也能超过强基线。理论和实验表明它可作为高阶导数正则器并在无标注数据置信度较高时减少过拟合；低置信度且不使用伪标签时可能失效。未来可把插值扩展到隐藏表示。",
+      "target_chunk_ids": [596]
+    },
+    {
+      "case_id": "hidiff-datasets",
+      "paper_id": 38,
+      "paper_title": "HiDiff: Hybrid Diffusion Framework for Medical Image Segmentation",
+      "question_type": "dataset",
+      "question": "这篇论文使用了哪些医学图像数据集进行实验？",
+      "reference_answer": "论文使用 Synapse、BraTS-2021、Kvasir-SEG、CVC-ClinicDB、DRIVE 和 CHASE DB1，覆盖腹部器官、脑肿瘤、息肉和视网膜血管分割任务，以及 CT、MRI、内镜和视网膜图像等模态。",
+      "target_chunk_ids": [694]
+    },
+    {
+      "case_id": "hidiff-method",
+      "paper_id": 38,
+      "paper_title": "HiDiff: Hybrid Diffusion Framework for Medical Image Segmentation",
+      "question_type": "method",
+      "question": "HiDiff 的核心方法是什么？",
+      "reference_answer": "HiDiff 将判别式分割器与 Bernoulli 扩散细化器组合成混合框架。训练时交替协同优化两部分：优化一方时冻结另一方；推理时先由分割器产生先验掩码，再从该先验初始化扩散变量并迭代细化，也支持 DDIM 加速采样。",
+      "target_chunk_ids": [686, 687, 692]
+    },
+    {
+      "case_id": "hidiff-metrics",
+      "paper_id": 38,
+      "paper_title": "HiDiff: Hybrid Diffusion Framework for Medical Image Segmentation",
+      "question_type": "metric",
+      "question": "这篇论文使用了什么评价指标？",
+      "reference_answer": "多目标分割采用 Dice 系数和 95% Hausdorff 距离（HD95），并用 NaN Ratio 记录 HD95 无定义的情况；单目标分割还采用 IoU、Recall 和 Accuracy。",
+      "target_chunk_ids": [701]
+    },
+    {
+      "case_id": "soil-data",
+      "paper_id": 48,
+      "paper_title": "Prediction of Soil Moisture Content Based On Satellite Data and Sequence-to-Sequence Networks",
+      "question_type": "dataset",
+      "question": "这篇论文使用了哪些数据来预测土壤含水量？",
+      "reference_answer": "论文使用 Sentinel-1 的极化雷达数据、Sentinel-2 的 RGB 和近红外影像及 NDVI，并结合气象站和土壤湿度传感器地面观测。数据包含澳大利亚三个葡萄酒产区、20 个站点和 7 年的日数据。",
+      "target_chunk_ids": [775, 776]
+    },
+    {
+      "case_id": "soil-model",
+      "paper_id": 48,
+      "paper_title": "Prediction of Soil Moisture Content Based On Satellite Data and Sequence-to-Sequence Networks",
+      "question_type": "method",
+      "question": "这篇论文使用了什么模型进行土壤含水量预测？",
+      "reference_answer": "论文使用卷积序列到序列自编码器预测土壤含水量。模型由两个循环神经网络组成编码器—解码器框架，编码器和解码器都使用卷积 LSTM 单元，并比较了 AE 与 LSTM 两类方案。",
+      "target_chunk_ids": [779, 780, 783]
+    },
+    {
+      "case_id": "soil-results",
+      "paper_id": 48,
+      "paper_title": "Prediction of Soil Moisture Content Based On Satellite Data and Sequence-to-Sequence Networks",
+      "question_type": "results",
+      "question": "这篇论文最后得到的主要实验结果是什么？",
+      "reference_answer": "AE 与 LSTM 获得了相近的预测精度。LSTM 在观测较少时表现更好但需要土壤湿度传感器数据；AE 只使用地球观测数据但需要较多历史数据。试点农场实验表明该方案可替代昂贵的土壤湿度传感器，实施成本约低四倍。",
+      "target_chunk_ids": [780, 786]
+    }
+  ]
+}

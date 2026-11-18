@@ -3786,6 +3786,45 @@ def test_validate_judge_response_rejects_invented_citation_page():
         raise AssertionError("答案中不存在的引用页码必须被拒绝")
 
 
+def test_evaluate_existing_answer_reuses_generation_judge_contract(monkeypatch):
+    captured = {}
+
+    def fake_judgment(prompt, *, answer, evidence_pages, cache_stats):
+        captured.update(
+            {
+                "prompt": prompt,
+                "answer": answer,
+                "evidence_pages": evidence_pages,
+                "cache_stats": cache_stats,
+            }
+        )
+        return {"faithfulness": 1.0}
+
+    monkeypatch.setattr(
+        generation_evaluation_service,
+        "_cached_judgment",
+        fake_judgment,
+    )
+    cache_stats = {}
+
+    result = generation_evaluation_service.evaluate_answer_against_reference(
+        question="使用了什么数据集？",
+        reference_answer="CIFAR-10。",
+        answer="使用 CIFAR-10。[第 3 页]",
+        evidence=[
+            {"page_number": 3, "content": "We use CIFAR-10."},
+            {"page_number": 4, "content": ""},
+        ],
+        cache_stats=cache_stats,
+    )
+
+    assert result == {"faithfulness": 1.0}
+    assert captured["answer"] == "使用 CIFAR-10。[第 3 页]"
+    assert captured["evidence_pages"] == {3}
+    assert captured["cache_stats"] is cache_stats
+    assert "We use CIFAR-10." in captured["prompt"]
+
+
 def test_aggregate_generation_metrics_excludes_failed_cases():
     results = [
         {

@@ -9,6 +9,8 @@
 - 新增 Requirements、Coverage Reflection、Evidence ID 校验、显式完成动作和三种结束语义。
 - 加入完全重复调用拦截、连续无进展重规划、8 次动作与 90 秒运行时保护。
 - 打通视觉 Chunk 裁图、VisualAsset 受控访问、SSE 视觉事件和消息刷新恢复。
+- 新增12条真实问题的 Research Chat 端到端评测，记录 Tool 轨迹、Evidence、Coverage、回答完整性与引用正确性，并生成公开 Badcase 报告。
+- 统一旧英文引用与最终中文引用的校验语法，避免正确引用在回答规范化后被误报。
 
 ## v0.17.0 — Tool Contract 与章节读取
 

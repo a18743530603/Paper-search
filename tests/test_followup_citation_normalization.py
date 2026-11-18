@@ -38,6 +38,17 @@ def test_normalizer_handles_multiple_citations_and_both_answer_languages():
     )
 
 
+def test_final_chinese_followup_citation_passes_shared_validator():
+    validation = research_conversation_service.validate_research_report_citations(
+        "结论由原文支持。[Paper A，第4页]",
+        EVIDENCE,
+    )
+
+    assert validation["status"] == "passed"
+    assert validation["citation_count"] == 1
+    assert validation["valid_citation_count"] == 1
+
+
 @pytest.mark.parametrize(
     "citation",
     [

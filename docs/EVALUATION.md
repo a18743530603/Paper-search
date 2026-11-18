@@ -93,7 +93,30 @@ Dynamic Evidence Allocation 的测试重点不是调整检索相关性，而是�
 5. 模型能基于 Observation 继续下一次 Decision。
 6. `complete_research` 作为 Completion Action 结束 Loop，而不是被 Tool Dispatcher 执行。
 
-## 5. 如何理解指标
+## 5. Research Chat 端到端评测
+
+检索指标只能说明 Target Chunk 的位置，不能说明 Agent 是否选对工具、最终回答是否完整或引用是否正确。`research-chat-e2e-v1` 因此复用3篇冻结论文的12个真实问题，真实执行生产 Research Loop 与回答模型。
+
+每条案例记录：
+
+- Agent 调用的 Research Tool 与参数；
+- 最终进入回答上下文的 Evidence ID；
+- Requirement Coverage 和结束状态；
+- Answer Relevance、Reference Correctness 与 Faithfulness；
+- 引用标题/页码是否合法，以及声明是否由对应页支持；
+- Badcase 首次暴露在 Loop、Evidence、Answer 还是 Citation 阶段。
+
+首轮运行正常完成10/12题，回答完整7/12，引用正确7/12，全合同通过5/12。两条失败来自模型生成的 Tool Arguments 包含合同未声明字段，证明单独的检索 Recall 无法覆盖 Agent 协议可靠性问题。完整逐题结果和评测边界见 [端到端评测报告](END_TO_END_EVALUATION.md)。
+
+可复现命令：
+
+```powershell
+uv run python scripts/evaluate_research_chat_e2e.py
+```
+
+原始 JSON 写入 Git 忽略的 `outputs/`，公开仓库只保留冻结案例、可复现脚本和去除正文后的汇总报告。
+
+## 6. 如何理解指标
 
 - **Recall@K**：所有标注目标证据中，有多少在前 K 个结果内出现。
 - **Hit@K**：按问题统计，前 K 个结果中至少命中一个目标证据的问题占比。
@@ -102,7 +125,7 @@ Dynamic Evidence Allocation 的测试重点不是调整检索相关性，而是�
 
 这些指标衡量的是检索和选择，不自动等于最终答案正确性。最终答案还受证据粒度、Prompt、模型能力和 Citation 约束影响。
 
-## 6. 可复现性边界
+## 7. 可复现性边界
 
 - 冻结问题、Target 标注和评测脚本保存在仓库的 `benchmarks/` 与 `scripts/`。
 - 本地 PDF、数据库、模型缓存和原始运行输出不提交 Git。

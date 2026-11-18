@@ -33,7 +33,10 @@ from .schemas import (
 
 
 REPORT_EVIDENCE_PER_PAPER = 3
-CITATION_PATTERN = re.compile(r"\[([^\[\]]+),\s*p\.\s*(\d+)\]", re.IGNORECASE)
+CITATION_PATTERN = re.compile(
+    r"\[([^\[\]]+?)(?:,\s*p\.\s*(\d+)|，\s*第\s*(\d+)\s*页)\]",
+    re.IGNORECASE,
+)
 RESEARCH_CONTEXT_SCHEMA_VERSION = "research-context-json-v1"
 UNTRUSTED_CONTEXT_BEGIN = "BEGIN_UNTRUSTED_RESEARCH_CONTEXT_JSON"
 UNTRUSTED_CONTEXT_END = "END_UNTRUSTED_RESEARCH_CONTEXT_JSON"
@@ -428,7 +431,7 @@ def validate_research_report_citations(
     citations = [
         {
             "paper_title": " ".join(match.group(1).split()),
-            "page_number": int(match.group(2)),
+            "page_number": int(match.group(2) or match.group(3)),
             "text": match.group(0),
         }
         for match in CITATION_PATTERN.finditer(content or "")
